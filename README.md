@@ -10,7 +10,18 @@ Pre-alpha. Workspace skeleton only — no member crates yet.
 
 ## Quick start
 
-Coming soon.
+```bash
+# One-time: install pre-commit hook (runs fmt + clippy on commit)
+./scripts/install-hooks.sh
+
+# Build everything
+cargo build --workspace
+
+# Hash a file (smoke test)
+cargo run -p eidetic-cli -- hash <path>
+```
+
+Postgres + pgvector + VectorChord (via the `tensorchord/vchord-postgres` Docker image) is required for db-backed work — not for the standalone `hash` command.
 
 ## Documentation
 
