@@ -1,0 +1,20 @@
+[package]
+name = "eidetic-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Eidetic command-line interface."
+
+[[bin]]
+name = "eidetic"
+path = "src/main.rs"
+
+[dependencies]
+eidetic-core = { path = "../eidetic-core" }
+eidetic-ingest = { path = "../eidetic-ingest" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
