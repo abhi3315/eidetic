@@ -377,6 +377,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidetic-ml"
+version = "0.1.0"
+dependencies = [
+ "eidetic-core",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
