@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# ML model files (auto-downloaded to ~/.cache/eidetic/models/)
+/models
+*.onnx
+*.safetensors
+
+# Local config and secrets
+.env
+.env.local
+config.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
