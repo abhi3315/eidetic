@@ -1,0 +1,18 @@
+[package]
+name = "eidetic-db"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Database access layer for Eidetic."
+
+[dependencies]
+eidetic-core = { path = "../eidetic-core" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
