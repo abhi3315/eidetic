@@ -8,6 +8,6 @@ pub mod store;
 
 pub use error::{Error, Result};
 pub use hasher::hash_file;
-pub use import::{ImportOutcome, import_file};
+pub use import::{ImportOutcome, ImportSummary, import_dir, import_file};
 pub use repo::{AssetIndex, NewAsset};
 pub use store::store_file;

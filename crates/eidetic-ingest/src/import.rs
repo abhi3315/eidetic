@@ -1,10 +1,11 @@
 use crate::{
-    Error, hash_file,
+    Error, Result, hash_file,
     repo::{AssetIndex, NewAsset},
     store_file,
 };
 use eidetic_core::{AssetId, Paths};
 use std::path::Path;
+use walkdir::WalkDir;
 
 pub enum ImportOutcome {
     Imported(AssetId),
@@ -57,6 +58,68 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         Ok(id) => ImportOutcome::Imported(id),
         Err(e) => ImportOutcome::Failed(e),
     }
+}
+
+pub struct ImportSummary {
+    pub imported: u32,
+    pub duplicates: u32,
+    pub failed: Vec<(std::path::PathBuf, Error)>,
+}
+
+pub async fn import_dir(
+    dir: &Path,
+    index: &impl AssetIndex,
+    config: &Paths,
+) -> Result<ImportSummary> {
+    if !dir.is_dir() {
+        return Err(Error::Io {
+            path: dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "path does not exist or is not a directory",
+            ),
+        });
+    }
+
+    let mut summary = ImportSummary {
+        imported: 0,
+        duplicates: 0,
+        failed: Vec::new(),
+    };
+
+    for entry in WalkDir::new(dir) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                let path = e.path().unwrap_or(dir).to_path_buf();
+                let io_err = e
+                    .into_io_error()
+                    .unwrap_or_else(|| std::io::Error::other("directory walk error"));
+                summary.failed.push((
+                    path.clone(),
+                    Error::Io {
+                        path,
+                        source: io_err,
+                    },
+                ));
+                continue;
+            }
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        match import_file(entry.path(), index, config).await {
+            ImportOutcome::Imported(_) => summary.imported += 1,
+            ImportOutcome::Duplicate(_) => summary.duplicates += 1,
+            ImportOutcome::Failed(e) => {
+                summary.failed.push((entry.path().to_path_buf(), e));
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -117,5 +180,62 @@ mod tests {
 
         let outcome = import_file(&nonexistent, &index, &paths).await;
         assert!(matches!(outcome, ImportOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn dir_imports_all_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src_dir = tmp.path().join("photos");
+        write_file(&src_dir, "a.jpg", b"image a");
+        write_file(&src_dir, "b.jpg", b"image b");
+        write_file(&src_dir, "c.jpg", b"image c");
+        let index = MockAssetIndex::new();
+
+        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
+        assert_eq!(summary.imported, 3);
+        assert_eq!(summary.duplicates, 0);
+        assert!(summary.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dir_counts_duplicates_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src_dir = tmp.path().join("photos");
+        let file = write_file(&src_dir, "photo.jpg", b"image content");
+        let index = MockAssetIndex::new();
+        let hash = crate::hash_file(&file).unwrap();
+        index.seed(&hash, AssetId::new());
+
+        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.duplicates, 1);
+        assert!(summary.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dir_not_found_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let index = MockAssetIndex::new();
+        let missing = tmp.path().join("does_not_exist");
+
+        let result = import_dir(&missing, &index, &paths).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dir_skips_subdirectory_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src_dir = tmp.path().join("photos");
+        write_file(&src_dir, "good.jpg", b"good image");
+        std::fs::create_dir(src_dir.join("subdir")).unwrap();
+        let index = MockAssetIndex::new();
+
+        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
+        assert_eq!(summary.imported, 1);
+        assert!(summary.failed.is_empty());
     }
 }
