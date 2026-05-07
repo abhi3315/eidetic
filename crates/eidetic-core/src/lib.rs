@@ -8,6 +8,6 @@ pub mod config;
 pub mod error;
 pub mod ids;
 
-pub use config::Config;
+pub use config::{Config, Paths};
 pub use error::{Error, Result};
 pub use ids::AssetId;
