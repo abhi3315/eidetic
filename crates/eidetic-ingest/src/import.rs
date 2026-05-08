@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dir_skips_subdirectory_entries() {
+    async fn dir_recurses_into_subdirectories() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let src_dir = tmp.path().join("photos");
