@@ -50,6 +50,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Import { path } => {
+            if !path.is_file() && !path.is_dir() {
+                anyhow::bail!("{} is not a file or directory", path.display());
+            }
+
             let config = Config::from_env().context("failed to load config")?;
             let pool = eidetic_db::connect(&config)
                 .await
@@ -92,8 +96,6 @@ async fn main() -> anyhow::Result<()> {
                 if !summary.failed.is_empty() {
                     std::process::exit(1);
                 }
-            } else {
-                anyhow::bail!("{} is not a file or directory", path.display());
             }
         }
     }
