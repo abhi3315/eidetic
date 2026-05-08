@@ -4,7 +4,7 @@ use exif::{In, Reader, Tag, Value};
 use std::io::{BufReader, Read};
 use std::path::Path;
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ExifData {
     pub date_taken: Option<DateTime<Utc>>,
     pub latitude: Option<f64>,
@@ -70,6 +70,8 @@ fn read_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
             let s = std::str::from_utf8(bytes).ok()?.trim_end_matches('\0');
             chrono::NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S")
                 .ok()
+                // EXIF stores local time with no timezone. Treating as UTC is a known
+                // imprecision acceptable for a single-user personal library.
                 .map(|ndt| ndt.and_utc())
         }),
         _ => None,
@@ -99,7 +101,7 @@ fn read_gps_coord(
         Value::Ascii(vecs) => vecs
             .first()
             .and_then(|b| b.first())
-            .and_then(|&b| char::from_u32(b as u32))?,
+            .map(|&b| char::from(b))?,
         _ => return None,
     };
 
