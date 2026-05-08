@@ -49,6 +49,7 @@ pub async fn connect(config: &Config) -> Result<PgPool> {
 fn sanitize_url(url: &str) -> String {
     if let Some(at_idx) = url.find('@')
         && let Some(scheme_end) = url.find("://")
+        && scheme_end + 3 < at_idx
     {
         let creds_start = scheme_end + 3;
         if let Some(colon_idx) = url[creds_start..at_idx].find(':') {
@@ -78,6 +79,13 @@ mod tests {
     #[test]
     fn sanitize_url_passes_through_when_no_credentials() {
         let url = "postgres://localhost:5432/eidetic";
+        assert_eq!(sanitize_url(url), url);
+    }
+
+    #[test]
+    fn sanitize_url_without_password_returns_unchanged() {
+        // URL with user but no password — no colon in creds, should pass through
+        let url = "postgres://eidetic@localhost:5432/eidetic";
         assert_eq!(sanitize_url(url), url);
     }
 }

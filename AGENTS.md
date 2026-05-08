@@ -39,8 +39,8 @@ Crates under `crates/`:
 | Crate | Role | Depends on |
 |---|---|---|
 | `eidetic-core` | Shared types: `AssetId`, `Sha256`, errors, config. Zero deps on tokio/sqlx/ort. | (nothing internal) |
-| `eidetic-db` | sqlx pool, migration runner, `*Repo` traits and Postgres impls. | `eidetic-core`, `eidetic-ingest` |
-| `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage. | `eidetic-core` |
+| `eidetic-db` | sqlx pool, migration runner. `AssetsRepo` trait impl (Postgres). | `eidetic-core`, `eidetic-ingest` |
+| `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage. Defines `AssetIndex` trait. | `eidetic-core` |
 | `eidetic-ml` | `Embedder` trait + impls (SigLIP 2 via `ort`). Mock impl for testing. | `eidetic-core` |
 | `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest` |
 
