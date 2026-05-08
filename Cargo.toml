@@ -45,7 +45,7 @@ fast_image_resize = "6"
 walkdir = "2"
 
 # Testing
-testcontainers = { version = "0.23", features = ["tokio"] }
+testcontainers = { version = "0.23" }
 tempfile = "3"
 
 [profile.release]

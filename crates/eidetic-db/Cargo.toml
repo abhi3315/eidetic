@@ -9,6 +9,7 @@ description = "Database access layer for Eidetic."
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
+eidetic-ingest = { path = "../eidetic-ingest" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -16,3 +17,8 @@ serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }

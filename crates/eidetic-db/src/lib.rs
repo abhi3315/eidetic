@@ -15,6 +15,9 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 
+pub mod assets;
+pub use assets::PgAssetsRepo;
+
 pub mod error;
 pub use error::{Error, Result};
 
