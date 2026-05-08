@@ -28,8 +28,9 @@ impl AssetIndex for PgAssetsRepo {
         let id = AssetId::new();
         sqlx::query(
             "INSERT INTO assets \
-             (id, hash, original_filename, storage_path, file_size, mime_type) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (id, hash, original_filename, storage_path, file_size, mime_type, \
+              date_taken, latitude, longitude, camera_make, camera_model) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(id.as_uuid())
         .bind(&asset.hash)
@@ -37,6 +38,11 @@ impl AssetIndex for PgAssetsRepo {
         .bind(asset.storage_path.to_string_lossy().as_ref())
         .bind(asset.file_size as i64)
         .bind(asset.mime_type.as_deref())
+        .bind(asset.date_taken)
+        .bind(asset.latitude)
+        .bind(asset.longitude)
+        .bind(asset.camera_make.as_deref())
+        .bind(asset.camera_model.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| eidetic_ingest::Error::Index(Box::new(e)))?;
