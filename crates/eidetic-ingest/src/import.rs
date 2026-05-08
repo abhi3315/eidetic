@@ -4,7 +4,7 @@ use crate::{
     store_file,
 };
 use eidetic_core::{AssetId, Paths};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub enum ImportOutcome {
@@ -63,7 +63,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
 pub struct ImportSummary {
     pub imported: u32,
     pub duplicates: u32,
-    pub failed: Vec<(std::path::PathBuf, Error)>,
+    pub failed: Vec<(PathBuf, Error)>,
 }
 
 pub async fn import_dir(
@@ -231,11 +231,13 @@ mod tests {
         let paths = make_paths(&tmp);
         let src_dir = tmp.path().join("photos");
         write_file(&src_dir, "good.jpg", b"good image");
-        std::fs::create_dir(src_dir.join("subdir")).unwrap();
+        let subdir = src_dir.join("subdir");
+        write_file(&subdir, "nested.jpg", b"nested image");
         let index = MockAssetIndex::new();
 
         let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
-        assert_eq!(summary.imported, 1);
+        assert_eq!(summary.imported, 2);
+        assert_eq!(summary.duplicates, 0);
         assert!(summary.failed.is_empty());
     }
 }
