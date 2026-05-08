@@ -482,7 +482,9 @@ dependencies = [
  "anyhow",
  "clap",
  "eidetic-core",
+ "eidetic-db",
  "eidetic-ingest",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -505,7 +507,6 @@ dependencies = [
  "eidetic-ingest",
  "serde",
  "sqlx",
- "tempfile",
  "testcontainers",
  "thiserror",
  "tokio",

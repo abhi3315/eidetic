@@ -14,7 +14,9 @@ path = "src/main.rs"
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
 eidetic-ingest = { path = "../eidetic-ingest" }
+eidetic-db = { path = "../eidetic-db" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
