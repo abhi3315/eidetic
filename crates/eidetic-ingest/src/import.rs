@@ -1,7 +1,7 @@
 use crate::{
     Error, Result, hash_file,
     repo::{AssetIndex, InsertOutcome, NewAsset},
-    store_file,
+    store::{commit_staged, stage_file},
 };
 use eidetic_core::{AssetId, Paths};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ pub enum ImportOutcome {
 }
 
 pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -> ImportOutcome {
+    // MIME detection reads only 512 bytes — acceptable before staging.
     let mime_type = match crate::meta::detect_mime(path) {
         Ok(Some(m)) => m,
         Ok(None) => return ImportOutcome::Skipped,
@@ -25,17 +26,34 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         return ImportOutcome::Skipped;
     }
 
-    let file_size = match std::fs::metadata(path) {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+
+    let original_filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Stage a stable copy so all subsequent I/O (size, hash, EXIF) reads the same bytes.
+    let stage = match stage_file(path, &config.library_dir) {
+        Ok(s) => s,
+        Err(e) => return ImportOutcome::Failed(e),
+    };
+
+    let file_size = match std::fs::metadata(stage.path()) {
         Ok(m) => m.len(),
         Err(source) => {
             return ImportOutcome::Failed(Error::Io {
-                path: path.to_path_buf(),
+                path: stage.path().to_path_buf(),
                 source,
             });
         }
     };
 
-    let hash = match hash_file(path) {
+    let hash = match hash_file(stage.path()) {
         Ok(h) => h,
         Err(e) => return ImportOutcome::Failed(e),
     };
@@ -46,21 +64,15 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         Err(e) => return ImportOutcome::Failed(e),
     }
 
-    let storage_path = match store_file(path, &hash, &config.library_dir) {
-        Ok(p) => p,
-        Err(e) => return ImportOutcome::Failed(e),
-    };
-
-    let original_filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
     let exif = if mime_type.starts_with("image/") {
-        crate::meta::extract_exif(path)
+        crate::meta::extract_exif(stage.path())
     } else {
         crate::meta::ExifData::default()
+    };
+
+    let storage_path = match commit_staged(stage, &hash, ext.as_deref(), &config.library_dir) {
+        Ok(p) => p,
+        Err(e) => return ImportOutcome::Failed(e),
     };
 
     let new_asset = NewAsset {

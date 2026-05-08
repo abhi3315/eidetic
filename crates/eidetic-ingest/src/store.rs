@@ -1,32 +1,48 @@
 use crate::Result;
 use std::path::{Path, PathBuf};
 
-/// Copy `src` into the content-addressable library at
-/// `{library_dir}/{hash[0..2]}/{hash[2..4]}/{hash}.{ext}`.
+/// Copy `src` to a uniquely-named temp file inside `staging_dir` (which must be on the
+/// same filesystem as the CAS library so that [`commit_staged`] can rename atomically).
 ///
-/// Creates intermediate directories. Idempotent: if the target already
-/// exists the copy is skipped and the existing path is returned. Dedup
-/// at the DB layer happens before this call, but the idempotency covers
-/// partial-failure recovery.
-pub fn store_file(src: &Path, hash: &str, library_dir: &Path) -> Result<PathBuf> {
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{}", e.to_lowercase()));
+/// The returned [`tempfile::NamedTempFile`] is automatically deleted if dropped without
+/// being persisted — so callers that return early (e.g. dedup hit) get free cleanup.
+pub fn stage_file(src: &Path, staging_dir: &Path) -> Result<tempfile::NamedTempFile> {
+    std::fs::create_dir_all(staging_dir).map_err(|source| crate::Error::StoreIo {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    let tmp =
+        tempfile::NamedTempFile::new_in(staging_dir).map_err(|source| crate::Error::StoreIo {
+            path: staging_dir.to_path_buf(),
+            source,
+        })?;
+    std::fs::copy(src, tmp.path()).map_err(|source| crate::Error::StoreIo {
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+    Ok(tmp)
+}
 
-    let filename = match &ext {
-        Some(e) => format!("{hash}{e}"),
+/// Atomically move a staged temp file to its CAS destination
+/// `{library_dir}/{hash[0..2]}/{hash[2..4]}/{hash}[.ext]`.
+///
+/// If a concurrent import already placed the same file, the temp file is discarded and
+/// the existing path is returned — safe because same hash implies identical content.
+pub fn commit_staged(
+    stage: tempfile::NamedTempFile,
+    hash: &str,
+    ext: Option<&str>,
+    library_dir: &Path,
+) -> Result<PathBuf> {
+    let filename = match ext {
+        Some(e) => format!("{hash}.{e}"),
         None => hash.to_string(),
     };
-
     let dest = library_dir
         .join(&hash[..2])
         .join(&hash[2..4])
         .join(&filename);
 
-    // TOCTOU: another import could complete between this check and the rename below.
-    // That's fine — both writers produce identical content (same hash), and the rename
-    // is atomic, so the last writer wins with a correct file.
     if dest.exists() {
         return Ok(dest);
     }
@@ -37,22 +53,31 @@ pub fn store_file(src: &Path, hash: &str, library_dir: &Path) -> Result<PathBuf>
         source,
     })?;
 
-    let tmp = parent.join(format!("{filename}.tmp"));
-
-    std::fs::copy(src, &tmp).map_err(|source| crate::Error::StoreIo {
-        path: tmp.clone(),
-        source,
-    })?;
-
-    std::fs::rename(&tmp, &dest).map_err(|source| {
-        let _ = std::fs::remove_file(&tmp);
-        crate::Error::StoreIo {
-            path: dest.clone(),
-            source,
+    match stage.persist(&dest) {
+        Ok(_) => Ok(dest),
+        Err(e) => {
+            if dest.exists() {
+                // A concurrent import completed first — same content, safe to ignore.
+                Ok(dest)
+            } else {
+                Err(crate::Error::StoreIo {
+                    path: dest,
+                    source: e.error,
+                })
+            }
         }
-    })?;
+    }
+}
 
-    Ok(dest)
+/// Stage `src` and immediately commit it to the CAS. Convenience wrapper over
+/// [`stage_file`] + [`commit_staged`] for callers that don't need a stable read window.
+pub fn store_file(src: &Path, hash: &str, library_dir: &Path) -> Result<PathBuf> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    let stage = stage_file(src, library_dir)?;
+    commit_staged(stage, hash, ext.as_deref(), library_dir)
 }
 
 #[cfg(test)]
@@ -117,5 +142,19 @@ mod tests {
 
         let dest = store_file(&src, hash, &library).unwrap();
         assert_eq!(dest.file_name().unwrap().to_str().unwrap(), hash);
+    }
+
+    #[test]
+    fn staged_file_auto_cleaned_if_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = write_tmp(tmp.path(), "photo.jpg", b"data");
+        let library = tmp.path().join("library");
+
+        let staged = stage_file(&src, &library).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        assert!(staged_path.exists());
+
+        drop(staged); // simulates early return (e.g. dedup hit)
+        assert!(!staged_path.exists());
     }
 }
