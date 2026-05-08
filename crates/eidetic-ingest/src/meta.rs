@@ -92,6 +92,9 @@ fn read_gps_coord(
         _ => return None,
     };
 
+    if rationals[0].denom == 0 || rationals[1].denom == 0 || rationals[2].denom == 0 {
+        return None;
+    }
     let d = rationals[0].num as f64 / rationals[0].denom as f64;
     let m = rationals[1].num as f64 / rationals[1].denom as f64;
     let s = rationals[2].num as f64 / rationals[2].denom as f64;
