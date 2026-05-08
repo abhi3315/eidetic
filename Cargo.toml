@@ -37,6 +37,12 @@ clap = { version = "4", features = ["derive"] }
 # Hashing
 sha2 = "0.10"
 
+# MIME detection
+infer = "0.16"
+
+# EXIF parsing (Rust module name: exif)
+kamadak-exif = "0.5"
+
 # Image processing
 image = "0.25"
 fast_image_resize = "6"
