@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     ImportOutcome::Skipped => {
-                        println!("Skipped   {} (unsupported file type)", path.display());
+                        println!("Skipped   {} (not a media file)", path.display());
                     }
                     ImportOutcome::Failed(e) => {
                         eprintln!("Failed    {} — {e}", path.display());
@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("Imported   {:>6} files", summary.imported);
                 println!("Duplicates {:>6} files", summary.duplicates);
+                println!("Skipped    {:>6} files", summary.skipped);
                 println!("Failed     {:>6} files", summary.failed.len());
                 for (p, e) in &summary.failed {
                     eprintln!("  {} — {e}", p.display());
