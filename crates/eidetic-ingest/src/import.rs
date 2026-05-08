@@ -15,6 +15,15 @@ pub enum ImportOutcome {
 }
 
 pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -> ImportOutcome {
+    let mime_type = match crate::meta::detect_mime(path) {
+        Ok(Some(m)) => m,
+        Ok(None) => return ImportOutcome::Skipped,
+        Err(e) => return ImportOutcome::Failed(e),
+    };
+    if !mime_type.starts_with("image/") && !mime_type.starts_with("video/") {
+        return ImportOutcome::Skipped;
+    }
+
     let file_size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(source) => {
@@ -47,17 +56,23 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         .unwrap_or("unknown")
         .to_string();
 
+    let exif = if mime_type.starts_with("image/") {
+        crate::meta::extract_exif(path)
+    } else {
+        crate::meta::ExifData::default()
+    };
+
     let new_asset = NewAsset {
         hash,
         original_filename,
         storage_path,
         file_size,
-        mime_type: None,
-        date_taken: None,
-        latitude: None,
-        longitude: None,
-        camera_make: None,
-        camera_model: None,
+        mime_type: Some(mime_type),
+        date_taken: exif.date_taken,
+        latitude: exif.latitude,
+        longitude: exif.longitude,
+        camera_make: exif.camera_make,
+        camera_model: exif.camera_model,
     };
 
     match index.insert_asset(new_asset).await {
@@ -147,11 +162,22 @@ mod tests {
         }
     }
 
-    fn write_file(dir: &Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+    /// Write a minimal JPEG (magic bytes + unique suffix) so files pass MIME detection.
+    /// Each call with a different `tag` produces a file with a different hash.
+    fn write_jpeg(dir: &Path, name: &str, tag: &[u8]) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content).unwrap();
+        f.write_all(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        f.write_all(tag).unwrap();
+        path
+    }
+
+    /// Write a file with non-media content (no recognizable magic bytes).
+    fn write_non_media(dir: &Path, name: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, b"this is not a media file at all").unwrap();
         path
     }
 
@@ -159,7 +185,7 @@ mod tests {
     async fn new_file_is_imported() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
-        let src = write_file(tmp.path(), "photo.jpg", b"fake image");
+        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
         let index = MockAssetIndex::new();
 
         let outcome = import_file(&src, &index, &paths).await;
@@ -170,7 +196,7 @@ mod tests {
     async fn known_hash_returns_duplicate() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
-        let src = write_file(tmp.path(), "photo.jpg", b"fake image");
+        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
         let index = MockAssetIndex::new();
         let hash = crate::hash_file(&src).unwrap();
         let existing_id = AssetId::new();
@@ -192,18 +218,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_media_file_returns_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src = write_non_media(tmp.path(), "document.txt");
+        let index = MockAssetIndex::new();
+
+        let outcome = import_file(&src, &index, &paths).await;
+        assert!(matches!(outcome, ImportOutcome::Skipped));
+    }
+
+    #[tokio::test]
     async fn dir_imports_all_files() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let src_dir = tmp.path().join("photos");
-        write_file(&src_dir, "a.jpg", b"image a");
-        write_file(&src_dir, "b.jpg", b"image b");
-        write_file(&src_dir, "c.jpg", b"image c");
+        write_jpeg(&src_dir, "a.jpg", b"a");
+        write_jpeg(&src_dir, "b.jpg", b"b");
+        write_jpeg(&src_dir, "c.jpg", b"c");
         let index = MockAssetIndex::new();
 
         let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
         assert_eq!(summary.imported, 3);
         assert_eq!(summary.duplicates, 0);
+        assert_eq!(summary.skipped, 0);
         assert!(summary.failed.is_empty());
     }
 
@@ -212,7 +250,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let src_dir = tmp.path().join("photos");
-        let file = write_file(&src_dir, "photo.jpg", b"image content");
+        let file = write_jpeg(&src_dir, "photo.jpg", b"a");
         let index = MockAssetIndex::new();
         let hash = crate::hash_file(&file).unwrap();
         index.seed(&hash, AssetId::new());
@@ -220,6 +258,23 @@ mod tests {
         let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
         assert_eq!(summary.imported, 0);
         assert_eq!(summary.duplicates, 1);
+        assert_eq!(summary.skipped, 0);
+        assert!(summary.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dir_counts_non_media_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src_dir = tmp.path().join("mixed");
+        write_jpeg(&src_dir, "photo.jpg", b"a");
+        write_non_media(&src_dir, "notes.txt");
+        write_non_media(&src_dir, "archive.zip");
+        let index = MockAssetIndex::new();
+
+        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
+        assert_eq!(summary.imported, 1);
+        assert_eq!(summary.skipped, 2);
         assert!(summary.failed.is_empty());
     }
 
@@ -239,9 +294,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
         let src_dir = tmp.path().join("photos");
-        write_file(&src_dir, "good.jpg", b"good image");
+        write_jpeg(&src_dir, "good.jpg", b"a");
         let subdir = src_dir.join("subdir");
-        write_file(&subdir, "nested.jpg", b"nested image");
+        write_jpeg(&subdir, "nested.jpg", b"b");
         let index = MockAssetIndex::new();
 
         let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
