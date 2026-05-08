@@ -11,5 +11,5 @@ pub use error::{Error, Result};
 pub use hasher::hash_file;
 pub use import::{ImportOutcome, ImportSummary, import_dir, import_file};
 pub use meta::ExifData;
-pub use repo::{AssetIndex, NewAsset};
+pub use repo::{AssetIndex, InsertOutcome, NewAsset};
 pub use store::store_file;

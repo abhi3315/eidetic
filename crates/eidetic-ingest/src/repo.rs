@@ -3,10 +3,15 @@ use chrono::{DateTime, Utc};
 use eidetic_core::AssetId;
 use std::path::PathBuf;
 
+pub enum InsertOutcome {
+    Inserted(AssetId),
+    Existing(AssetId),
+}
+
 #[allow(async_fn_in_trait)]
 pub trait AssetIndex {
     async fn find_by_hash(&self, hash: &str) -> Result<Option<AssetId>>;
-    async fn insert_asset(&self, asset: NewAsset) -> Result<AssetId>;
+    async fn insert_asset(&self, asset: NewAsset) -> Result<InsertOutcome>;
 }
 
 #[derive(Clone)]
@@ -57,11 +62,16 @@ pub(crate) mod test_support {
             Ok(self.records.lock().unwrap().get(hash).copied())
         }
 
-        async fn insert_asset(&self, asset: NewAsset) -> crate::Result<AssetId> {
+        async fn insert_asset(&self, asset: NewAsset) -> crate::Result<InsertOutcome> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(&existing_id) = records.get(&asset.hash) {
+                return Ok(InsertOutcome::Existing(existing_id));
+            }
             let id = AssetId::new();
-            self.records.lock().unwrap().insert(asset.hash.clone(), id);
+            records.insert(asset.hash.clone(), id);
+            drop(records);
             self.inserted.lock().unwrap().push(asset);
-            Ok(id)
+            Ok(InsertOutcome::Inserted(id))
         }
     }
 }
@@ -86,7 +96,11 @@ mod tests {
             camera_make: None,
             camera_model: None,
         };
-        let id = index.insert_asset(asset).await.unwrap();
+        let outcome = index.insert_asset(asset).await.unwrap();
+        let id = match outcome {
+            InsertOutcome::Inserted(id) => id,
+            InsertOutcome::Existing(_) => panic!("expected Inserted, got Existing"),
+        };
         let found = index
             .find_by_hash("abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abcd")
             .await

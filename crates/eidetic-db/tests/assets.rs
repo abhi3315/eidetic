@@ -1,7 +1,7 @@
 use chrono::Utc;
 use eidetic_core::Config;
 use eidetic_db::PgAssetsRepo;
-use eidetic_ingest::{AssetIndex, NewAsset};
+use eidetic_ingest::{AssetIndex, InsertOutcome, NewAsset};
 use std::path::PathBuf;
 use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 
@@ -45,7 +45,11 @@ async fn insert_asset_then_find_by_hash() {
         camera_model: None,
     };
 
-    let id = repo.insert_asset(asset).await.expect("insert");
+    let outcome = repo.insert_asset(asset).await.expect("insert");
+    let id = match outcome {
+        InsertOutcome::Inserted(id) => id,
+        InsertOutcome::Existing(_) => panic!("expected Inserted, got Existing"),
+    };
     let found = repo.find_by_hash(hash).await.expect("find");
     assert_eq!(found, Some(id));
 }
@@ -96,7 +100,7 @@ async fn insert_asset_stores_exif_fields() {
         camera_model: Some("EOS R5".to_string()),
     };
 
-    let _id = repo.insert_asset(asset).await.expect("insert");
+    repo.insert_asset(asset).await.expect("insert");
 
     type ExifRow = (
         Option<chrono::DateTime<Utc>>,
@@ -120,4 +124,44 @@ async fn insert_asset_stores_exif_fields() {
     assert!((db_lon.unwrap() - (-122.4194)).abs() < 1e-6);
     assert_eq!(db_make.as_deref(), Some("Canon"));
     assert_eq!(db_model.as_deref(), Some("EOS R5"));
+}
+
+#[tokio::test]
+async fn insert_duplicate_returns_existing() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    let hash = "cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222cccc3333dddd4444";
+    let make_asset = || NewAsset {
+        hash: hash.to_string(),
+        original_filename: "dup.jpg".to_string(),
+        storage_path: PathBuf::from("/library/cc/cc/cccc3333.jpg"),
+        file_size: 1024,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+
+    let first = repo.insert_asset(make_asset()).await.expect("first insert");
+    let first_id = match first {
+        InsertOutcome::Inserted(id) => id,
+        InsertOutcome::Existing(_) => panic!("expected Inserted"),
+    };
+
+    let second = repo
+        .insert_asset(make_asset())
+        .await
+        .expect("second insert");
+    match second {
+        InsertOutcome::Existing(id) => assert_eq!(id, first_id),
+        InsertOutcome::Inserted(_) => panic!("expected Existing on duplicate"),
+    }
 }

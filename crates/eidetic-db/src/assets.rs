@@ -1,5 +1,5 @@
 use eidetic_core::AssetId;
-use eidetic_ingest::{AssetIndex, NewAsset};
+use eidetic_ingest::{AssetIndex, InsertOutcome, NewAsset};
 use sqlx::PgPool;
 
 pub struct PgAssetsRepo {
@@ -24,15 +24,17 @@ impl AssetIndex for PgAssetsRepo {
         Ok(row.map(|(uuid,)| AssetId::from(uuid)))
     }
 
-    async fn insert_asset(&self, asset: NewAsset) -> eidetic_ingest::Result<AssetId> {
-        let id = AssetId::new();
-        sqlx::query(
+    async fn insert_asset(&self, asset: NewAsset) -> eidetic_ingest::Result<InsertOutcome> {
+        let new_id = AssetId::new();
+        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
              (id, hash, original_filename, storage_path, file_size, mime_type, \
               date_taken, latitude, longitude, camera_make, camera_model) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (hash) DO NOTHING \
+             RETURNING id",
         )
-        .bind(id.as_uuid())
+        .bind(new_id.as_uuid())
         .bind(&asset.hash)
         .bind(&asset.original_filename)
         .bind(asset.storage_path.to_string_lossy().as_ref())
@@ -43,10 +45,21 @@ impl AssetIndex for PgAssetsRepo {
         .bind(asset.longitude)
         .bind(asset.camera_make.as_deref())
         .bind(asset.camera_model.as_deref())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| eidetic_ingest::Error::Index(Box::new(e)))?;
 
-        Ok(id)
+        match row {
+            Some((uuid,)) => Ok(InsertOutcome::Inserted(AssetId::from(uuid))),
+            None => {
+                let (uuid,): (uuid::Uuid,) =
+                    sqlx::query_as("SELECT id FROM assets WHERE hash = $1")
+                        .bind(&asset.hash)
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(|e| eidetic_ingest::Error::Index(Box::new(e)))?;
+                Ok(InsertOutcome::Existing(AssetId::from(uuid)))
+            }
+        }
     }
 }

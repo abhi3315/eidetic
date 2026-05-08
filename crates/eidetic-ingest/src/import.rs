@@ -1,6 +1,6 @@
 use crate::{
     Error, Result, hash_file,
-    repo::{AssetIndex, NewAsset},
+    repo::{AssetIndex, InsertOutcome, NewAsset},
     store_file,
 };
 use eidetic_core::{AssetId, Paths};
@@ -77,7 +77,8 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
 
     match index.insert_asset(new_asset).await {
-        Ok(id) => ImportOutcome::Imported(id),
+        Ok(InsertOutcome::Inserted(id)) => ImportOutcome::Imported(id),
+        Ok(InsertOutcome::Existing(id)) => ImportOutcome::Duplicate(id),
         Err(e) => ImportOutcome::Failed(e),
     }
 }
