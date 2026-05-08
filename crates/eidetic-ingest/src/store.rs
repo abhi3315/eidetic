@@ -34,9 +34,19 @@ pub fn store_file(src: &Path, hash: &str, library_dir: &Path) -> Result<PathBuf>
         source,
     })?;
 
-    std::fs::copy(src, &dest).map_err(|source| crate::Error::StoreIo {
-        path: dest.clone(),
+    let tmp = parent.join(format!("{filename}.tmp"));
+
+    std::fs::copy(src, &tmp).map_err(|source| crate::Error::StoreIo {
+        path: tmp.clone(),
         source,
+    })?;
+
+    std::fs::rename(&tmp, &dest).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        crate::Error::StoreIo {
+            path: dest.clone(),
+            source,
+        }
     })?;
 
     Ok(dest)
