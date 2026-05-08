@@ -24,6 +24,9 @@ pub fn store_file(src: &Path, hash: &str, library_dir: &Path) -> Result<PathBuf>
         .join(&hash[2..4])
         .join(&filename);
 
+    // TOCTOU: another import could complete between this check and the rename below.
+    // That's fine — both writers produce identical content (same hash), and the rename
+    // is atomic, so the last writer wins with a correct file.
     if dest.exists() {
         return Ok(dest);
     }
