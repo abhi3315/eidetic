@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 }
-            } else {
+            } else if path.is_dir() {
                 let summary = eidetic_ingest::import_dir(&path, &repo, &config.paths)
                     .await
                     .with_context(|| format!("cannot import {}", path.display()))?;
@@ -82,12 +82,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Duplicates {:>6} files", summary.duplicates);
                 println!("Failed     {:>6} files", summary.failed.len());
                 for (p, e) in &summary.failed {
-                    println!("  {} — {e}", p.display());
+                    eprintln!("  {} — {e}", p.display());
                 }
 
                 if !summary.failed.is_empty() {
                     std::process::exit(1);
                 }
+            } else {
+                anyhow::bail!("{} is not a file or directory", path.display());
             }
         }
     }
