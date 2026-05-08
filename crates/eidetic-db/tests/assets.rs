@@ -1,3 +1,4 @@
+use chrono::Utc;
 use eidetic_core::Config;
 use eidetic_db::PgAssetsRepo;
 use eidetic_ingest::{AssetIndex, NewAsset};
@@ -65,4 +66,58 @@ async fn find_by_hash_returns_none_for_unknown() {
         .await
         .expect("find");
     assert!(found.is_none());
+}
+
+#[tokio::test]
+async fn insert_asset_stores_exif_fields() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool.clone());
+
+    let hash = "bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222cccc3333";
+    let date_taken = chrono::DateTime::parse_from_rfc3339("2023-06-15T10:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let asset = NewAsset {
+        hash: hash.to_string(),
+        original_filename: "vacation.jpg".to_string(),
+        storage_path: PathBuf::from("/library/bb/bb/bbbb2222.jpg"),
+        file_size: 4096,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: Some(date_taken),
+        latitude: Some(37.7749),
+        longitude: Some(-122.4194),
+        camera_make: Some("Canon".to_string()),
+        camera_model: Some("EOS R5".to_string()),
+    };
+
+    let _id = repo.insert_asset(asset).await.expect("insert");
+
+    type ExifRow = (
+        Option<chrono::DateTime<Utc>>,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: ExifRow = sqlx::query_as(
+        "SELECT date_taken, latitude, longitude, camera_make, camera_model \
+         FROM assets WHERE hash = $1",
+    )
+    .bind(hash)
+    .fetch_one(&pool)
+    .await
+    .expect("select");
+
+    let (db_date_taken, db_lat, db_lon, db_make, db_model) = row;
+    assert_eq!(db_date_taken, Some(date_taken));
+    assert!((db_lat.unwrap() - 37.7749).abs() < 1e-6);
+    assert!((db_lon.unwrap() - (-122.4194)).abs() < 1e-6);
+    assert_eq!(db_make.as_deref(), Some("Canon"));
+    assert_eq!(db_model.as_deref(), Some("EOS R5"));
 }
