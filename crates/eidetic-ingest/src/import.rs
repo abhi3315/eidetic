@@ -57,8 +57,9 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         Ok(h) => h,
         Err(e) => return ImportOutcome::Failed(e),
     };
+    let hash_hex = hash.to_string();
 
-    match index.find_by_hash(&hash).await {
+    match index.find_by_hash(&hash_hex).await {
         Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
         Ok(None) => {}
         Err(e) => return ImportOutcome::Failed(e),
@@ -76,7 +77,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
 
     let new_asset = NewAsset {
-        hash,
+        hash: hash_hex,
         original_filename,
         storage_path,
         file_size,
@@ -212,7 +213,7 @@ mod tests {
         let paths = make_paths(&tmp);
         let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
         let index = MockAssetIndex::new();
-        let hash = crate::hash_file(&src).unwrap();
+        let hash = crate::hash_file(&src).unwrap().to_string();
         let existing_id = AssetId::new();
         index.seed(&hash, existing_id);
 
@@ -280,7 +281,7 @@ mod tests {
         let src_dir = tmp.path().join("photos");
         let file = write_jpeg(&src_dir, "photo.jpg", b"a");
         let index = MockAssetIndex::new();
-        let hash = crate::hash_file(&file).unwrap();
+        let hash = crate::hash_file(&file).unwrap().to_string();
         index.seed(&hash, AssetId::new());
 
         let summary = import_dir(&src_dir, &index, &paths).await.unwrap();

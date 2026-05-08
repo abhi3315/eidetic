@@ -10,7 +10,8 @@
 //! the user's library.
 
 use crate::{Error, Result};
-use sha2::{Digest, Sha256};
+use eidetic_core::Sha256;
+use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -20,14 +21,14 @@ use std::path::Path;
 /// up RAM.
 const READ_BUF_SIZE: usize = 64 * 1024;
 
-/// Compute the SHA-256 hash of a file. Returns a lowercase hex string.
-pub fn hash_file(path: &Path) -> Result<String> {
+/// Compute the SHA-256 hash of a file.
+pub fn hash_file(path: &Path) -> Result<Sha256> {
     let file = File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
     let mut reader = BufReader::with_capacity(READ_BUF_SIZE, file);
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha256Hasher::new();
     let mut buf = [0u8; READ_BUF_SIZE];
 
     loop {
@@ -41,7 +42,9 @@ pub fn hash_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hasher.finalize());
+    Ok(Sha256::from_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -63,7 +66,7 @@ mod tests {
 
         let hash = hash_file(&path).unwrap();
         assert_eq!(
-            hash,
+            hash.to_string(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
 
@@ -77,7 +80,7 @@ mod tests {
 
         let hash = hash_file(&path).unwrap();
         assert_eq!(
-            hash,
+            hash.to_string(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
 
@@ -101,11 +104,11 @@ mod tests {
         let streamed = hash_file(&path).unwrap();
         let oneshot = {
             let bytes = std::fs::read(&path).unwrap();
-            let mut h = Sha256::new();
+            let mut h = Sha256Hasher::new();
             h.update(&bytes);
             format!("{:x}", h.finalize())
         };
-        assert_eq!(streamed, oneshot);
+        assert_eq!(streamed.to_string(), oneshot);
 
         let _ = std::fs::remove_file(&path);
     }

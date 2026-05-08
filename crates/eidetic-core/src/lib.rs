@@ -10,4 +10,4 @@ pub mod ids;
 
 pub use config::{Config, Paths};
 pub use error::{Error, Result};
-pub use ids::AssetId;
+pub use ids::{AssetId, Sha256};

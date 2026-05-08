@@ -1,4 +1,5 @@
 use crate::Result;
+use eidetic_core::Sha256;
 use std::path::{Path, PathBuf};
 
 /// Copy `src` to a uniquely-named temp file inside `staging_dir` (which must be on the
@@ -30,18 +31,16 @@ pub fn stage_file(src: &Path, staging_dir: &Path) -> Result<tempfile::NamedTempF
 /// the existing path is returned — safe because same hash implies identical content.
 pub fn commit_staged(
     stage: tempfile::NamedTempFile,
-    hash: &str,
+    hash: &Sha256,
     ext: Option<&str>,
     library_dir: &Path,
 ) -> Result<PathBuf> {
+    let hex = hash.to_string(); // always 64 chars — safe to slice
     let filename = match ext {
-        Some(e) => format!("{hash}.{e}"),
-        None => hash.to_string(),
+        Some(e) => format!("{hex}.{e}"),
+        None => hex.clone(),
     };
-    let dest = library_dir
-        .join(&hash[..2])
-        .join(&hash[2..4])
-        .join(&filename);
+    let dest = library_dir.join(&hex[..2]).join(&hex[2..4]).join(&filename);
 
     if dest.exists() {
         return Ok(dest);
@@ -71,7 +70,7 @@ pub fn commit_staged(
 
 /// Stage `src` and immediately commit it to the CAS. Convenience wrapper over
 /// [`stage_file`] + [`commit_staged`] for callers that don't need a stable read window.
-pub fn store_file(src: &Path, hash: &str, library_dir: &Path) -> Result<PathBuf> {
+pub fn store_file(src: &Path, hash: &Sha256, library_dir: &Path) -> Result<PathBuf> {
     let ext = src
         .extension()
         .and_then(|e| e.to_str())
@@ -93,14 +92,18 @@ mod tests {
         path
     }
 
+    fn hex(s: &str) -> Sha256 {
+        Sha256::from_hex(s).expect("test hash must be valid 64-char hex")
+    }
+
     #[test]
     fn stores_at_cas_path() {
         let tmp = tempfile::tempdir().unwrap();
         let src = write_tmp(tmp.path(), "photo.jpg", b"fake image data");
         let library = tmp.path().join("library");
-        let hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let hash = hex("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
 
-        let dest = store_file(&src, hash, &library).unwrap();
+        let dest = store_file(&src, &hash, &library).unwrap();
 
         assert_eq!(
             dest,
@@ -115,9 +118,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = write_tmp(tmp.path(), "img.png", b"data");
         let library = tmp.path().join("nested").join("library");
-        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash = hex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
-        let dest = store_file(&src, hash, &library).unwrap();
+        let dest = store_file(&src, &hash, &library).unwrap();
         assert!(dest.exists());
     }
 
@@ -126,10 +129,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = write_tmp(tmp.path(), "dup.jpg", b"content");
         let library = tmp.path().join("library");
-        let hash = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222";
+        let hash = hex("aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222");
 
-        let dest1 = store_file(&src, hash, &library).unwrap();
-        let dest2 = store_file(&src, hash, &library).unwrap();
+        let dest1 = store_file(&src, &hash, &library).unwrap();
+        let dest2 = store_file(&src, &hash, &library).unwrap();
         assert_eq!(dest1, dest2);
     }
 
@@ -138,10 +141,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = write_tmp(tmp.path(), "noext", b"data");
         let library = tmp.path().join("library");
-        let hash = "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff";
+        let hash = hex("1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff");
 
-        let dest = store_file(&src, hash, &library).unwrap();
-        assert_eq!(dest.file_name().unwrap().to_str().unwrap(), hash);
+        let dest = store_file(&src, &hash, &library).unwrap();
+        assert_eq!(
+            dest.file_name().unwrap().to_str().unwrap(),
+            hash.to_string()
+        );
     }
 
     #[test]
