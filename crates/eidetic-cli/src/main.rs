@@ -68,6 +68,9 @@ async fn main() -> anyhow::Result<()> {
                             id
                         );
                     }
+                    ImportOutcome::Skipped => {
+                        println!("Skipped   {} (unsupported file type)", path.display());
+                    }
                     ImportOutcome::Failed(e) => {
                         eprintln!("Failed    {} — {e}", path.display());
                         std::process::exit(1);

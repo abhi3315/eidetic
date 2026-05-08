@@ -37,6 +37,11 @@ async fn insert_asset_then_find_by_hash() {
         storage_path: PathBuf::from("/library/aa/aa/aaaa1111.jpg"),
         file_size: 2048,
         mime_type: None,
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
     };
 
     let id = repo.insert_asset(asset).await.expect("insert");

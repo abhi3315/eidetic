@@ -1,4 +1,5 @@
 use crate::Result;
+use chrono::{DateTime, Utc};
 use eidetic_core::AssetId;
 use std::path::PathBuf;
 
@@ -14,6 +15,11 @@ pub struct NewAsset {
     pub storage_path: PathBuf,
     pub file_size: u64,
     pub mime_type: Option<String>,
+    pub date_taken: Option<DateTime<Utc>>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
 }
 
 #[cfg(test)]
@@ -66,6 +72,11 @@ mod tests {
             storage_path: PathBuf::from("/library/ab/c1/abc123.jpg"),
             file_size: 1024,
             mime_type: None,
+            date_taken: None,
+            latitude: None,
+            longitude: None,
+            camera_make: None,
+            camera_model: None,
         };
         let id = index.insert_asset(asset).await.unwrap();
         let found = index

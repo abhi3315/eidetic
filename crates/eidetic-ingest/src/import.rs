@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 pub enum ImportOutcome {
     Imported(AssetId),
     Duplicate(AssetId),
+    Skipped,
     Failed(Error),
 }
 
@@ -52,6 +53,11 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         storage_path,
         file_size,
         mime_type: None,
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
     };
 
     match index.insert_asset(new_asset).await {
@@ -63,6 +69,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
 pub struct ImportSummary {
     pub imported: u32,
     pub duplicates: u32,
+    pub skipped: u32,
     pub failed: Vec<(PathBuf, Error)>,
 }
 
@@ -84,6 +91,7 @@ pub async fn import_dir(
     let mut summary = ImportSummary {
         imported: 0,
         duplicates: 0,
+        skipped: 0,
         failed: Vec::new(),
     };
 
@@ -113,6 +121,7 @@ pub async fn import_dir(
         match import_file(entry.path(), index, config).await {
             ImportOutcome::Imported(_) => summary.imported += 1,
             ImportOutcome::Duplicate(_) => summary.duplicates += 1,
+            ImportOutcome::Skipped => summary.skipped += 1,
             ImportOutcome::Failed(e) => {
                 summary.failed.push((entry.path().to_path_buf(), e));
             }
