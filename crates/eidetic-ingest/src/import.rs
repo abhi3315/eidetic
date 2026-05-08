@@ -7,6 +7,7 @@ use eidetic_core::{AssetId, Paths};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+#[derive(Debug)]
 pub enum ImportOutcome {
     Imported(AssetId),
     Duplicate(AssetId),
@@ -162,7 +163,7 @@ mod tests {
         }
     }
 
-    /// Write a minimal JPEG (magic bytes + unique suffix) so files pass MIME detection.
+    /// Write stub bytes that `infer` detects as JPEG (not a real JPEG — EXIF parsers will return defaults).
     /// Each call with a different `tag` produces a file with a different hash.
     fn write_jpeg(dir: &Path, name: &str, tag: &[u8]) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
@@ -229,6 +230,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn imported_file_has_jpeg_mime_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
+        let index = MockAssetIndex::new();
+
+        import_file(&src, &index, &paths).await;
+
+        let inserted = index.all_inserted();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].mime_type, Some("image/jpeg".to_string()));
+    }
+
+    #[tokio::test]
     async fn dir_imports_all_files() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_paths(&tmp);
@@ -286,7 +301,7 @@ mod tests {
         let missing = tmp.path().join("does_not_exist");
 
         let result = import_dir(&missing, &index, &paths).await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(crate::Error::Io { .. })));
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ pub trait AssetIndex {
     async fn insert_asset(&self, asset: NewAsset) -> Result<AssetId>;
 }
 
+#[derive(Clone)]
 pub struct NewAsset {
     pub hash: String,
     pub original_filename: String,
@@ -30,13 +31,19 @@ pub(crate) mod test_support {
 
     pub(crate) struct MockAssetIndex {
         records: Mutex<HashMap<String, AssetId>>,
+        inserted: Mutex<Vec<NewAsset>>,
     }
 
     impl MockAssetIndex {
         pub(crate) fn new() -> Self {
             Self {
                 records: Mutex::new(HashMap::new()),
+                inserted: Mutex::new(Vec::new()),
             }
+        }
+
+        pub(crate) fn all_inserted(&self) -> Vec<NewAsset> {
+            self.inserted.lock().unwrap().clone()
         }
 
         #[allow(dead_code)]
@@ -53,6 +60,7 @@ pub(crate) mod test_support {
         async fn insert_asset(&self, asset: NewAsset) -> crate::Result<AssetId> {
             let id = AssetId::new();
             self.records.lock().unwrap().insert(asset.hash.clone(), id);
+            self.inserted.lock().unwrap().push(asset);
             Ok(id)
         }
     }
