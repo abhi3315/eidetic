@@ -155,14 +155,17 @@ fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
     // Convert HWC -> CHW layout, normalize pixel values to [-1.0, 1.0].
     // SigLIP 2 expects: (pixel / 255.0 - 0.5) / 0.5 per channel.
     let size = IMAGE_SIZE as usize;
+    let raw = rgb.as_raw(); // contiguous HWC, length 3*size*size
+    debug_assert_eq!(raw.len(), 3 * size * size);
     let mut chw = vec![0.0f32; 3 * size * size];
-    for y in 0..size {
-        for x in 0..size {
-            let pixel = rgb.get_pixel(x as u32, y as u32);
-            for c in 0..3usize {
-                chw[c * size * size + y * size + x] = (pixel.0[c] as f32 / 255.0 - 0.5) / 0.5;
-            }
-        }
+    let plane = size * size;
+    for i in 0..plane {
+        let r = raw[3 * i] as f32;
+        let g = raw[3 * i + 1] as f32;
+        let b = raw[3 * i + 2] as f32;
+        chw[i] = (r / 255.0 - 0.5) / 0.5;
+        chw[plane + i] = (g / 255.0 - 0.5) / 0.5;
+        chw[2 * plane + i] = (b / 255.0 - 0.5) / 0.5;
     }
     Ok(chw)
 }
@@ -224,6 +227,50 @@ mod tests {
 
     // Note: tokenize() requires a real tokenizer file and is tested end-to-end
     // by the #[ignore] integration test below (image_embedding_is_768_dim_and_normalized).
+
+    #[test]
+    fn preprocess_image_chw_layout_matches_naive() {
+        use image::{ImageBuffer, Rgb};
+
+        // Build a synthetic 4x4 RGB image with deterministic per-channel gradients.
+        let size = 4usize;
+        let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(size as u32, size as u32);
+        for y in 0..size {
+            for x in 0..size {
+                img.put_pixel(
+                    x as u32,
+                    y as u32,
+                    Rgb([(x * 17) as u8, (y * 23) as u8, ((x + y) * 11) as u8]),
+                );
+            }
+        }
+
+        // Naive (old) HWC -> CHW with per-pixel get_pixel.
+        let mut naive = vec![0.0f32; 3 * size * size];
+        for y in 0..size {
+            for x in 0..size {
+                let pixel = img.get_pixel(x as u32, y as u32);
+                for c in 0..3usize {
+                    naive[c * size * size + y * size + x] = (pixel.0[c] as f32 / 255.0 - 0.5) / 0.5;
+                }
+            }
+        }
+
+        // New (linear) HWC -> CHW from as_raw().
+        let raw = img.as_raw();
+        let mut linear = vec![0.0f32; 3 * size * size];
+        let plane = size * size;
+        for i in 0..plane {
+            let r = raw[3 * i] as f32;
+            let g = raw[3 * i + 1] as f32;
+            let b = raw[3 * i + 2] as f32;
+            linear[i] = (r / 255.0 - 0.5) / 0.5;
+            linear[plane + i] = (g / 255.0 - 0.5) / 0.5;
+            linear[2 * plane + i] = (b / 255.0 - 0.5) / 0.5;
+        }
+
+        assert_eq!(naive, linear, "linear walk must match naive get_pixel");
+    }
 
     #[test]
     fn l2_normalize_arbitrary_vector() {
