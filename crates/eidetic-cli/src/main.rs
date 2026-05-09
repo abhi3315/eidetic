@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} is not a file or directory", path.display());
             }
 
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Stats => {
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -190,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Embed => {
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
 
             let models_dir = config.paths.models_cache.clone();
             println!("Loading model (downloads ~350 MB on first run)…");
@@ -266,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
 
             let models_dir = config.paths.models_cache.clone();
             let embedder =

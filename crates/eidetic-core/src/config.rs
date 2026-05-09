@@ -1,4 +1,3 @@
-use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -40,7 +39,7 @@ impl Config {
     /// - `EIDETIC_DATABASE_URL`
     /// - `EIDETIC_LIBRARY_DIR`
     /// - `EIDETIC_MODELS_CACHE`
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env() -> Self {
         let mut config = Self::default();
 
         if let Ok(v) = std::env::var("EIDETIC_DATABASE_URL") {
@@ -53,7 +52,7 @@ impl Config {
             config.paths.models_cache = PathBuf::from(v);
         }
 
-        Ok(config)
+        config
     }
 }
 
