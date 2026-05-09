@@ -68,17 +68,6 @@ pub fn commit_staged(
     }
 }
 
-/// Stage `src` and immediately commit it to the CAS. Convenience wrapper over
-/// [`stage_file`] + [`commit_staged`] for callers that don't need a stable read window.
-pub fn store_file(src: &Path, hash: &Sha256, library_dir: &Path) -> Result<PathBuf> {
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    let stage = stage_file(src, library_dir)?;
-    commit_staged(stage, hash, ext.as_deref(), library_dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +85,15 @@ mod tests {
         Sha256::from_hex(s).expect("test hash must be valid 64-char hex")
     }
 
+    fn store(src: &Path, hash: &Sha256, library_dir: &Path) -> PathBuf {
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        let stage = stage_file(src, library_dir).unwrap();
+        commit_staged(stage, hash, ext.as_deref(), library_dir).unwrap()
+    }
+
     #[test]
     fn stores_at_cas_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -103,7 +101,7 @@ mod tests {
         let library = tmp.path().join("library");
         let hash = hex("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
 
-        let dest = store_file(&src, &hash, &library).unwrap();
+        let dest = store(&src, &hash, &library);
 
         assert_eq!(
             dest,
@@ -120,7 +118,7 @@ mod tests {
         let library = tmp.path().join("nested").join("library");
         let hash = hex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
-        let dest = store_file(&src, &hash, &library).unwrap();
+        let dest = store(&src, &hash, &library);
         assert!(dest.exists());
     }
 
@@ -131,8 +129,8 @@ mod tests {
         let library = tmp.path().join("library");
         let hash = hex("aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222");
 
-        let dest1 = store_file(&src, &hash, &library).unwrap();
-        let dest2 = store_file(&src, &hash, &library).unwrap();
+        let dest1 = store(&src, &hash, &library);
+        let dest2 = store(&src, &hash, &library);
         assert_eq!(dest1, dest2);
     }
 
@@ -143,7 +141,7 @@ mod tests {
         let library = tmp.path().join("library");
         let hash = hex("1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff");
 
-        let dest = store_file(&src, &hash, &library).unwrap();
+        let dest = store(&src, &hash, &library);
         assert_eq!(
             dest.file_name().unwrap().to_str().unwrap(),
             hash.to_string()
