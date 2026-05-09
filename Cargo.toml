@@ -59,7 +59,7 @@ sha2 = "0.10"
 infer = "0.19"
 
 # EXIF parsing (Rust module name: exif)
-kamadak-exif = "0.5"
+kamadak-exif = "0.6"
 
 # Directory walking
 walkdir = "2"
