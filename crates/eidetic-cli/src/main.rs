@@ -78,7 +78,7 @@ const VALID_FIELDS: &[&str] = &[
     "path", "score", "date", "make", "model", "lat", "lon", "mime",
 ];
 
-fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> anyhow::Result<String> {
+fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> String {
     let mut parts = Vec::new();
     for field in fields {
         let value = match field.as_str() {
@@ -93,14 +93,13 @@ fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> anyhow::Res
             "lat" => r.latitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
             "lon" => r.longitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
             "mime" => r.mime_type.clone().unwrap_or_default(),
-            other => anyhow::bail!(
-                "Unknown field: '{other}'. Valid fields: {}",
-                VALID_FIELDS.join(", ")
+            other => unreachable!(
+                "unknown field {other:?} should have been rejected by VALID_FIELDS check"
             ),
         };
         parts.push(value);
     }
-    Ok(parts.join("\t"))
+    parts.join("\t")
 }
 
 #[tokio::main]
@@ -319,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else if let Some(ref field_list) = fields {
                 for r in &results {
-                    println!("{}", format_result(r, field_list)?);
+                    println!("{}", format_result(r, field_list));
                 }
             } else {
                 for r in &results {
