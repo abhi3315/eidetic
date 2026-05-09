@@ -5,6 +5,34 @@ use std::path::Path;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
+/// Which execution provider to register on a `Session`.
+#[allow(dead_code)] // wired into Session construction in a follow-up commit
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// User did not set `EIDETIC_ACCELERATOR`. Platform default applies:
+    /// CoreML on macOS, CPU elsewhere.
+    Default,
+    /// Explicitly requested CoreML. Errors on non-macOS.
+    CoreML,
+    /// Explicitly requested CPU. Always valid.
+    Cpu,
+}
+
+/// Parse the `EIDETIC_ACCELERATOR` env var. Unknown non-empty values are
+/// rejected so a typo (`metal`, `cuda`, etc.) fails loudly rather than
+/// quietly selecting CPU.
+#[allow(dead_code)] // wired into Session construction in a follow-up commit
+fn parse_accelerator(raw: Option<&str>) -> Result<Mode> {
+    match raw {
+        None => Ok(Mode::Default),
+        Some("coreml") => Ok(Mode::CoreML),
+        Some("cpu") => Ok(Mode::Cpu),
+        Some(other) => Err(Error::ModelLoad(format!(
+            "Unknown EIDETIC_ACCELERATOR={other:?}; valid values: coreml, cpu"
+        ))),
+    }
+}
+
 const VISION_MODEL_FILE: &str = "onnx/vision_model.onnx";
 const TEXT_MODEL_FILE: &str = "onnx/text_model.onnx";
 const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -310,6 +338,46 @@ mod tests {
         // Original: [1, 2, 2], magnitude = 3.0, normalized = [1/3, 2/3, 2/3]
         assert!((v[0] - 1.0 / 3.0).abs() < 1e-6);
         assert!((v[1] - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_accelerator_unset_is_default() {
+        assert_eq!(parse_accelerator(None).unwrap(), Mode::Default);
+    }
+
+    #[test]
+    fn parse_accelerator_coreml_ok() {
+        assert_eq!(parse_accelerator(Some("coreml")).unwrap(), Mode::CoreML);
+    }
+
+    #[test]
+    fn parse_accelerator_cpu_ok() {
+        assert_eq!(parse_accelerator(Some("cpu")).unwrap(), Mode::Cpu);
+    }
+
+    #[test]
+    fn parse_accelerator_unknown_value_errors() {
+        let err = parse_accelerator(Some("metal")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metal"),
+            "expected error to mention the bad value, got: {msg}"
+        );
+        assert!(
+            msg.contains("coreml"),
+            "expected error to list valid values, got: {msg}"
+        );
+        assert!(
+            msg.contains("cpu"),
+            "expected error to list valid values, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_accelerator_empty_string_is_unknown() {
+        // Empty string is "set but empty" — treat as a typo, not as unset.
+        let err = parse_accelerator(Some("")).unwrap_err();
+        assert!(err.to_string().contains("Unknown EIDETIC_ACCELERATOR"));
     }
 
     #[test]
