@@ -7,6 +7,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use eidetic_core::Config;
 use eidetic_ingest::ImportOutcome;
+use eidetic_ml::Embedder;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -33,6 +34,8 @@ enum Command {
         /// File or directory to import.
         path: PathBuf,
     },
+    /// Generate embeddings for all imported images that don't have one yet.
+    Embed,
 }
 
 #[tokio::main]
@@ -97,6 +100,65 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Command::Embed => {
+            let config = Config::from_env().context("failed to load config")?;
+
+            let models_dir = config.paths.models_cache.clone();
+            println!("Loading model (downloads ~350 MB on first run)…");
+            let embedder = std::sync::Arc::new(
+                tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
+                    .await
+                    .context("embedder thread panicked")?
+                    .context("failed to load SigLIP 2 model — check your internet connection")?,
+            );
+
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::PgAssetsRepo::new(pool);
+
+            let unembedded = repo
+                .fetch_unembedded()
+                .await
+                .context("failed to fetch unembedded assets")?;
+
+            if unembedded.is_empty() {
+                println!("Nothing to do.");
+                return Ok(());
+            }
+
+            let total = unembedded.len();
+            println!("Found {total} images to embed");
+
+            let mut embedded = 0u32;
+            let mut skipped = 0u32;
+
+            for (i, (id, path)) in unembedded.into_iter().enumerate() {
+                let embedder = std::sync::Arc::clone(&embedder);
+                let path_clone = path.clone();
+
+                let result = tokio::task::spawn_blocking(move || embedder.embed(&path_clone))
+                    .await
+                    .context("embedder thread panicked")?;
+
+                match result {
+                    Ok(emb) => {
+                        repo.store_embedding(id, emb.as_slice())
+                            .await
+                            .context("failed to store embedding")?;
+                        println!("[{}/{}] {}", i + 1, total, path.display());
+                        embedded += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  skipped {}: {e}", path.display());
+                        skipped += 1;
+                    }
+                }
+            }
+
+            println!("Done. Embedded {embedded}, skipped {skipped}.");
         }
     }
 
