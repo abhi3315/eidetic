@@ -17,10 +17,6 @@ impl Embedding {
     pub fn as_slice(&self) -> &[f32] {
         &self.0
     }
-
-    pub fn into_vec(self) -> Vec<f32> {
-        self.0
-    }
 }
 
 /// Produces vector embeddings from images and text.
@@ -82,14 +78,6 @@ mod tests {
         let emb = embedder.embed(&path).unwrap();
         assert_eq!(emb.dim(), 768);
         assert_eq!(emb.as_slice(), &[0.0; 768]);
-    }
-
-    #[test]
-    fn embedding_round_trip() {
-        let values = vec![1.0, 2.0, 3.0];
-        let emb = Embedding::new(values.clone());
-        assert_eq!(emb.dim(), 3);
-        assert_eq!(emb.into_vec(), values);
     }
 
     #[test]
