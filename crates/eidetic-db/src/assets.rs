@@ -1,14 +1,54 @@
+use chrono::{DateTime, Utc};
 use eidetic_core::AssetId;
 use eidetic_ingest::{AssetIndex, InsertOutcome, NewAsset};
 use sqlx::PgPool;
+use std::path::PathBuf;
 
 pub struct PgAssetsRepo {
     pool: PgPool,
 }
 
+pub struct SearchResult {
+    pub id: AssetId,
+    pub storage_path: PathBuf,
+    pub score: f32,
+    pub mime_type: Option<String>,
+    pub date_taken: Option<DateTime<Utc>>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
 impl PgAssetsRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn fetch_unembedded(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
+        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT id, storage_path FROM assets \
+             WHERE embedding IS NULL AND mime_type LIKE 'image/%'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(uuid, path)| (AssetId::from(uuid), PathBuf::from(path)))
+            .collect())
+    }
+
+    pub async fn store_embedding(&self, id: AssetId, embedding: &[f32]) -> crate::Result<()> {
+        let vec = pgvector::Vector::from(embedding.to_vec());
+        sqlx::query("UPDATE assets SET embedding = $1 WHERE id = $2")
+            .bind(vec)
+            .bind(id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(())
     }
 }
 

@@ -1,6 +1,7 @@
 use chrono::Utc;
 use eidetic_core::Config;
-use eidetic_db::PgAssetsRepo;
+#[allow(unused_imports)]
+use eidetic_db::{PgAssetsRepo, SearchResult};
 use eidetic_ingest::{AssetIndex, InsertOutcome, NewAsset};
 use std::path::PathBuf;
 use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
@@ -164,4 +165,99 @@ async fn insert_duplicate_returns_existing() {
         InsertOutcome::Existing(id) => assert_eq!(id, first_id),
         InsertOutcome::Inserted(_) => panic!("expected Existing on duplicate"),
     }
+}
+
+#[tokio::test]
+async fn fetch_unembedded_returns_only_null_embedding_images() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool.clone());
+
+    // Insert two image assets
+    let asset_a = NewAsset {
+        hash: "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000".to_string(),
+        original_filename: "a.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/aa/aa/a.jpg"),
+        file_size: 1024,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+    let asset_b = NewAsset {
+        hash: "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000".to_string(),
+        original_filename: "b.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/bb/bb/b.jpg"),
+        file_size: 2048,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+    let outcome_a = repo.insert_asset(asset_a).await.expect("insert a");
+    repo.insert_asset(asset_b).await.expect("insert b");
+
+    let id_a = match outcome_a {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected Inserted"),
+    };
+
+    // Embed asset_a — now only asset_b should be in the unembedded list
+    repo.store_embedding(id_a, &[0.1f32; 768])
+        .await
+        .expect("store embedding");
+
+    let unembedded = repo.fetch_unembedded().await.expect("fetch unembedded");
+    assert_eq!(unembedded.len(), 1);
+    let (_, path) = &unembedded[0];
+    assert!(path.to_str().unwrap().contains("b.jpg"));
+}
+
+#[tokio::test]
+async fn store_embedding_persists_float_values() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool.clone());
+
+    let asset = NewAsset {
+        hash: "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000".to_string(),
+        original_filename: "c.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/cc/cc/c.jpg"),
+        file_size: 512,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+    let outcome = repo.insert_asset(asset).await.expect("insert");
+    let id = match outcome {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected Inserted"),
+    };
+
+    let embedding: Vec<f32> = (0..768).map(|i| i as f32 / 768.0).collect();
+    repo.store_embedding(id, &embedding).await.expect("store");
+
+    // Verify via raw SQL that the embedding column is non-null
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM assets WHERE id = $1 AND embedding IS NOT NULL")
+            .bind(id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("count query");
+    assert_eq!(count, 1);
 }
