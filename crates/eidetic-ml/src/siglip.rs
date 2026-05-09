@@ -126,18 +126,7 @@ impl Embedder for SiglipEmbedder {
 fn download(models_dir: &Path, filename: &str) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
 
-    // Check local cache first (flat layout: models_dir/<basename>)
-    let basename = std::path::Path::new(filename)
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let local = models_dir.join(basename);
-    if local.exists() {
-        return Ok(local);
-    }
-
-    tracing::info!("Downloading {filename} from {MODEL_REPO}…");
+    tracing::info!("Loading {filename} from {MODEL_REPO}…");
 
     let api = ApiBuilder::new()
         .with_cache_dir(models_dir.to_path_buf())
@@ -233,32 +222,18 @@ mod tests {
         assert!(v.iter().all(|&x| x == 0.0));
     }
 
-    #[test]
-    fn tokenize_pads_to_seq_len() {
-        // Test the padding logic directly with a simulated short sequence.
-        let mut ids = vec![1i64, 2, 3];
-        let mut mask = vec![1i64, 1, 1];
-        ids.truncate(SEQ_LEN);
-        mask.truncate(SEQ_LEN);
-        ids.resize(SEQ_LEN, PAD_TOKEN_ID);
-        mask.resize(SEQ_LEN, 0);
-        assert_eq!(ids.len(), SEQ_LEN);
-        assert_eq!(mask.len(), SEQ_LEN);
-        assert_eq!(ids[63], PAD_TOKEN_ID);
-        assert_eq!(mask[3], 0);
-        assert_eq!(mask[0], 1);
-    }
+    // Note: tokenize() requires a real tokenizer file and is tested end-to-end
+    // by the #[ignore] integration test below (image_embedding_is_768_dim_and_normalized).
 
     #[test]
-    fn tokenize_truncates_long_sequence() {
-        let mut ids: Vec<i64> = (0..100).collect();
-        let mut mask: Vec<i64> = vec![1; 100];
-        ids.truncate(SEQ_LEN);
-        mask.truncate(SEQ_LEN);
-        ids.resize(SEQ_LEN, PAD_TOKEN_ID);
-        mask.resize(SEQ_LEN, 0);
-        assert_eq!(ids.len(), SEQ_LEN);
-        assert_eq!(ids[63], 63); // truncated at index 63
+    fn l2_normalize_arbitrary_vector() {
+        let mut v = vec![1.0f32, 2.0, 2.0];
+        l2_normalize(&mut v);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        // Original: [1, 2, 2], magnitude = 3.0, normalized = [1/3, 2/3, 2/3]
+        assert!((v[0] - 1.0 / 3.0).abs() < 1e-6);
+        assert!((v[1] - 2.0 / 3.0).abs() < 1e-6);
     }
 
     #[test]
