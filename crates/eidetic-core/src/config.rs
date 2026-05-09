@@ -58,7 +58,10 @@ impl Config {
 }
 
 fn default_cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = std::env::var("HOME").expect(
+        "HOME must be set; required for default cache dir \
+         (override with EIDETIC_LIBRARY_DIR / EIDETIC_MODELS_CACHE)",
+    );
     PathBuf::from(home).join(".cache").join("eidetic")
 }
 
