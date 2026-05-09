@@ -28,6 +28,6 @@ jobs:
           OPENAI.API_BASE: https://api.deepseek.com/v1
           OPENAI.API_TYPE: openai
           CONFIG.AI_PROVIDER: openai
-          CONFIG.MODEL: deepseek/deepseek-chat
-          CONFIG.FALLBACK_MODELS: '["deepseek/deepseek-chat"]'
+          CONFIG.MODEL: deepseek-chat
+          CONFIG.FALLBACK_MODELS: '["deepseek-chat"]'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

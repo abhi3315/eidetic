@@ -1,6 +1,11 @@
 [config]
 ai_provider = "openai"
-model = "deepseek/deepseek-chat"
+model = "deepseek-chat"
+
+[github_action_config]
+auto_review = true
+auto_describe = true
+auto_improve = false
 
 [pr_reviewer]
 require_score_label = false
