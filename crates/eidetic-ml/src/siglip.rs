@@ -5,8 +5,10 @@ use std::path::Path;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
+#[cfg(target_os = "macos")]
+use ort::ep::{CoreML, coreml::ComputeUnits};
+
 /// Which execution provider to register on a `Session`.
-#[allow(dead_code)] // wired into Session construction in a follow-up commit
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// User did not set `EIDETIC_ACCELERATOR`. Platform default applies:
@@ -21,7 +23,6 @@ enum Mode {
 /// Parse the `EIDETIC_ACCELERATOR` env var. Unknown non-empty values are
 /// rejected so a typo (`metal`, `cuda`, etc.) fails loudly rather than
 /// quietly selecting CPU.
-#[allow(dead_code)] // wired into Session construction in a follow-up commit
 fn parse_accelerator(raw: Option<&str>) -> Result<Mode> {
     match raw {
         None => Ok(Mode::Default),
@@ -106,15 +107,10 @@ impl SiglipEmbedder {
         let text_path = download(models_dir, variant.repo, TEXT_MODEL_FILE)?;
         let tokenizer_path = download(models_dir, variant.repo, TOKENIZER_FILE)?;
 
-        let vision_session = Session::builder()
-            .map_err(|e: ort::Error| Error::ModelLoad(e.to_string()))?
-            .commit_from_file(&vision_path)
-            .map_err(|e| Error::ModelLoad(format!("vision model: {e}")))?;
+        let mode = parse_accelerator(std::env::var("EIDETIC_ACCELERATOR").ok().as_deref())?;
 
-        let text_session = Session::builder()
-            .map_err(|e: ort::Error| Error::ModelLoad(e.to_string()))?
-            .commit_from_file(&text_path)
-            .map_err(|e| Error::ModelLoad(format!("text model: {e}")))?;
+        let vision_session = build_session(&vision_path, mode)?;
+        let text_session = build_session(&text_path, mode)?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| Error::Tokenize(format!("load tokenizer: {e}")))?;
@@ -202,6 +198,58 @@ fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::
         .map_err(|e| Error::ModelDownload(format!("{filename}: {e}")))?;
 
     Ok(path)
+}
+
+/// Build an ort `Session` from a model file, registering the execution
+/// provider implied by `mode`. CoreML is only registered on macOS — on
+/// other targets, `Mode::Default` and `Mode::Cpu` both fall through to
+/// the CPU EP, and `Mode::CoreML` errors.
+fn build_session(model_path: &Path, mode: Mode) -> Result<Session> {
+    let mut builder =
+        Session::builder().map_err(|e: ort::Error| Error::ModelLoad(e.to_string()))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(mode, Mode::Default | Mode::CoreML) {
+            tracing::info!(
+                accelerator = "coreml",
+                model = %model_path.display(),
+                "registering CoreML EP"
+            );
+            builder = builder
+                .with_execution_providers([CoreML::default()
+                    .with_compute_units(ComputeUnits::All)
+                    .build()])
+                .map_err(|e| Error::ModelLoad(e.to_string()))?;
+        } else {
+            tracing::info!(
+                accelerator = "cpu",
+                model = %model_path.display(),
+                "using CPU EP"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if matches!(mode, Mode::CoreML) {
+            return Err(Error::ModelLoad(
+                "EIDETIC_ACCELERATOR=coreml requested on non-macOS host".into(),
+            ));
+        }
+        // Default and Cpu both mean CPU EP on non-macOS; no registration needed
+        // because ort always builds in the CPU EP.
+        let _ = mode; // silence unused warning when only Cpu/Default are reachable
+        tracing::info!(
+            accelerator = "cpu",
+            model = %model_path.display(),
+            "using CPU EP"
+        );
+    }
+
+    builder
+        .commit_from_file(model_path)
+        .map_err(|e| Error::ModelLoad(format!("{}: {e}", model_path.display())))
 }
 
 fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
