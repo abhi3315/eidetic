@@ -19,6 +19,24 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# ONNX Runtime (ML inference, downloads prebuilt native library at build time)
+ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"] }
+
+# HuggingFace Hub (model file download)
+hf-hub = "0.4"
+
+# Image loading and resizing
+image = "0.25"
+
+# N-dimensional arrays for tensor construction
+ndarray = "0.16"
+
+# Text tokenization (HuggingFace tokenizers port)
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# pgvector sqlx type integration
+pgvector = { version = "0.4", features = ["sqlx"] }
+
 # Errors
 thiserror = "2"
 anyhow = "1"

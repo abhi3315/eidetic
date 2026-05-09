@@ -17,6 +17,7 @@ serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+pgvector = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
