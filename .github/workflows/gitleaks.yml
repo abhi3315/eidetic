@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write  # needed for GITLEAKS_ENABLE_COMMENTS to post findings on the PR
 
 jobs:
   scan:
