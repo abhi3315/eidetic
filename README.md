@@ -11,7 +11,7 @@ Written in Rust. Built primarily with AI assistance.
   - Deduplicates by content hash
   - Extracts EXIF: date taken, GPS, camera make/model
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
-- `eidetic embed` — generate SigLIP 2 embeddings for all imported images (~350 MB model download on first run)
+- `eidetic embed` — generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
 - `eidetic search "dog on beach"` — find photos by natural-language description
   - `--limit N` — number of results (default 10)
   - `--fields score,date,path` — tab-separated column output
@@ -31,7 +31,7 @@ export EIDETIC_DATABASE_URL="postgres://eidetic:eidetic@localhost:5432/eidetic"
 # 3. Import your photos (migrations run automatically on first connect)
 cargo run --release -p eidetic-cli -- import ~/Pictures/
 
-# 4. Generate embeddings (downloads SigLIP 2 model ~350 MB on first run)
+# 4. Generate embeddings (downloads SigLIP 2 model ~1.4 GiB on first run)
 cargo run --release -p eidetic-cli -- embed
 
 # 5. Search

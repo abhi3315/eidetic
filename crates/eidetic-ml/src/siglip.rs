@@ -17,7 +17,8 @@ const PAD_TOKEN_ID: i64 = 1;
 /// SigLIP 2 base embedder.
 ///
 /// Produces 768-dim L2-normalised embeddings for images and text using the
-/// `google/siglip2-base-patch16-256` ONNX models.
+/// `onnx-community/siglip2-base-patch16-256-ONNX` builds of Google's
+/// SigLIP 2 base model.
 pub struct SiglipEmbedder {
     // Session::run takes &mut self, so we use Mutex for interior mutability
     // to satisfy the &self required by the Embedder trait.

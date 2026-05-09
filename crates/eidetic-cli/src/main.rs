@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::from_env();
 
             let models_dir = config.paths.models_cache.clone();
-            println!("Loading model (downloads ~350 MB on first run)…");
+            println!("Loading model (downloads ~1.4 GiB on first run)…");
             let embedder = std::sync::Arc::new(
                 tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
                     .await
