@@ -29,7 +29,7 @@ hf-hub = "0.5"
 image = "0.25"
 
 # N-dimensional arrays for tensor construction
-ndarray = "0.16"
+ndarray = "0.17"
 
 # Text tokenization (HuggingFace tokenizers port)
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
