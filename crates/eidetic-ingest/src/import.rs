@@ -33,9 +33,8 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
 
     let original_filename = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Stage a stable copy so all subsequent I/O (size, hash, EXIF) reads the same bytes.
     let stage = match stage_file(path, &config.library_dir) {
@@ -315,6 +314,21 @@ mod tests {
 
         let result = import_dir(&missing, &index, &paths).await;
         assert!(matches!(result, Err(crate::Error::Io { .. })));
+    }
+
+    #[tokio::test]
+    async fn non_ascii_filename_preserved_not_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src = write_jpeg(tmp.path(), "héllo.jpg", b"a");
+        let index = MockAssetIndex::new();
+
+        import_file(&src, &index, &paths).await;
+
+        let inserted = index.all_inserted();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].original_filename, "héllo.jpg");
+        assert_ne!(inserted[0].original_filename, "unknown");
     }
 
     #[tokio::test]
