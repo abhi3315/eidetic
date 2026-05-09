@@ -92,13 +92,11 @@ impl Embedder for SiglipEmbedder {
     }
 
     fn embed_text(&self, text: &str) -> Result<Embedding> {
-        let (ids, mask) = tokenize(&self.tokenizer, text)?;
+        let ids = tokenize(&self.tokenizer, text)?;
 
         let seq_shape = [1usize, SEQ_LEN];
         let ids_tensor = Tensor::<i64>::from_array((seq_shape, ids))
             .map_err(|e| Error::Inference(format!("create ids tensor: {e}")))?;
-        let mask_tensor = Tensor::<i64>::from_array((seq_shape, mask))
-            .map_err(|e| Error::Inference(format!("create mask tensor: {e}")))?;
 
         let mut session = self
             .text_session
@@ -106,10 +104,7 @@ impl Embedder for SiglipEmbedder {
             .map_err(|e| Error::Inference(format!("lock text session: {e}")))?;
 
         let outputs = session
-            .run(ort::inputs![
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor
-            ])
+            .run(ort::inputs!["input_ids" => ids_tensor])
             .map_err(|e: ort::Error| Error::Inference(e.to_string()))?;
 
         let (_shape, data) = outputs["pooler_output"]
@@ -171,25 +166,19 @@ fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
     Ok(chw)
 }
 
-fn tokenize(tokenizer: &Tokenizer, text: &str) -> Result<(Vec<i64>, Vec<i64>)> {
+fn tokenize(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
     let encoding = tokenizer
         .encode(text, true)
         .map_err(|e| Error::Tokenize(e.to_string()))?;
 
     let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-    let mut mask: Vec<i64> = encoding
-        .get_attention_mask()
-        .iter()
-        .map(|&x| x as i64)
-        .collect();
 
-    // Truncate then pad to exactly SEQ_LEN tokens.
+    // Truncate then pad to exactly SEQ_LEN tokens. SigLIP's text encoder is
+    // bidirectional and does not consume an attention mask.
     ids.truncate(SEQ_LEN);
-    mask.truncate(SEQ_LEN);
     ids.resize(SEQ_LEN, PAD_TOKEN_ID);
-    mask.resize(SEQ_LEN, 0);
 
-    Ok((ids, mask))
+    Ok(ids)
 }
 
 fn l2_normalize(v: &mut [f32]) {
