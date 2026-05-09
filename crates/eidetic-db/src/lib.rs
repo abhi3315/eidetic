@@ -16,7 +16,7 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 
 pub mod assets;
-pub use assets::{PgAssetsRepo, SearchResult};
+pub use assets::{LibraryStats, PgAssetsRepo, SearchResult};
 
 pub mod error;
 pub use error::{Error, Result};

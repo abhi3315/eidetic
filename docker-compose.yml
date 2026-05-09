@@ -1,0 +1,19 @@
+services:
+  db:
+    image: tensorchord/vchord-postgres:pg17-v0.4.3
+    environment:
+      POSTGRES_USER: eidetic
+      POSTGRES_PASSWORD: eidetic
+      POSTGRES_DB: eidetic
+    ports:
+      - "5432:5432"
+    volumes:
+      - eidetic_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eidetic -d eidetic"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  eidetic_pgdata:

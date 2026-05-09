@@ -34,6 +34,8 @@ enum Command {
         /// File or directory to import.
         path: PathBuf,
     },
+    /// Show library statistics.
+    Stats,
     /// Generate embeddings for all imported images that don't have one yet.
     Embed,
     /// Search the library by natural-language description.
@@ -55,6 +57,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GB: u64 = 1 << 30;
+    const MB: u64 = 1 << 20;
+    const KB: u64 = 1 << 10;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 const VALID_FIELDS: &[&str] = &[
@@ -147,6 +164,28 @@ async fn main() -> anyhow::Result<()> {
                 if !summary.failed.is_empty() {
                     std::process::exit(1);
                 }
+            }
+        }
+
+        Command::Stats => {
+            let config = Config::from_env().context("failed to load config")?;
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let s = repo.fetch_stats().await.context("failed to fetch stats")?;
+
+            println!("Assets     {:>8}", s.total);
+            println!("  images   {:>8}", s.images);
+            println!("  videos   {:>8}", s.videos);
+            println!("Embedded   {:>8}", s.embedded);
+            println!("Not yet    {:>8}", s.needs_embed);
+            println!("Size       {:>8}", format_bytes(s.total_bytes as u64));
+            if let Some(earliest) = s.earliest {
+                println!("Earliest   {}", earliest.format("%Y-%m-%d"));
+            }
+            if let Some(latest) = s.latest {
+                println!("Latest     {}", latest.format("%Y-%m-%d"));
             }
         }
 

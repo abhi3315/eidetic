@@ -4,61 +4,92 @@ Self-hosted media intelligence system. A personal photo and video library with s
 
 Written in Rust. Built primarily with AI assistance.
 
-## Status
-
-Pre-alpha. Ingestion pipeline is working — import, dedup, MIME filtering, and EXIF extraction. Semantic search (embedding model + query CLI) is not yet built.
-
 ## What works today
 
-- `eidetic hash <file>` — SHA-256 a file, no setup needed
 - `eidetic import <file|dir>` — import photos/videos into the library
   - Filters non-media files by magic bytes (not extension)
   - Deduplicates by content hash
   - Extracts EXIF: date taken, GPS, camera make/model
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
+- `eidetic embed` — generate SigLIP 2 embeddings for all imported images (~350 MB model download on first run)
+- `eidetic search "dog on beach"` — find photos by natural-language description
+  - `--limit N` — number of results (default 10)
+  - `--fields score,date,path` — tab-separated column output
+  - `--json` — full JSON array
+- `eidetic stats` — library summary (asset counts, size, date range, embedding coverage)
+- `eidetic hash <file>` — SHA-256 a file, no setup needed
 
 ## Quick start
 
 ```bash
-# One-time: install pre-commit hook (runs fmt + clippy on commit)
-./scripts/install-hooks.sh
+# 1. Start Postgres (VectorChord variant required for vector search)
+docker compose up -d
 
-# Build everything
-cargo build --workspace
+# 2. Set env vars (or copy .env.example to .env and source it)
+export EIDETIC_DATABASE_URL="postgres://eidetic:eidetic@localhost:5432/eidetic"
 
-# Hash a file (no DB needed)
-cargo run -p eidetic-cli -- hash <path>
+# 3. Import your photos (migrations run automatically on first connect)
+cargo run --release -p eidetic-cli -- import ~/Pictures/
 
-# Import photos (requires Postgres — see below)
-cargo run -p eidetic-cli -- import ~/Pictures/vacation/
+# 4. Generate embeddings (downloads SigLIP 2 model ~350 MB on first run)
+cargo run --release -p eidetic-cli -- embed
+
+# 5. Search
+cargo run --release -p eidetic-cli -- search "golden hour at the beach"
+cargo run --release -p eidetic-cli -- search "birthday cake" --limit 5 --fields score,date,path
+
+# 6. See what's in the library
+cargo run --release -p eidetic-cli -- stats
 ```
 
-## Postgres setup
+## Configuration
 
-Requires pgvector + VectorChord. Easiest with Docker:
+All settings have sensible defaults (`~/.cache/eidetic/`). Override with environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `EIDETIC_DATABASE_URL` | `postgres://eidetic:eidetic@localhost:5432/eidetic` | Postgres connection string |
+| `EIDETIC_LIBRARY_DIR` | `~/.cache/eidetic/library` | Content-addressable file store |
+| `EIDETIC_MODELS_CACHE` | `~/.cache/eidetic/models` | SigLIP 2 ONNX model cache |
+| `EIDETIC_LOG` | `info` | Log level (trace/debug/info/warn/error) |
+
+Copy `.env.example` to `.env` and adjust as needed. There is no config file — env vars are the only configuration layer for now.
+
+## Database
+
+Requires Postgres with the [VectorChord](https://github.com/tensorchord/VectorChord) extension (`pgvector` compatible, built-in ANN index). The `docker-compose.yml` uses the official image.
 
 ```bash
-docker run -d \
-  --name eidetic-pg \
-  -e POSTGRES_USER=eidetic \
-  -e POSTGRES_PASSWORD=eidetic \
-  -e POSTGRES_DB=eidetic \
-  -p 5432:5432 \
-  tensorchord/vchord-postgres:pg17-v0.4.3
+# Start
+docker compose up -d
 
-export EIDETIC_DATABASE_URL="postgres://eidetic:eidetic@localhost:5432/eidetic"
-export EIDETIC_LIBRARY_DIR="$HOME/.cache/eidetic/library"
+# Stop (data persists in Docker volume)
+docker compose down
+
+# Wipe everything and start fresh
+docker compose down -v
 ```
 
-Migrations run automatically on first connect.
+Migrations run automatically on every `eidetic` startup that connects to the database. They are idempotent and safe to run repeatedly.
+
+## Build
+
+```bash
+# Install pre-commit hook (runs fmt + clippy on every commit)
+./scripts/install-hooks.sh
+
+# Build
+cargo build --workspace
+
+# Test (integration tests require Docker)
+cargo test --workspace
+```
 
 ## Documentation
 
 - [`AGENTS.md`](AGENTS.md) — context for AI agents working on this codebase
 - [`docs/adr/`](docs/adr/) — architecture decisions
 - [`goals.md`](goals.md) — what this project is and isn't
-- [`../STACK_AUDIT.md`](../STACK_AUDIT.md) — verified stack choices (2026-04-26)
-- [`../IMPLEMENTATION_KICKOFF.md`](../IMPLEMENTATION_KICKOFF.md) — how we're building this
 
 ## License
 

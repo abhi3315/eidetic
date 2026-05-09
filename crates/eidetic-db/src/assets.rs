@@ -8,6 +8,17 @@ pub struct PgAssetsRepo {
     pool: PgPool,
 }
 
+pub struct LibraryStats {
+    pub total: i64,
+    pub images: i64,
+    pub videos: i64,
+    pub embedded: i64,
+    pub needs_embed: i64,
+    pub total_bytes: i64,
+    pub earliest: Option<DateTime<Utc>>,
+    pub latest: Option<DateTime<Utc>>,
+}
+
 pub struct SearchResult {
     pub id: AssetId,
     pub storage_path: PathBuf,
@@ -23,6 +34,48 @@ pub struct SearchResult {
 impl PgAssetsRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn fetch_stats(&self) -> crate::Result<LibraryStats> {
+        #[derive(sqlx::FromRow)]
+        struct StatsRow {
+            total: i64,
+            images: i64,
+            videos: i64,
+            embedded: i64,
+            needs_embed: i64,
+            total_bytes: i64,
+            earliest: Option<DateTime<Utc>>,
+            latest: Option<DateTime<Utc>>,
+        }
+
+        let row: StatsRow = sqlx::query_as(
+            "SELECT \
+               COUNT(*)                                                   AS total, \
+               COUNT(*) FILTER (WHERE mime_type LIKE 'image/%')           AS images, \
+               COUNT(*) FILTER (WHERE mime_type LIKE 'video/%')           AS videos, \
+               COUNT(*) FILTER (WHERE embedding IS NOT NULL)              AS embedded, \
+               COUNT(*) FILTER (WHERE embedding IS NULL \
+                                  AND mime_type LIKE 'image/%')           AS needs_embed, \
+               COALESCE(SUM(file_size), 0)                                AS total_bytes, \
+               MIN(date_taken)                                            AS earliest, \
+               MAX(date_taken)                                            AS latest \
+             FROM assets",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(LibraryStats {
+            total: row.total,
+            images: row.images,
+            videos: row.videos,
+            embedded: row.embedded,
+            needs_embed: row.needs_embed,
+            total_bytes: row.total_bytes,
+            earliest: row.earliest,
+            latest: row.latest,
+        })
     }
 
     pub async fn fetch_unembedded(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
