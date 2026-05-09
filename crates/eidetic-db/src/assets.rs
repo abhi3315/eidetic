@@ -50,6 +50,56 @@ impl PgAssetsRepo {
             .map_err(crate::Error::Query)?;
         Ok(())
     }
+
+    pub async fn search_similar(
+        &self,
+        query_vec: &[f32],
+        limit: u32,
+    ) -> crate::Result<Vec<SearchResult>> {
+        #[derive(sqlx::FromRow)]
+        struct SearchRow {
+            id: uuid::Uuid,
+            storage_path: String,
+            score: f32,
+            mime_type: Option<String>,
+            date_taken: Option<DateTime<Utc>>,
+            camera_make: Option<String>,
+            camera_model: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+        }
+
+        let vec = pgvector::Vector::from(query_vec.to_vec());
+        let rows: Vec<SearchRow> = sqlx::query_as(
+            "SELECT id, storage_path, mime_type, date_taken, \
+                    camera_make, camera_model, latitude, longitude, \
+                    (1.0 - (embedding <=> $1))::real AS score \
+             FROM assets \
+             WHERE embedding IS NOT NULL \
+             ORDER BY embedding <=> $1 \
+             LIMIT $2",
+        )
+        .bind(vec)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| SearchResult {
+                id: AssetId::from(r.id),
+                storage_path: PathBuf::from(r.storage_path),
+                score: r.score,
+                mime_type: r.mime_type,
+                date_taken: r.date_taken,
+                camera_make: r.camera_make,
+                camera_model: r.camera_model,
+                latitude: r.latitude,
+                longitude: r.longitude,
+            })
+            .collect())
+    }
 }
 
 #[allow(async_fn_in_trait)]

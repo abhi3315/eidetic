@@ -261,3 +261,76 @@ async fn store_embedding_persists_float_values() {
             .expect("count query");
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn search_similar_orders_by_cosine_similarity() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool.clone());
+
+    // Asset A: embedding aligned with e1 = [1, 0, 0, ..., 0]
+    let mut emb_a = vec![0.0f32; 768];
+    emb_a[0] = 1.0;
+
+    // Asset B: embedding aligned with e2 = [0, 1, 0, ..., 0]
+    let mut emb_b = vec![0.0f32; 768];
+    emb_b[1] = 1.0;
+
+    let asset_a = NewAsset {
+        hash: "dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000".to_string(),
+        original_filename: "d.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/dd/dd/d.jpg"),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+    let asset_b = NewAsset {
+        hash: "eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000".to_string(),
+        original_filename: "e.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/ee/ee/e.jpg"),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+
+    let id_a = match repo.insert_asset(asset_a).await.expect("insert a") {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!(),
+    };
+    let id_b = match repo.insert_asset(asset_b).await.expect("insert b") {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!(),
+    };
+
+    repo.store_embedding(id_a, &emb_a).await.expect("embed a");
+    repo.store_embedding(id_b, &emb_b).await.expect("embed b");
+
+    // Query with e1 — asset A should come first (score ~1.0), B second (score ~0.0)
+    let query = emb_a.clone();
+    let results = repo.search_similar(&query, 10).await.expect("search");
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].score > 0.99,
+        "first result score should be ~1.0, got {}",
+        results[0].score
+    );
+    assert!(
+        results[1].score < 0.01,
+        "second result score should be ~0.0, got {}",
+        results[1].score
+    );
+    assert!(results[0].storage_path.to_str().unwrap().contains("d.jpg"));
+}
