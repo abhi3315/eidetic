@@ -35,35 +35,35 @@ pub trait Embedder: Send + Sync {
     fn embed_text(&self, text: &str) -> Result<Embedding>;
 }
 
-/// Deterministic mock embedder for tests. Returns zeros for all inputs.
-pub struct MockEmbedder {
-    dim: usize,
-}
-
-impl MockEmbedder {
-    pub fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-}
-
-impl Embedder for MockEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn embed(&self, _path: &Path) -> Result<Embedding> {
-        Ok(Embedding(vec![0.0; self.dim]))
-    }
-
-    fn embed_text(&self, _text: &str) -> Result<Embedding> {
-        Ok(Embedding(vec![0.0; self.dim]))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Deterministic mock embedder for tests. Returns zeros for all inputs.
+    struct MockEmbedder {
+        dim: usize,
+    }
+
+    impl MockEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { dim }
+        }
+    }
+
+    impl Embedder for MockEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed(&self, _path: &Path) -> Result<Embedding> {
+            Ok(Embedding(vec![0.0; self.dim]))
+        }
+
+        fn embed_text(&self, _text: &str) -> Result<Embedding> {
+            Ok(Embedding(vec![0.0; self.dim]))
+        }
+    }
 
     #[test]
     fn mock_returns_correct_dim() {
