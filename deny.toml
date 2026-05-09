@@ -11,7 +11,16 @@ no-default-features = false
 
 [advisories]
 yanked = "warn"
-ignore = []
+ignore = [
+    # number_prefix is unmaintained — pulled in via hf-hub → indicatif. No safe upgrade.
+    "RUSTSEC-2025-0119",
+    # paste is unmaintained — pulled in via tokenizers and image → ravif → rav1e. No safe upgrade.
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile is unmaintained — pulled in via testcontainers → bollard. No safe upgrade.
+    "RUSTSEC-2025-0134",
+    # tokio-tar PAX parsing bug — pulled in via testcontainers. No safe upgrade.
+    "RUSTSEC-2025-0111",
+]
 
 [licenses]
 allow = [
@@ -30,7 +39,10 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
-exceptions = []
+exceptions = [
+    # libfuzzer-sys (NCSA) is a transitive dep via image → ravif → rav1e → libfuzzer-sys.
+    { allow = ["NCSA"], name = "libfuzzer-sys" },
+]
 
 [bans]
 multiple-versions = "warn"
