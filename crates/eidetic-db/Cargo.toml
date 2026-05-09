@@ -19,5 +19,7 @@ tracing = { workspace = true }
 pgvector = { workspace = true }
 
 [dev-dependencies]
+eidetic-ingest = { path = "../eidetic-ingest" }
+tempfile = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true }

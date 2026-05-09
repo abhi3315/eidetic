@@ -1042,9 +1042,11 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "eidetic-core",
+ "eidetic-ingest",
  "pgvector",
  "serde",
  "sqlx",
+ "tempfile",
  "testcontainers",
  "thiserror",
  "tokio",

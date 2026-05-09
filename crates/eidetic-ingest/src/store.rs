@@ -42,6 +42,32 @@ pub fn commit_staged(
     let dest = library_dir.join(&hex[..2]).join(&hex[2..4]).join(&filename);
 
     if dest.exists() {
+        // Trust same-hash collisions only when sizes match. Catches a corrupt
+        // file left at this CAS path by an earlier crash or manual placement;
+        // re-hash on length match would be safer still but is overkill at v0.
+        let staged_len = std::fs::metadata(stage.path())
+            .map_err(|source| crate::Error::Io {
+                path: stage.path().to_path_buf(),
+                source,
+            })?
+            .len();
+        let dest_len = std::fs::metadata(&dest)
+            .map_err(|source| crate::Error::Io {
+                path: dest.clone(),
+                source,
+            })?
+            .len();
+        if staged_len != dest_len {
+            return Err(crate::Error::Io {
+                path: dest,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "CAS collision: existing file is {dest_len} B, staged is {staged_len} B"
+                    ),
+                ),
+            });
+        }
         return Ok(dest);
     }
 

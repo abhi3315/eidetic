@@ -1,5 +1,5 @@
 use chrono::Utc;
-use eidetic_core::{AssetIndex, Config, InsertOutcome, NewAsset};
+use eidetic_core::{AssetIndex, Config, InsertOutcome, NewAsset, Paths};
 #[allow(unused_imports)]
 use eidetic_db::{PgAssetsRepo, SearchResult};
 use std::path::PathBuf;
@@ -332,4 +332,97 @@ async fn search_similar_orders_by_cosine_similarity() {
         results[1].score
     );
     assert!(results[0].storage_path.to_str().unwrap().contains("d.jpg"));
+}
+
+#[tokio::test]
+async fn fetch_unembedded_orders_by_id_stably() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    let make_asset = |hash: &str, name: &str| NewAsset {
+        hash: hash.to_string(),
+        original_filename: name.to_string(),
+        storage_path: PathBuf::from(format!("/lib/x/x/{name}")),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+    };
+    let h1 = "1111000011110000111100001111000011110000111100001111000011110000";
+    let h2 = "2222000022220000222200002222000022220000222200002222000022220000";
+    repo.insert_asset(make_asset(h1, "x1.jpg"))
+        .await
+        .expect("insert h1");
+    repo.insert_asset(make_asset(h2, "x2.jpg"))
+        .await
+        .expect("insert h2");
+
+    let r1 = repo.fetch_unembedded().await.expect("fetch a");
+    let r2 = repo.fetch_unembedded().await.expect("fetch b");
+    assert_eq!(r1.len(), 2);
+    let order_a: Vec<_> = r1.iter().map(|(id, _)| *id).collect();
+    let order_b: Vec<_> = r2.iter().map(|(id, _)| *id).collect();
+    assert_eq!(order_a, order_b, "fetch_unembedded must be order-stable");
+}
+
+#[tokio::test]
+async fn import_file_round_trips_through_pg_assets_repo() {
+    use eidetic_ingest::{ImportOutcome, import_file};
+
+    let (_container, url) = start_db().await;
+    let library_tmp = tempfile::tempdir().expect("library tempdir");
+    let src_tmp = tempfile::tempdir().expect("src tempdir");
+
+    let config = Config {
+        database_url: url,
+        paths: Paths {
+            library_dir: library_tmp.path().to_path_buf(),
+            models_cache: PathBuf::from("/tmp/eidetic-test-models-unused"),
+        },
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool.clone());
+
+    // Stub JPEG: 4-byte magic header is enough for `infer` to classify.
+    let src = src_tmp.path().join("photo.jpg");
+    std::fs::write(&src, [0xFF, 0xD8, 0xFF, 0xE0, b'a']).expect("write src");
+
+    // First import lands a row.
+    let id = match import_file(&src, &repo, &config.paths).await {
+        ImportOutcome::Imported(id) => id,
+        other => panic!("expected Imported, got {other:?}"),
+    };
+
+    // Verify the seam: PathBuf → TEXT, u64 → BIGINT, mime/filename round-trip.
+    let (file_size, mime, original_filename, storage_path): (i64, Option<String>, String, String) =
+        sqlx::query_as(
+            "SELECT file_size, mime_type, original_filename, storage_path \
+             FROM assets WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("row exists");
+    assert_eq!(file_size, 5);
+    assert_eq!(mime.as_deref(), Some("image/jpeg"));
+    assert_eq!(original_filename, "photo.jpg");
+    assert!(
+        storage_path.starts_with(library_tmp.path().to_str().unwrap()),
+        "storage_path {storage_path:?} should sit under {:?}",
+        library_tmp.path()
+    );
+
+    // Re-importing the same bytes is a Duplicate, not a constraint error.
+    match import_file(&src, &repo, &config.paths).await {
+        ImportOutcome::Duplicate(dup_id) => assert_eq!(dup_id, id),
+        other => panic!("expected Duplicate, got {other:?}"),
+    }
 }

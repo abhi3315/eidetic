@@ -81,7 +81,8 @@ impl PgAssetsRepo {
     pub async fn fetch_unembedded(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
         let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
             "SELECT id, storage_path FROM assets \
-             WHERE embedding IS NULL AND mime_type LIKE 'image/%'",
+             WHERE embedding IS NULL AND mime_type LIKE 'image/%' \
+             ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await

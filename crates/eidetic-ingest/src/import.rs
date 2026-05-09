@@ -5,6 +5,7 @@ use crate::{
 };
 use eidetic_core::{AssetId, Paths};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 use walkdir::WalkDir;
 
 #[derive(Debug)]
@@ -76,7 +77,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
 
     let new_asset = NewAsset {
-        hash: hash_hex,
+        hash: hash_hex.clone(),
         original_filename,
         storage_path,
         file_size,
@@ -89,8 +90,14 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
 
     match index.insert_asset(new_asset).await {
-        Ok(InsertOutcome::Inserted(id)) => ImportOutcome::Imported(id),
-        Ok(InsertOutcome::Existing(id)) => ImportOutcome::Duplicate(id),
+        Ok(InsertOutcome::Inserted(id)) => {
+            debug!(path = %path.display(), hash = %hash_hex, "imported");
+            ImportOutcome::Imported(id)
+        }
+        Ok(InsertOutcome::Existing(id)) => {
+            debug!(path = %path.display(), hash = %hash_hex, "duplicate");
+            ImportOutcome::Duplicate(id)
+        }
         Err(e) => ImportOutcome::Failed(Error::Index(e)),
     }
 }
@@ -116,6 +123,8 @@ pub async fn import_dir(
             ),
         });
     }
+
+    info!(dir = %dir.display(), "starting import");
 
     let mut summary = ImportSummary {
         imported: 0,
@@ -156,6 +165,14 @@ pub async fn import_dir(
             }
         }
     }
+
+    info!(
+        imported = summary.imported,
+        duplicates = summary.duplicates,
+        skipped = summary.skipped,
+        failed = summary.failed.len(),
+        "import complete"
+    );
 
     Ok(summary)
 }
