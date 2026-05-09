@@ -51,9 +51,30 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_DATABASE_URL` | `postgres://eidetic:eidetic@localhost:5432/eidetic` | Postgres connection string |
 | `EIDETIC_LIBRARY_DIR` | `~/.cache/eidetic/library` | Content-addressable file store |
 | `EIDETIC_MODELS_CACHE` | `~/.cache/eidetic/models` | SigLIP 2 ONNX model cache |
-| `EIDETIC_LOG` | `info` | Log level (trace/debug/info/warn/error) |
+| `EIDETIC_LOG` | `info,ort=warn` | Log level (trace/debug/info/warn/error). `ort=warn` mutes the CoreML EP's verbose graph-partition output. |
+| `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download) or `large` (1024-dim, 3.6 GB, ~5x slower). |
+| `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider. `cpu` or `coreml`. CoreML is wired up and can be enabled, but **does not currently accelerate this workload**. See "Why CoreML is opt-in" below. |
 
 Copy `.env.example` to `.env` and adjust as needed. There is no config file — env vars are the only configuration layer for now.
+
+### Why CoreML is opt-in
+
+CoreML EP is wired up via `ort 2.0.0-rc.12` and registers correctly on macOS, but in practice it does not accelerate SigLIP 2 inference on Apple Silicon (M1 Pro tested). Per-image vision-encoder benchmarks via Python `onnxruntime`:
+
+| Model preprocessing | CPU EP | CoreML EP |
+|---|---|---|
+| As-shipped from `onnx-community` | **148 ms/img** | 265 ms/img |
+| With `onnxruntime.transformers.optimizer` fusions | 151 ms/img | 231 ms/img |
+
+End-to-end COCO 5K eval (Rust): CPU 35 min, CoreML 2.36× slower. Recall@1, R@5, R@10 are bit-identical between the two — accuracy is not the issue.
+
+Why this is happening (all documented unfixed bugs):
+
+- The `onnx-community` SigLIP 2 export uses `auto_pad=SAME_LOWER` on the patch-embedding Conv. CoreML's `MLProgram` compiler refuses to compile this op ([apple/coremltools#2127](https://github.com/apple/coremltools/issues/2127), open since Jan 2024). The legacy `NeuralNetwork` format compiles, but fragments the graph into ~95 CoreML subgraphs that never reach ANE.
+- fp16 model weights produce slightly faster CoreML execution, but ort's optimizer crashes on `SimplifiedLayerNormFusion` for fp16 transformers ([microsoft/onnxruntime#25824](https://github.com/microsoft/onnxruntime/issues/25824)). Forcing `GraphOptimizationLevel::Level1` works around the crash but fp16 on Apple's CPU is itself slower than fp32 (no native fp16 ALUs).
+- ANE never engages even when CoreML runs the fp16 path — measured 0% utilization, 0 W.
+
+Current behavior: `EIDETIC_ACCELERATOR=coreml` registers the CoreML EP and runs correctly, but for typical workloads (importing a photo library, ad-hoc searches) you should leave the variable unset and use CPU. The flag and the wiring are kept so that future ort releases or alternate ONNX exports of SigLIP 2 don't require a code change.
 
 ## Database
 
