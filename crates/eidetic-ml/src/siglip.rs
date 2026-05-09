@@ -34,8 +34,6 @@ fn parse_accelerator(raw: Option<&str>) -> Result<Mode> {
     }
 }
 
-const VISION_MODEL_FILE: &str = "onnx/vision_model.onnx";
-const TEXT_MODEL_FILE: &str = "onnx/text_model.onnx";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const SEQ_LEN: usize = 64;
 const PAD_TOKEN_ID: i64 = 1;
@@ -43,6 +41,8 @@ const PAD_TOKEN_ID: i64 = 1;
 /// Available SigLIP 2 model variants, selected via `EIDETIC_MODEL`.
 struct ModelVariant {
     repo: &'static str,
+    vision_model: &'static str,
+    text_model: &'static str,
     /// Optional companion file holding the text model's external weights.
     /// Some HF exports split a large `.onnx` into a tiny graph header plus a
     /// big `.onnx_data` file; ort loads it transparently if both files sit
@@ -54,6 +54,8 @@ struct ModelVariant {
 
 const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
     repo: "onnx-community/siglip2-base-patch16-256-ONNX",
+    vision_model: "onnx/vision_model.onnx",
+    text_model: "onnx/text_model.onnx",
     text_model_data: None,
     image_size: 256,
     embed_dim: 768,
@@ -61,6 +63,8 @@ const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
 
 const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
     repo: "onnx-community/siglip2-large-patch16-384-ONNX",
+    vision_model: "onnx/vision_model.onnx",
+    text_model: "onnx/text_model.onnx",
     text_model_data: Some("onnx/text_model.onnx_data"),
     image_size: 384,
     embed_dim: 1024,
@@ -98,19 +102,20 @@ impl SiglipEmbedder {
             .map_err(|e| Error::ModelLoad(format!("cannot create models dir: {e}")))?;
 
         let variant = current_variant();
-        let vision_path = download(models_dir, variant.repo, VISION_MODEL_FILE)?;
+        let vision_path = download(models_dir, variant.repo, variant.vision_model)?;
         // Pre-download the external-data companion (if any) so it sits
         // beside text_model.onnx in the snapshot dir before ort opens it.
         if let Some(data_file) = variant.text_model_data {
             download(models_dir, variant.repo, data_file)?;
         }
-        let text_path = download(models_dir, variant.repo, TEXT_MODEL_FILE)?;
+        let text_path = download(models_dir, variant.repo, variant.text_model)?;
         let tokenizer_path = download(models_dir, variant.repo, TOKENIZER_FILE)?;
 
         let mode = parse_accelerator(std::env::var("EIDETIC_ACCELERATOR").ok().as_deref())?;
+        let coreml_cache_dir = models_dir.join("coreml-cache");
 
-        let vision_session = build_session(&vision_path, mode)?;
-        let text_session = build_session(&text_path, mode)?;
+        let vision_session = build_session(&vision_path, mode, &coreml_cache_dir)?;
+        let text_session = build_session(&text_path, mode, &coreml_cache_dir)?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| Error::Tokenize(format!("load tokenizer: {e}")))?;
@@ -203,22 +208,31 @@ fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::
 /// Build an ort `Session` from a model file, registering the execution
 /// provider implied by `mode`. CoreML is only registered on macOS — on
 /// other targets, `Mode::Default` and `Mode::Cpu` both fall through to
-/// the CPU EP, and `Mode::CoreML` errors.
-fn build_session(model_path: &Path, mode: Mode) -> Result<Session> {
+/// the CPU EP, and `Mode::CoreML` errors. `coreml_cache_dir` is where ort
+/// stores the compiled CoreML model so subsequent loads skip recompile.
+fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Result<Session> {
     let mut builder =
         Session::builder().map_err(|e: ort::Error| Error::ModelLoad(e.to_string()))?;
 
     #[cfg(target_os = "macos")]
     {
         if matches!(mode, Mode::Default | Mode::CoreML) {
+            std::fs::create_dir_all(coreml_cache_dir).map_err(|e| {
+                Error::ModelLoad(format!(
+                    "cannot create CoreML cache dir {}: {e}",
+                    coreml_cache_dir.display()
+                ))
+            })?;
             tracing::info!(
                 accelerator = "coreml",
                 model = %model_path.display(),
-                "registering CoreML EP"
+                cache = %coreml_cache_dir.display(),
+                "registering CoreML EP (NeuralNetwork, ComputeUnits::All)"
             );
             builder = builder
                 .with_execution_providers([CoreML::default()
                     .with_compute_units(ComputeUnits::All)
+                    .with_model_cache_dir(coreml_cache_dir.display().to_string())
                     .build()])
                 .map_err(|e| Error::ModelLoad(e.to_string()))?;
         } else {
@@ -239,7 +253,7 @@ fn build_session(model_path: &Path, mode: Mode) -> Result<Session> {
         }
         // Default and Cpu both mean CPU EP on non-macOS; no registration needed
         // because ort always builds in the CPU EP.
-        let _ = mode; // silence unused warning when only Cpu/Default are reachable
+        let _ = (mode, coreml_cache_dir);
         tracing::info!(
             accelerator = "cpu",
             model = %model_path.display(),
