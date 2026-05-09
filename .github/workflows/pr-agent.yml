@@ -24,12 +24,10 @@ jobs:
     steps:
       - uses: qodo-ai/pr-agent@main
         env:
-          OPENAI.KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          OPENAI.API_BASE: https://api.deepseek.com/v1
-          OPENAI.API_TYPE: openai
-          CONFIG.AI_PROVIDER: openai
-          CONFIG.MODEL: deepseek-chat
-          CONFIG.FALLBACK_MODELS: '["deepseek-chat"]'
+          CONFIG.AI_PROVIDER: litellm
+          CONFIG.MODEL: deepseek/deepseek-chat
+          CONFIG.FALLBACK_MODELS: '["deepseek/deepseek-chat"]'
+          DEEPSEEK.KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: "true"
           GITHUB_ACTION_CONFIG.AUTO_IMPROVE: "false"
