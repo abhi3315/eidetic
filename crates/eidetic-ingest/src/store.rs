@@ -8,16 +8,15 @@ use std::path::{Path, PathBuf};
 /// The returned [`tempfile::NamedTempFile`] is automatically deleted if dropped without
 /// being persisted — so callers that return early (e.g. dedup hit) get free cleanup.
 pub fn stage_file(src: &Path, staging_dir: &Path) -> Result<tempfile::NamedTempFile> {
-    std::fs::create_dir_all(staging_dir).map_err(|source| crate::Error::StoreIo {
+    std::fs::create_dir_all(staging_dir).map_err(|source| crate::Error::Io {
         path: staging_dir.to_path_buf(),
         source,
     })?;
-    let tmp =
-        tempfile::NamedTempFile::new_in(staging_dir).map_err(|source| crate::Error::StoreIo {
-            path: staging_dir.to_path_buf(),
-            source,
-        })?;
-    std::fs::copy(src, tmp.path()).map_err(|source| crate::Error::StoreIo {
+    let tmp = tempfile::NamedTempFile::new_in(staging_dir).map_err(|source| crate::Error::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    std::fs::copy(src, tmp.path()).map_err(|source| crate::Error::Io {
         path: tmp.path().to_path_buf(),
         source,
     })?;
@@ -47,7 +46,7 @@ pub fn commit_staged(
     }
 
     let parent = dest.parent().expect("dest always has a parent");
-    std::fs::create_dir_all(parent).map_err(|source| crate::Error::StoreIo {
+    std::fs::create_dir_all(parent).map_err(|source| crate::Error::Io {
         path: parent.to_path_buf(),
         source,
     })?;
@@ -59,7 +58,7 @@ pub fn commit_staged(
                 // A concurrent import completed first — same content, safe to ignore.
                 Ok(dest)
             } else {
-                Err(crate::Error::StoreIo {
+                Err(crate::Error::Io {
                     path: dest,
                     source: e.error,
                 })
