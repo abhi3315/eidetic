@@ -16,10 +16,6 @@ ignore = [
     "RUSTSEC-2025-0119",
     # paste is unmaintained — pulled in via tokenizers and image → ravif → rav1e. No safe upgrade.
     "RUSTSEC-2024-0436",
-    # rustls-pemfile is unmaintained — pulled in via testcontainers → bollard. No safe upgrade.
-    "RUSTSEC-2025-0134",
-    # tokio-tar PAX parsing bug — pulled in via testcontainers. No safe upgrade.
-    "RUSTSEC-2025-0111",
 ]
 
 [licenses]
