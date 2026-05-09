@@ -30,4 +30,7 @@ jobs:
           CONFIG.AI_PROVIDER: openai
           CONFIG.MODEL: deepseek-chat
           CONFIG.FALLBACK_MODELS: '["deepseek-chat"]'
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: "true"
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: "false"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
