@@ -15,7 +15,6 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Paths {
-    pub import_dir: PathBuf,
     pub library_dir: PathBuf,
     pub models_cache: PathBuf,
 }
@@ -25,7 +24,6 @@ impl Default for Config {
         let cache = default_cache_dir();
         Self {
             paths: Paths {
-                import_dir: cache.join("import"),
                 library_dir: cache.join("library"),
                 models_cache: cache.join("models"),
             },
@@ -40,7 +38,6 @@ impl Config {
     ///
     /// Recognized env vars:
     /// - `EIDETIC_DATABASE_URL`
-    /// - `EIDETIC_IMPORT_DIR`
     /// - `EIDETIC_LIBRARY_DIR`
     /// - `EIDETIC_MODELS_CACHE`
     pub fn from_env() -> Result<Self> {
@@ -48,9 +45,6 @@ impl Config {
 
         if let Ok(v) = std::env::var("EIDETIC_DATABASE_URL") {
             config.database_url = v;
-        }
-        if let Ok(v) = std::env::var("EIDETIC_IMPORT_DIR") {
-            config.paths.import_dir = PathBuf::from(v);
         }
         if let Ok(v) = std::env::var("EIDETIC_LIBRARY_DIR") {
             config.paths.library_dir = PathBuf::from(v);
@@ -75,7 +69,6 @@ mod tests {
     #[test]
     fn default_paths_are_under_cache_dir() {
         let config = Config::default();
-        assert!(config.paths.import_dir.ends_with("import"));
         assert!(config.paths.library_dir.ends_with("library"));
         assert!(config.paths.models_cache.ends_with("models"));
     }

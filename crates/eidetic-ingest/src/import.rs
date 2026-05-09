@@ -171,7 +171,6 @@ mod tests {
 
     fn make_paths(tmp: &tempfile::TempDir) -> Paths {
         Paths {
-            import_dir: tmp.path().join("import"),
             library_dir: tmp.path().join("library"),
             models_cache: tmp.path().join("models"),
         }
