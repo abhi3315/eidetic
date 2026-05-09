@@ -36,6 +36,54 @@ enum Command {
     },
     /// Generate embeddings for all imported images that don't have one yet.
     Embed,
+    /// Search the library by natural-language description.
+    Search {
+        /// The text query, e.g. "dog on beach".
+        query: String,
+
+        /// Maximum number of results to return.
+        #[arg(long, default_value = "10")]
+        limit: u32,
+
+        /// Comma-separated fields to include in output.
+        /// Valid: path, score, date, make, model, lat, lon, mime.
+        /// Defaults to path-only when omitted.
+        #[arg(long, value_delimiter = ',')]
+        fields: Option<Vec<String>>,
+
+        /// Output results as a JSON array with all fields.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+const VALID_FIELDS: &[&str] = &[
+    "path", "score", "date", "make", "model", "lat", "lon", "mime",
+];
+
+fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> anyhow::Result<String> {
+    let mut parts = Vec::new();
+    for field in fields {
+        let value = match field.as_str() {
+            "path" => r.storage_path.display().to_string(),
+            "score" => format!("{:.3}", r.score),
+            "date" => r
+                .date_taken
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+            "make" => r.camera_make.clone().unwrap_or_default(),
+            "model" => r.camera_model.clone().unwrap_or_default(),
+            "lat" => r.latitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
+            "lon" => r.longitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
+            "mime" => r.mime_type.clone().unwrap_or_default(),
+            other => anyhow::bail!(
+                "Unknown field: '{other}'. Valid fields: {}",
+                VALID_FIELDS.join(", ")
+            ),
+        };
+        parts.push(value);
+    }
+    Ok(parts.join("\t"))
 }
 
 #[tokio::main]
@@ -159,6 +207,86 @@ async fn main() -> anyhow::Result<()> {
             }
 
             println!("Done. Embedded {embedded}, skipped {skipped}.");
+        }
+
+        Command::Search {
+            query,
+            limit,
+            fields,
+            json,
+        } => {
+            // Validate fields early to fail fast before any model loading.
+            if let Some(ref f) = fields {
+                for field in f {
+                    if !VALID_FIELDS.contains(&field.as_str()) {
+                        anyhow::bail!(
+                            "Unknown field: '{field}'. Valid fields: {}",
+                            VALID_FIELDS.join(", ")
+                        );
+                    }
+                }
+            }
+
+            let config = Config::from_env().context("failed to load config")?;
+
+            let models_dir = config.paths.models_cache.clone();
+            let embedder =
+                tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
+                    .await
+                    .context("embedder thread panicked")?
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to load model: {e}. Run 'eidetic embed' first to download it."
+                        )
+                    })?;
+
+            let query_clone = query.clone();
+            let query_emb = tokio::task::spawn_blocking(move || embedder.embed_text(&query_clone))
+                .await
+                .context("embedder thread panicked")?
+                .context("text embedding failed")?;
+
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::PgAssetsRepo::new(pool);
+
+            let results = repo
+                .search_similar(query_emb.as_slice(), limit)
+                .await
+                .context("search failed")?;
+
+            if results.is_empty() {
+                println!("No results.");
+                return Ok(());
+            }
+
+            if json {
+                let arr: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "path": r.storage_path.to_string_lossy(),
+                            "score": r.score,
+                            "date": r.date_taken.map(|d| d.to_rfc3339()),
+                            "make": r.camera_make,
+                            "model": r.camera_model,
+                            "lat": r.latitude,
+                            "lon": r.longitude,
+                            "mime": r.mime_type,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else if let Some(ref field_list) = fields {
+                for r in &results {
+                    println!("{}", format_result(r, field_list)?);
+                }
+            } else {
+                for r in &results {
+                    println!("{}", r.storage_path.display());
+                }
+            }
         }
     }
 
