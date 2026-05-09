@@ -57,7 +57,7 @@ impl PgAssetsRepo {
                COUNT(*) FILTER (WHERE embedding IS NOT NULL)              AS embedded, \
                COUNT(*) FILTER (WHERE embedding IS NULL \
                                   AND mime_type LIKE 'image/%')           AS needs_embed, \
-               COALESCE(SUM(file_size), 0)                                AS total_bytes, \
+               COALESCE(SUM(file_size), 0)::bigint                        AS total_bytes, \
                MIN(date_taken)                                            AS earliest, \
                MAX(date_taken)                                            AS latest \
              FROM assets",
