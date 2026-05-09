@@ -17,6 +17,7 @@ eidetic-ingest = { path = "../eidetic-ingest" }
 eidetic-db = { path = "../eidetic-db" }
 eidetic-ml = { path = "../eidetic-ml" }
 serde_json = { workspace = true }
+csv = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

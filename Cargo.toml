@@ -64,6 +64,9 @@ kamadak-exif = "0.5"
 # Directory walking
 walkdir = "2"
 
+# CSV parsing (for COCO eval)
+csv = "1"
+
 # Testing
 testcontainers = { version = "0.27" }
 tempfile = "3"

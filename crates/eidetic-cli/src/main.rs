@@ -3,6 +3,8 @@
 //! This binary contains no business logic. Each subcommand wires up the
 //! library crates and dispatches to them. Logic lives in the libraries.
 
+mod eval;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use eidetic_core::Config;
@@ -38,6 +40,19 @@ enum Command {
     Stats,
     /// Generate embeddings for all imported images that don't have one yet.
     Embed,
+    /// Run COCO 5K (Karpathy) text-to-image retrieval eval. Bypasses the
+    /// library entirely — embeds images and captions in-memory.
+    Eval {
+        /// Path to the COCO captions CSV (e.g. test_5k_mscoco_2014.csv).
+        #[arg(long)]
+        coco_csv: PathBuf,
+        /// Directory containing the COCO images named per the CSV.
+        #[arg(long)]
+        coco_images: PathBuf,
+        /// Limit to first N images for fast iteration. Omit for full 5K.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Search the library by natural-language description.
     Search {
         /// The text query, e.g. "dog on beach".
@@ -187,6 +202,16 @@ async fn main() -> anyhow::Result<()> {
             if let Some(latest) = s.latest {
                 println!("Latest     {}", latest.format("%Y-%m-%d"));
             }
+        }
+
+        Command::Eval {
+            coco_csv,
+            coco_images,
+            limit,
+        } => {
+            tokio::task::spawn_blocking(move || eval::run(&coco_csv, &coco_images, limit))
+                .await
+                .context("eval thread panicked")??;
         }
 
         Command::Embed => {
