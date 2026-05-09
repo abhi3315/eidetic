@@ -10,7 +10,7 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error("asset index: {0}")]
-    Index(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    Index(#[source] eidetic_core::IndexError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

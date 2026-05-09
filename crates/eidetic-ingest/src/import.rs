@@ -61,7 +61,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     match index.find_by_hash(&hash_hex).await {
         Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
         Ok(None) => {}
-        Err(e) => return ImportOutcome::Failed(e),
+        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
     }
 
     let exif = if mime_type.starts_with("image/") {
@@ -91,7 +91,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     match index.insert_asset(new_asset).await {
         Ok(InsertOutcome::Inserted(id)) => ImportOutcome::Imported(id),
         Ok(InsertOutcome::Existing(id)) => ImportOutcome::Duplicate(id),
-        Err(e) => ImportOutcome::Failed(e),
+        Err(e) => ImportOutcome::Failed(Error::Index(e)),
     }
 }
 

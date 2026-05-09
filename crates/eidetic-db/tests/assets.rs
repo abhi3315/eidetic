@@ -1,8 +1,7 @@
 use chrono::Utc;
-use eidetic_core::Config;
+use eidetic_core::{AssetIndex, Config, InsertOutcome, NewAsset};
 #[allow(unused_imports)]
 use eidetic_db::{PgAssetsRepo, SearchResult};
-use eidetic_ingest::{AssetIndex, InsertOutcome, NewAsset};
 use std::path::PathBuf;
 use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 

@@ -9,5 +9,5 @@ description = "Shared types and configuration for Eidetic."
 
 [dependencies]
 serde = { workspace = true }
-thiserror = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }

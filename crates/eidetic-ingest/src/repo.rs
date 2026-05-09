@@ -1,36 +1,14 @@
-use crate::Result;
-use chrono::{DateTime, Utc};
-use eidetic_core::AssetId;
-use std::path::PathBuf;
+//! Re-export the AssetIndex trait + types from `eidetic-core`.
+//!
+//! The trait moved to `eidetic-core` so storage backends (e.g. `eidetic-db`)
+//! can implement it without depending on this crate.
 
-pub enum InsertOutcome {
-    Inserted(AssetId),
-    Existing(AssetId),
-}
-
-#[allow(async_fn_in_trait)]
-pub trait AssetIndex {
-    async fn find_by_hash(&self, hash: &str) -> Result<Option<AssetId>>;
-    async fn insert_asset(&self, asset: NewAsset) -> Result<InsertOutcome>;
-}
-
-#[derive(Clone)]
-pub struct NewAsset {
-    pub hash: String,
-    pub original_filename: String,
-    pub storage_path: PathBuf,
-    pub file_size: u64,
-    pub mime_type: Option<String>,
-    pub date_taken: Option<DateTime<Utc>>,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub camera_make: Option<String>,
-    pub camera_model: Option<String>,
-}
+pub use eidetic_core::{AssetIndex, InsertOutcome, NewAsset};
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use eidetic_core::AssetId;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -58,11 +36,11 @@ pub(crate) mod test_support {
     }
 
     impl AssetIndex for MockAssetIndex {
-        async fn find_by_hash(&self, hash: &str) -> crate::Result<Option<AssetId>> {
+        async fn find_by_hash(&self, hash: &str) -> eidetic_core::IndexResult<Option<AssetId>> {
             Ok(self.records.lock().unwrap().get(hash).copied())
         }
 
-        async fn insert_asset(&self, asset: NewAsset) -> crate::Result<InsertOutcome> {
+        async fn insert_asset(&self, asset: NewAsset) -> eidetic_core::IndexResult<InsertOutcome> {
             let mut records = self.records.lock().unwrap();
             if let Some(&existing_id) = records.get(&asset.hash) {
                 return Ok(InsertOutcome::Existing(existing_id));
@@ -79,6 +57,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use test_support::MockAssetIndex;
 
     #[tokio::test]
