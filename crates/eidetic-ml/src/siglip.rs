@@ -5,41 +5,78 @@ use std::path::Path;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
-const MODEL_REPO: &str = "onnx-community/siglip2-base-patch16-256-ONNX";
 const VISION_MODEL_FILE: &str = "onnx/vision_model.onnx";
 const TEXT_MODEL_FILE: &str = "onnx/text_model.onnx";
 const TOKENIZER_FILE: &str = "tokenizer.json";
-const IMAGE_SIZE: u32 = 256;
 const SEQ_LEN: usize = 64;
-const EMBED_DIM: usize = 768;
 const PAD_TOKEN_ID: i64 = 1;
 
-/// SigLIP 2 base embedder.
+/// Available SigLIP 2 model variants, selected via `EIDETIC_MODEL`.
+struct ModelVariant {
+    repo: &'static str,
+    /// Optional companion file holding the text model's external weights.
+    /// Some HF exports split a large `.onnx` into a tiny graph header plus a
+    /// big `.onnx_data` file; ort loads it transparently if both files sit
+    /// in the same directory, but we still need to download it explicitly.
+    text_model_data: Option<&'static str>,
+    image_size: u32,
+    embed_dim: usize,
+}
+
+const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
+    repo: "onnx-community/siglip2-base-patch16-256-ONNX",
+    text_model_data: None,
+    image_size: 256,
+    embed_dim: 768,
+};
+
+const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
+    repo: "onnx-community/siglip2-large-patch16-384-ONNX",
+    text_model_data: Some("onnx/text_model.onnx_data"),
+    image_size: 384,
+    embed_dim: 1024,
+};
+
+fn current_variant() -> &'static ModelVariant {
+    match std::env::var("EIDETIC_MODEL").as_deref() {
+        Ok("large") => &SIGLIP2_LARGE_384,
+        _ => &SIGLIP2_BASE_256,
+    }
+}
+
+/// SigLIP 2 embedder.
 ///
-/// Produces 768-dim L2-normalised embeddings for images and text using the
-/// `onnx-community/siglip2-base-patch16-256-ONNX` builds of Google's
-/// SigLIP 2 base model.
+/// Produces L2-normalised embeddings for images and text. The active model
+/// variant is selected via the `EIDETIC_MODEL` env var (`base` by default,
+/// `large` for `siglip2-large-patch16-384`).
 pub struct SiglipEmbedder {
     // Session::run takes &mut self, so we use Mutex for interior mutability
     // to satisfy the &self required by the Embedder trait.
     vision_session: Mutex<Session>,
     text_session: Mutex<Session>,
     tokenizer: Tokenizer,
+    variant: &'static ModelVariant,
 }
 
 impl SiglipEmbedder {
-    /// Load the SigLIP 2 model from `models_dir`.
+    /// Load the active SigLIP 2 variant from `models_dir`.
     ///
-    /// Downloads `onnx/vision_model.onnx`, `onnx/text_model.onnx`, and
-    /// `tokenizer.json` from HuggingFace on first call. Subsequent calls
-    /// load from the local cache.
+    /// Downloads vision/text ONNX files and the tokenizer from HuggingFace
+    /// on first call. The large variant additionally pulls a `.onnx_data`
+    /// companion holding external weights.
     pub fn load(models_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(models_dir)
             .map_err(|e| Error::ModelLoad(format!("cannot create models dir: {e}")))?;
 
-        let vision_path = download(models_dir, VISION_MODEL_FILE)?;
-        let text_path = download(models_dir, TEXT_MODEL_FILE)?;
-        let tokenizer_path = download(models_dir, TOKENIZER_FILE)?;
+        let variant = current_variant();
+        let vision_path = download(models_dir, variant.repo, VISION_MODEL_FILE)?;
+        // Pre-download the external-data companion (if any) so it sits
+        // beside text_model.onnx in the snapshot dir before ort opens it.
+        if let Some(data_file) = variant.text_model_data {
+            download(models_dir, variant.repo, data_file)?;
+        }
+        let text_path = download(models_dir, variant.repo, TEXT_MODEL_FILE)?;
+        let tokenizer_path = download(models_dir, variant.repo, TOKENIZER_FILE)?;
 
         let vision_session = Session::builder()
             .map_err(|e: ort::Error| Error::ModelLoad(e.to_string()))?
@@ -58,18 +95,20 @@ impl SiglipEmbedder {
             vision_session: Mutex::new(vision_session),
             text_session: Mutex::new(text_session),
             tokenizer,
+            variant,
         })
     }
 }
 
 impl Embedder for SiglipEmbedder {
     fn dim(&self) -> usize {
-        EMBED_DIM
+        self.variant.embed_dim
     }
 
     fn embed(&self, path: &Path) -> Result<Embedding> {
-        let pixels = preprocess_image(path)?;
-        let shape = [1usize, 3, IMAGE_SIZE as usize, IMAGE_SIZE as usize];
+        let image_size = self.variant.image_size;
+        let pixels = preprocess_image(path, image_size)?;
+        let shape = [1usize, 3, image_size as usize, image_size as usize];
         let tensor = Tensor::<f32>::from_array((shape, pixels))
             .map_err(|e| Error::Inference(format!("create tensor: {e}")))?;
 
@@ -119,10 +158,10 @@ impl Embedder for SiglipEmbedder {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn download(models_dir: &Path, filename: &str) -> Result<std::path::PathBuf> {
+fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
 
-    tracing::info!("Loading {filename} from {MODEL_REPO}…");
+    tracing::info!("Loading {filename} from {repo}…");
 
     let api = ApiBuilder::new()
         .with_cache_dir(models_dir.to_path_buf())
@@ -130,27 +169,27 @@ fn download(models_dir: &Path, filename: &str) -> Result<std::path::PathBuf> {
         .map_err(|e| Error::ModelDownload(e.to_string()))?;
 
     let path = api
-        .model(MODEL_REPO.to_string())
+        .model(repo.to_string())
         .get(filename)
         .map_err(|e| Error::ModelDownload(format!("{filename}: {e}")))?;
 
     Ok(path)
 }
 
-fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
+fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
     let img = image::open(path).map_err(|e| Error::Inference(format!("cannot open image: {e}")))?;
 
     let rgb = img
         .resize_exact(
-            IMAGE_SIZE,
-            IMAGE_SIZE,
+            image_size,
+            image_size,
             image::imageops::FilterType::Lanczos3,
         )
         .into_rgb8();
 
     // Convert HWC -> CHW layout, normalize pixel values to [-1.0, 1.0].
     // SigLIP 2 expects: (pixel / 255.0 - 0.5) / 0.5 per channel.
-    let size = IMAGE_SIZE as usize;
+    let size = image_size as usize;
     let raw = rgb.as_raw(); // contiguous HWC, length 3*size*size
     debug_assert_eq!(raw.len(), 3 * size * size);
     let mut chw = vec![0.0f32; 3 * size * size];
