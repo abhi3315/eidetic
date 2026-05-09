@@ -11,8 +11,12 @@ use ort::ep::{CoreML, coreml::ComputeUnits};
 /// Which execution provider to register on a `Session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// User did not set `EIDETIC_ACCELERATOR`. Platform default applies:
-    /// CoreML on macOS, CPU elsewhere.
+    /// User did not set `EIDETIC_ACCELERATOR`. Platform default is CPU
+    /// everywhere — CoreML is wired up but does not deliver acceleration
+    /// on the current ort 2.0-rc + onnx-community SigLIP 2 combo (measured
+    /// 2.4× slower than CPU on M1 Pro). Future ort releases or different
+    /// ONNX exports may change this; flip the default back to CoreML on
+    /// macOS once that's true.
     Default,
     /// Explicitly requested CoreML. Errors on non-macOS.
     CoreML,
@@ -216,7 +220,7 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
 
     #[cfg(target_os = "macos")]
     {
-        if matches!(mode, Mode::Default | Mode::CoreML) {
+        if matches!(mode, Mode::CoreML) {
             std::fs::create_dir_all(coreml_cache_dir).map_err(|e| {
                 Error::ModelLoad(format!(
                     "cannot create CoreML cache dir {}: {e}",
