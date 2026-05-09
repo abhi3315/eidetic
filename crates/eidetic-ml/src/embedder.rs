@@ -1,20 +1,7 @@
-//! Image embedder trait + mock implementation.
-//!
-//! The real implementation (`SiglipEmbedder` via `ort`) lands in a
-//! subsequent commit. This file establishes the contract every
-//! embedder honors so the rest of the codebase (search, ingest)
-//! can be built and tested against the trait, not the concrete
-//! impl.
-
 use crate::Result;
 use std::path::Path;
 
 /// A vector embedding produced by an [`Embedder`].
-///
-/// Newtype wrapper around `Vec<f32>` so callers can't accidentally
-/// pass raw floats where an embedding is expected, and so we can
-/// add metadata later (model version, normalization flag, etc.)
-/// without breaking callers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Embedding(Vec<f32>);
 
@@ -36,26 +23,23 @@ impl Embedding {
     }
 }
 
-/// Produces vector embeddings from images.
+/// Produces vector embeddings from images and text.
 ///
-/// Synchronous on purpose. Inference is CPU/GPU-bound, not I/O-bound,
-/// so there's nothing for an async runtime to await on. Callers that
-/// want to keep their tokio runtime threads free should wrap calls
-/// in `tokio::task::spawn_blocking`.
+/// Synchronous on purpose — inference is CPU/GPU-bound, not I/O-bound.
+/// Callers that want to keep their tokio runtime threads free should wrap
+/// calls in `tokio::task::spawn_blocking`.
 pub trait Embedder: Send + Sync {
-    /// Output dimension. Stable for the lifetime of an embedder
-    /// instance — the model is fixed at construction time.
+    /// Output dimension. Stable for the lifetime of an embedder instance.
     fn dim(&self) -> usize;
 
     /// Compute an embedding for the image at `path`.
     fn embed(&self, path: &Path) -> Result<Embedding>;
+
+    /// Compute an embedding for a text string.
+    fn embed_text(&self, text: &str) -> Result<Embedding>;
 }
 
-/// Deterministic mock embedder for tests.
-///
-/// Returns an embedding of the configured dimension where every value
-/// is `0.0`. Useful when a test needs an [`Embedder`] but doesn't
-/// exercise the actual values.
+/// Deterministic mock embedder for tests. Returns zeros for all inputs.
 pub struct MockEmbedder {
     dim: usize,
 }
@@ -72,6 +56,10 @@ impl Embedder for MockEmbedder {
     }
 
     fn embed(&self, _path: &Path) -> Result<Embedding> {
+        Ok(Embedding(vec![0.0; self.dim]))
+    }
+
+    fn embed_text(&self, _text: &str) -> Result<Embedding> {
         Ok(Embedding(vec![0.0; self.dim]))
     }
 }
@@ -102,5 +90,19 @@ mod tests {
         let emb = Embedding::new(values.clone());
         assert_eq!(emb.dim(), 3);
         assert_eq!(emb.into_vec(), values);
+    }
+
+    #[test]
+    fn mock_embed_text_returns_correct_dim() {
+        let embedder = MockEmbedder::new(768);
+        let emb = embedder.embed_text("dog on beach").unwrap();
+        assert_eq!(emb.dim(), 768);
+    }
+
+    #[test]
+    fn mock_embed_text_returns_zeros() {
+        let embedder = MockEmbedder::new(4);
+        let emb = embedder.embed_text("test").unwrap();
+        assert_eq!(emb.as_slice(), &[0.0f32; 4]);
     }
 }
