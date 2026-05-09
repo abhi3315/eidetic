@@ -32,7 +32,7 @@ image = "0.25"
 ndarray = "0.16"
 
 # Text tokenization (HuggingFace tokenizers port)
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 # pgvector sqlx type integration
 pgvector = { version = "0.4", features = ["sqlx"] }
