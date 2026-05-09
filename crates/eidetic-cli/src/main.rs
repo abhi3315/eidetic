@@ -298,11 +298,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
                     .await
                     .context("embedder thread panicked")?
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to load model: {e}. Run 'eidetic embed' first to download it."
-                        )
-                    })?;
+                    .context("failed to load SigLIP 2 model — check your internet connection")?;
 
             let query_clone = query.clone();
             let query_emb = tokio::task::spawn_blocking(move || embedder.embed_text(&query_clone))

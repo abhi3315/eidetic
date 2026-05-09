@@ -271,7 +271,22 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
 }
 
 fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
-    let img = image::open(path).map_err(|e| Error::Inference(format!("cannot open image: {e}")))?;
+    // Cap allocation + dimensions before decode so a decompression-bomb file
+    // (crafted PNG/JPEG/WEBP) can't OOM-kill the embed loop. 512 MB / 16384 px
+    // is well above any real photo and well below "exhaust process memory".
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|e| Error::Inference(format!("cannot open image: {e}")))?
+        .with_guessed_format()
+        .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    reader.limits(limits);
+
+    let img = reader
+        .decode()
+        .map_err(|e| Error::Inference(format!("cannot decode image: {e}")))?;
 
     let rgb = img
         .resize_exact(

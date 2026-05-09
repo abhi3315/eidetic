@@ -12,7 +12,8 @@
 
 use eidetic_core::Config;
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::str::FromStr;
 use tracing::info;
 
 pub mod assets;
@@ -30,9 +31,15 @@ pub use error::{Error, Result};
 pub async fn connect(config: &Config) -> Result<PgPool> {
     info!(database_url = %sanitize_url(&config.database_url), "connecting to postgres");
 
+    // Parse the URL ourselves so any later sqlx error references structured
+    // fields (host, port, user) instead of round-tripping the raw URL — which
+    // sqlx::Error::Configuration would otherwise echo verbatim through anyhow.
+    let options =
+        PgConnectOptions::from_str(&config.database_url).map_err(|_| Error::InvalidUrl)?;
+
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&config.database_url)
+        .connect_with(options)
         .await
         .map_err(Error::Connect)?;
 
