@@ -13,7 +13,7 @@ use crate::{Error, Result};
 use eidetic_core::Sha256;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 
 /// 64 KiB read buffer. Large enough to amortize syscall overhead,
@@ -23,16 +23,15 @@ const READ_BUF_SIZE: usize = 64 * 1024;
 
 /// Compute the SHA-256 hash of a file.
 pub fn hash_file(path: &Path) -> Result<Sha256> {
-    let file = File::open(path).map_err(|source| Error::Io {
+    let mut file = File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut reader = BufReader::with_capacity(READ_BUF_SIZE, file);
     let mut hasher = Sha256Hasher::new();
     let mut buf = [0u8; READ_BUF_SIZE];
 
     loop {
-        let n = reader.read(&mut buf).map_err(|source| Error::Io {
+        let n = file.read(&mut buf).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;

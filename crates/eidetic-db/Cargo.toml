@@ -9,7 +9,6 @@ description = "Database access layer for Eidetic."
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
-eidetic-ingest = { path = "../eidetic-ingest" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -20,5 +19,7 @@ tracing = { workspace = true }
 pgvector = { workspace = true }
 
 [dev-dependencies]
+eidetic-ingest = { path = "../eidetic-ingest" }
+tempfile = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true }

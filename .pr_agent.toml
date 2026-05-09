@@ -1,0 +1,20 @@
+[config]
+ai_provider = "openai"
+model = "deepseek-chat"
+
+[pr_reviewer]
+require_score_label = false
+require_tests_review = true
+require_security_review = true
+extra_instructions = """
+This is a Rust project. Focus on:
+- Unsafe code and memory safety
+- Error handling (prefer ? over unwrap in library code)
+- Unnecessary clones or allocations
+- Trait bounds that are too tight or too loose
+- Missing or incomplete tests for new functionality
+"""
+
+[pr_description]
+publish_labels = false
+use_bullet_points = true

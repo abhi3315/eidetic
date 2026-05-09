@@ -8,16 +8,15 @@ use std::path::{Path, PathBuf};
 /// The returned [`tempfile::NamedTempFile`] is automatically deleted if dropped without
 /// being persisted — so callers that return early (e.g. dedup hit) get free cleanup.
 pub fn stage_file(src: &Path, staging_dir: &Path) -> Result<tempfile::NamedTempFile> {
-    std::fs::create_dir_all(staging_dir).map_err(|source| crate::Error::StoreIo {
+    std::fs::create_dir_all(staging_dir).map_err(|source| crate::Error::Io {
         path: staging_dir.to_path_buf(),
         source,
     })?;
-    let tmp =
-        tempfile::NamedTempFile::new_in(staging_dir).map_err(|source| crate::Error::StoreIo {
-            path: staging_dir.to_path_buf(),
-            source,
-        })?;
-    std::fs::copy(src, tmp.path()).map_err(|source| crate::Error::StoreIo {
+    let tmp = tempfile::NamedTempFile::new_in(staging_dir).map_err(|source| crate::Error::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    std::fs::copy(src, tmp.path()).map_err(|source| crate::Error::Io {
         path: tmp.path().to_path_buf(),
         source,
     })?;
@@ -43,11 +42,37 @@ pub fn commit_staged(
     let dest = library_dir.join(&hex[..2]).join(&hex[2..4]).join(&filename);
 
     if dest.exists() {
+        // Trust same-hash collisions only when sizes match. Catches a corrupt
+        // file left at this CAS path by an earlier crash or manual placement;
+        // re-hash on length match would be safer still but is overkill at v0.
+        let staged_len = std::fs::metadata(stage.path())
+            .map_err(|source| crate::Error::Io {
+                path: stage.path().to_path_buf(),
+                source,
+            })?
+            .len();
+        let dest_len = std::fs::metadata(&dest)
+            .map_err(|source| crate::Error::Io {
+                path: dest.clone(),
+                source,
+            })?
+            .len();
+        if staged_len != dest_len {
+            return Err(crate::Error::Io {
+                path: dest,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "CAS collision: existing file is {dest_len} B, staged is {staged_len} B"
+                    ),
+                ),
+            });
+        }
         return Ok(dest);
     }
 
     let parent = dest.parent().expect("dest always has a parent");
-    std::fs::create_dir_all(parent).map_err(|source| crate::Error::StoreIo {
+    std::fs::create_dir_all(parent).map_err(|source| crate::Error::Io {
         path: parent.to_path_buf(),
         source,
     })?;
@@ -59,24 +84,13 @@ pub fn commit_staged(
                 // A concurrent import completed first — same content, safe to ignore.
                 Ok(dest)
             } else {
-                Err(crate::Error::StoreIo {
+                Err(crate::Error::Io {
                     path: dest,
                     source: e.error,
                 })
             }
         }
     }
-}
-
-/// Stage `src` and immediately commit it to the CAS. Convenience wrapper over
-/// [`stage_file`] + [`commit_staged`] for callers that don't need a stable read window.
-pub fn store_file(src: &Path, hash: &Sha256, library_dir: &Path) -> Result<PathBuf> {
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    let stage = stage_file(src, library_dir)?;
-    commit_staged(stage, hash, ext.as_deref(), library_dir)
 }
 
 #[cfg(test)]
@@ -96,6 +110,15 @@ mod tests {
         Sha256::from_hex(s).expect("test hash must be valid 64-char hex")
     }
 
+    fn store(src: &Path, hash: &Sha256, library_dir: &Path) -> PathBuf {
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        let stage = stage_file(src, library_dir).unwrap();
+        commit_staged(stage, hash, ext.as_deref(), library_dir).unwrap()
+    }
+
     #[test]
     fn stores_at_cas_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -103,7 +126,7 @@ mod tests {
         let library = tmp.path().join("library");
         let hash = hex("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
 
-        let dest = store_file(&src, &hash, &library).unwrap();
+        let dest = store(&src, &hash, &library);
 
         assert_eq!(
             dest,
@@ -120,7 +143,7 @@ mod tests {
         let library = tmp.path().join("nested").join("library");
         let hash = hex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
-        let dest = store_file(&src, &hash, &library).unwrap();
+        let dest = store(&src, &hash, &library);
         assert!(dest.exists());
     }
 
@@ -131,8 +154,8 @@ mod tests {
         let library = tmp.path().join("library");
         let hash = hex("aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222");
 
-        let dest1 = store_file(&src, &hash, &library).unwrap();
-        let dest2 = store_file(&src, &hash, &library).unwrap();
+        let dest1 = store(&src, &hash, &library);
+        let dest2 = store(&src, &hash, &library);
         assert_eq!(dest1, dest2);
     }
 
@@ -143,7 +166,7 @@ mod tests {
         let library = tmp.path().join("library");
         let hash = hex("1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff");
 
-        let dest = store_file(&src, &hash, &library).unwrap();
+        let dest = store(&src, &hash, &library);
         assert_eq!(
             dest.file_name().unwrap().to_str().unwrap(),
             hash.to_string()

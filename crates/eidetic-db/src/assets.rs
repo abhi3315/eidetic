@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use eidetic_core::AssetId;
-use eidetic_ingest::{AssetIndex, InsertOutcome, NewAsset};
+use eidetic_core::{AssetIndex, InsertOutcome, NewAsset};
 use sqlx::PgPool;
 use std::path::PathBuf;
 
@@ -57,7 +57,7 @@ impl PgAssetsRepo {
                COUNT(*) FILTER (WHERE embedding IS NOT NULL)              AS embedded, \
                COUNT(*) FILTER (WHERE embedding IS NULL \
                                   AND mime_type LIKE 'image/%')           AS needs_embed, \
-               COALESCE(SUM(file_size), 0)                                AS total_bytes, \
+               COALESCE(SUM(file_size), 0)::bigint                        AS total_bytes, \
                MIN(date_taken)                                            AS earliest, \
                MAX(date_taken)                                            AS latest \
              FROM assets",
@@ -81,7 +81,8 @@ impl PgAssetsRepo {
     pub async fn fetch_unembedded(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
         let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
             "SELECT id, storage_path FROM assets \
-             WHERE embedding IS NULL AND mime_type LIKE 'image/%'",
+             WHERE embedding IS NULL AND mime_type LIKE 'image/%' \
+             ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await
@@ -157,17 +158,17 @@ impl PgAssetsRepo {
 
 #[allow(async_fn_in_trait)]
 impl AssetIndex for PgAssetsRepo {
-    async fn find_by_hash(&self, hash: &str) -> eidetic_ingest::Result<Option<AssetId>> {
+    async fn find_by_hash(&self, hash: &str) -> eidetic_core::IndexResult<Option<AssetId>> {
         let row: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM assets WHERE hash = $1")
             .bind(hash)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| eidetic_ingest::Error::Index(Box::new(e)))?;
+            .map_err(|e| Box::new(e) as eidetic_core::IndexError)?;
 
         Ok(row.map(|(uuid,)| AssetId::from(uuid)))
     }
 
-    async fn insert_asset(&self, asset: NewAsset) -> eidetic_ingest::Result<InsertOutcome> {
+    async fn insert_asset(&self, asset: NewAsset) -> eidetic_core::IndexResult<InsertOutcome> {
         let new_id = AssetId::new();
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
@@ -190,7 +191,7 @@ impl AssetIndex for PgAssetsRepo {
         .bind(asset.camera_model.as_deref())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| eidetic_ingest::Error::Index(Box::new(e)))?;
+        .map_err(|e| Box::new(e) as eidetic_core::IndexError)?;
 
         match row {
             Some((uuid,)) => Ok(InsertOutcome::Inserted(AssetId::from(uuid))),
@@ -200,7 +201,7 @@ impl AssetIndex for PgAssetsRepo {
                         .bind(&asset.hash)
                         .fetch_one(&self.pool)
                         .await
-                        .map_err(|e| eidetic_ingest::Error::Index(Box::new(e)))?;
+                        .map_err(|e| Box::new(e) as eidetic_core::IndexError)?;
                 Ok(InsertOutcome::Existing(AssetId::from(uuid)))
             }
         }

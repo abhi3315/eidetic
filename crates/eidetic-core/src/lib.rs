@@ -5,9 +5,9 @@
 //! dependencies here pollutes the dependency graph for everyone.
 
 pub mod config;
-pub mod error;
 pub mod ids;
+pub mod index;
 
 pub use config::{Config, Paths};
-pub use error::{Error, Result};
 pub use ids::{AssetId, Sha256};
+pub use index::{AssetIndex, IndexError, IndexResult, InsertOutcome, NewAsset};

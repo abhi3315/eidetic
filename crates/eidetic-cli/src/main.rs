@@ -3,6 +3,8 @@
 //! This binary contains no business logic. Each subcommand wires up the
 //! library crates and dispatches to them. Logic lives in the libraries.
 
+mod eval;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use eidetic_core::Config;
@@ -38,6 +40,19 @@ enum Command {
     Stats,
     /// Generate embeddings for all imported images that don't have one yet.
     Embed,
+    /// Run COCO 5K (Karpathy) text-to-image retrieval eval. Bypasses the
+    /// library entirely — embeds images and captions in-memory.
+    Eval {
+        /// Path to the COCO captions CSV (e.g. test_5k_mscoco_2014.csv).
+        #[arg(long)]
+        coco_csv: PathBuf,
+        /// Directory containing the COCO images named per the CSV.
+        #[arg(long)]
+        coco_images: PathBuf,
+        /// Limit to first N images for fast iteration. Omit for full 5K.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Search the library by natural-language description.
     Search {
         /// The text query, e.g. "dog on beach".
@@ -78,7 +93,7 @@ const VALID_FIELDS: &[&str] = &[
     "path", "score", "date", "make", "model", "lat", "lon", "mime",
 ];
 
-fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> anyhow::Result<String> {
+fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> String {
     let mut parts = Vec::new();
     for field in fields {
         let value = match field.as_str() {
@@ -93,19 +108,24 @@ fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> anyhow::Res
             "lat" => r.latitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
             "lon" => r.longitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
             "mime" => r.mime_type.clone().unwrap_or_default(),
-            other => anyhow::bail!(
-                "Unknown field: '{other}'. Valid fields: {}",
-                VALID_FIELDS.join(", ")
+            other => unreachable!(
+                "unknown field {other:?} should have been rejected by VALID_FIELDS check"
             ),
         };
         parts.push(value);
     }
-    Ok(parts.join("\t"))
+    parts.join("\t")
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_env("EIDETIC_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // EIDETIC_LOG → RUST_LOG → default. Fall through silently on parse errors;
+    // there's no logger yet to warn through.
+    let filter = std::env::var("EIDETIC_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .and_then(|s| EnvFilter::try_new(&s).ok())
+        .unwrap_or_else(|| EnvFilter::new("info,ort=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
@@ -122,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} is not a file or directory", path.display());
             }
 
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -168,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Stats => {
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -189,11 +209,21 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Command::Eval {
+            coco_csv,
+            coco_images,
+            limit,
+        } => {
+            tokio::task::spawn_blocking(move || eval::run(&coco_csv, &coco_images, limit))
+                .await
+                .context("eval thread panicked")??;
+        }
+
         Command::Embed => {
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
 
             let models_dir = config.paths.models_cache.clone();
-            println!("Loading model (downloads ~350 MB on first run)…");
+            println!("Loading model (downloads ~1.4 GiB on first run)…");
             let embedder = std::sync::Arc::new(
                 tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
                     .await
@@ -266,18 +296,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let config = Config::from_env().context("failed to load config")?;
+            let config = Config::from_env();
 
             let models_dir = config.paths.models_cache.clone();
             let embedder =
                 tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
                     .await
                     .context("embedder thread panicked")?
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to load model: {e}. Run 'eidetic embed' first to download it."
-                        )
-                    })?;
+                    .context("failed to load SigLIP 2 model — check your internet connection")?;
 
             let query_clone = query.clone();
             let query_emb = tokio::task::spawn_blocking(move || embedder.embed_text(&query_clone))
@@ -319,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else if let Some(ref field_list) = fields {
                 for r in &results {
-                    println!("{}", format_result(r, field_list)?);
+                    println!("{}", format_result(r, field_list));
                 }
             } else {
                 for r in &results {

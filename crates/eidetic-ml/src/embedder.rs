@@ -17,10 +17,6 @@ impl Embedding {
     pub fn as_slice(&self) -> &[f32] {
         &self.0
     }
-
-    pub fn into_vec(self) -> Vec<f32> {
-        self.0
-    }
 }
 
 /// Produces vector embeddings from images and text.
@@ -39,35 +35,35 @@ pub trait Embedder: Send + Sync {
     fn embed_text(&self, text: &str) -> Result<Embedding>;
 }
 
-/// Deterministic mock embedder for tests. Returns zeros for all inputs.
-pub struct MockEmbedder {
-    dim: usize,
-}
-
-impl MockEmbedder {
-    pub fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-}
-
-impl Embedder for MockEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn embed(&self, _path: &Path) -> Result<Embedding> {
-        Ok(Embedding(vec![0.0; self.dim]))
-    }
-
-    fn embed_text(&self, _text: &str) -> Result<Embedding> {
-        Ok(Embedding(vec![0.0; self.dim]))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Deterministic mock embedder for tests. Returns zeros for all inputs.
+    struct MockEmbedder {
+        dim: usize,
+    }
+
+    impl MockEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { dim }
+        }
+    }
+
+    impl Embedder for MockEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed(&self, _path: &Path) -> Result<Embedding> {
+            Ok(Embedding(vec![0.0; self.dim]))
+        }
+
+        fn embed_text(&self, _text: &str) -> Result<Embedding> {
+            Ok(Embedding(vec![0.0; self.dim]))
+        }
+    }
 
     #[test]
     fn mock_returns_correct_dim() {
@@ -82,14 +78,6 @@ mod tests {
         let emb = embedder.embed(&path).unwrap();
         assert_eq!(emb.dim(), 768);
         assert_eq!(emb.as_slice(), &[0.0; 768]);
-    }
-
-    #[test]
-    fn embedding_round_trip() {
-        let values = vec![1.0, 2.0, 3.0];
-        let emb = Embedding::new(values.clone());
-        assert_eq!(emb.dim(), 3);
-        assert_eq!(emb.into_vec(), values);
     }
 
     #[test]

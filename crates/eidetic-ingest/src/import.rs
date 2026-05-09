@@ -5,6 +5,7 @@ use crate::{
 };
 use eidetic_core::{AssetId, Paths};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 use walkdir::WalkDir;
 
 #[derive(Debug)]
@@ -33,9 +34,8 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
 
     let original_filename = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Stage a stable copy so all subsequent I/O (size, hash, EXIF) reads the same bytes.
     let stage = match stage_file(path, &config.library_dir) {
@@ -62,7 +62,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     match index.find_by_hash(&hash_hex).await {
         Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
         Ok(None) => {}
-        Err(e) => return ImportOutcome::Failed(e),
+        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
     }
 
     let exif = if mime_type.starts_with("image/") {
@@ -77,7 +77,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
 
     let new_asset = NewAsset {
-        hash: hash_hex,
+        hash: hash_hex.clone(),
         original_filename,
         storage_path,
         file_size,
@@ -90,9 +90,15 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
 
     match index.insert_asset(new_asset).await {
-        Ok(InsertOutcome::Inserted(id)) => ImportOutcome::Imported(id),
-        Ok(InsertOutcome::Existing(id)) => ImportOutcome::Duplicate(id),
-        Err(e) => ImportOutcome::Failed(e),
+        Ok(InsertOutcome::Inserted(id)) => {
+            debug!(path = %path.display(), hash = %hash_hex, "imported");
+            ImportOutcome::Imported(id)
+        }
+        Ok(InsertOutcome::Existing(id)) => {
+            debug!(path = %path.display(), hash = %hash_hex, "duplicate");
+            ImportOutcome::Duplicate(id)
+        }
+        Err(e) => ImportOutcome::Failed(Error::Index(e)),
     }
 }
 
@@ -117,6 +123,8 @@ pub async fn import_dir(
             ),
         });
     }
+
+    info!(dir = %dir.display(), "starting import");
 
     let mut summary = ImportSummary {
         imported: 0,
@@ -158,6 +166,14 @@ pub async fn import_dir(
         }
     }
 
+    info!(
+        imported = summary.imported,
+        duplicates = summary.duplicates,
+        skipped = summary.skipped,
+        failed = summary.failed.len(),
+        "import complete"
+    );
+
     Ok(summary)
 }
 
@@ -171,7 +187,6 @@ mod tests {
 
     fn make_paths(tmp: &tempfile::TempDir) -> Paths {
         Paths {
-            import_dir: tmp.path().join("import"),
             library_dir: tmp.path().join("library"),
             models_cache: tmp.path().join("models"),
         }
@@ -316,6 +331,21 @@ mod tests {
 
         let result = import_dir(&missing, &index, &paths).await;
         assert!(matches!(result, Err(crate::Error::Io { .. })));
+    }
+
+    #[tokio::test]
+    async fn non_ascii_filename_preserved_not_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src = write_jpeg(tmp.path(), "héllo.jpg", b"a");
+        let index = MockAssetIndex::new();
+
+        import_file(&src, &index, &paths).await;
+
+        let inserted = index.all_inserted();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].original_filename, "héllo.jpg");
+        assert_ne!(inserted[0].original_filename, "unknown");
     }
 
     #[tokio::test]

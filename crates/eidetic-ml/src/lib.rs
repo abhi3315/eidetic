@@ -1,9 +1,9 @@
 //! ML inference for Eidetic.
 
-pub mod embedder;
-pub mod error;
-pub mod siglip;
+mod embedder;
+mod error;
+mod siglip;
 
-pub use embedder::{Embedder, Embedding, MockEmbedder};
+pub use embedder::{Embedder, Embedding};
 pub use error::{Error, Result};
 pub use siglip::SiglipEmbedder;
