@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
-const MODEL_REPO: &str = "google/siglip2-base-patch16-256";
+const MODEL_REPO: &str = "onnx-community/siglip2-base-patch16-256-ONNX";
 const VISION_MODEL_FILE: &str = "onnx/vision_model.onnx";
 const TEXT_MODEL_FILE: &str = "onnx/text_model.onnx";
 const TOKENIZER_FILE: &str = "tokenizer.json";
