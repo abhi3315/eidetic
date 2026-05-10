@@ -37,7 +37,23 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Stage a stable copy so all subsequent I/O (size, hash, EXIF) reads the same bytes.
+    // Hash the source directly so we can short-circuit duplicates before
+    // copying the file to staging. On a re-import of a synced photo dir
+    // this avoids gigabytes of pointless I/O per duplicate.
+    let hash = match hash_file(path) {
+        Ok(h) => h,
+        Err(e) => return ImportOutcome::Failed(e),
+    };
+    let hash_hex = hash.to_string();
+
+    match index.find_by_hash(&hash_hex).await {
+        Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
+        Ok(None) => {}
+        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
+    }
+
+    // Past the dedup gate. Stage a stable copy so EXIF and the CAS commit
+    // both read the same bytes that will end up canonical at the CAS path.
     let stage = match stage_file(path, &config.library_dir) {
         Ok(s) => s,
         Err(e) => return ImportOutcome::Failed(e),
@@ -52,18 +68,6 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
             });
         }
     };
-
-    let hash = match hash_file(stage.path()) {
-        Ok(h) => h,
-        Err(e) => return ImportOutcome::Failed(e),
-    };
-    let hash_hex = hash.to_string();
-
-    match index.find_by_hash(&hash_hex).await {
-        Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
-        Ok(None) => {}
-        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
-    }
 
     let exif = if mime_type.starts_with("image/") {
         crate::meta::extract_exif(stage.path())
@@ -362,5 +366,49 @@ mod tests {
         assert_eq!(summary.imported, 2);
         assert_eq!(summary.duplicates, 0);
         assert!(summary.failed.is_empty());
+    }
+
+    /// Sorted list of every path under `dir` (including `dir` itself), or
+    /// empty if `dir` doesn't exist. Used to assert no filesystem mutation.
+    fn snapshot_dir(dir: &Path) -> Vec<std::path::PathBuf> {
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut entries: Vec<std::path::PathBuf> = WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[tokio::test]
+    async fn duplicate_import_does_not_touch_library_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
+        let index = MockAssetIndex::new();
+        let hash = crate::hash_file(&src).unwrap().to_string();
+        index.seed(&hash, AssetId::new());
+
+        // Precondition: library_dir hasn't been created yet.
+        assert!(!paths.library_dir.exists());
+        let before = snapshot_dir(&paths.library_dir);
+
+        let outcome = import_file(&src, &index, &paths).await;
+        assert!(
+            matches!(outcome, ImportOutcome::Duplicate(_)),
+            "expected Duplicate, got {outcome:?}"
+        );
+
+        // Contract: a dedup hit must not write anything to library_dir,
+        // not even create the directory itself. This locks in the
+        // hash-before-stage refactor against future drift.
+        let after = snapshot_dir(&paths.library_dir);
+        assert_eq!(
+            before, after,
+            "duplicate import mutated library_dir; before={before:?} after={after:?}",
+        );
     }
 }
