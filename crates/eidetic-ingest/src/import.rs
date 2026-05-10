@@ -37,7 +37,23 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Stage a stable copy so all subsequent I/O (size, hash, EXIF) reads the same bytes.
+    // Hash the source directly so we can short-circuit duplicates before
+    // copying the file to staging. On a re-import of a synced photo dir
+    // this avoids gigabytes of pointless I/O per duplicate.
+    let hash = match hash_file(path) {
+        Ok(h) => h,
+        Err(e) => return ImportOutcome::Failed(e),
+    };
+    let hash_hex = hash.to_string();
+
+    match index.find_by_hash(&hash_hex).await {
+        Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
+        Ok(None) => {}
+        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
+    }
+
+    // Past the dedup gate. Stage a stable copy so EXIF and the CAS commit
+    // both read the same bytes that will end up canonical at the CAS path.
     let stage = match stage_file(path, &config.library_dir) {
         Ok(s) => s,
         Err(e) => return ImportOutcome::Failed(e),
@@ -52,18 +68,6 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
             });
         }
     };
-
-    let hash = match hash_file(stage.path()) {
-        Ok(h) => h,
-        Err(e) => return ImportOutcome::Failed(e),
-    };
-    let hash_hex = hash.to_string();
-
-    match index.find_by_hash(&hash_hex).await {
-        Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
-        Ok(None) => {}
-        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
-    }
 
     let exif = if mime_type.starts_with("image/") {
         crate::meta::extract_exif(stage.path())
