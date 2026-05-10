@@ -286,6 +286,10 @@ async fn main() -> anyhow::Result<()> {
                     "Done. Embedded {embedded}, skipped {skipped}, failed {failed}. \
                      Re-run `eidetic embed` to retry the failed rows."
                 );
+                // Match the `import` command's convention: non-zero exit when
+                // any per-item failure occurred, so cron / shell pipelines
+                // (e.g. `eidetic embed && rsync …`) treat it as a failure.
+                std::process::exit(1);
             } else {
                 println!("Done. Embedded {embedded}, skipped {skipped}.");
             }
