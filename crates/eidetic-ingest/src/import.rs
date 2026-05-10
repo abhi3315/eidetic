@@ -363,4 +363,48 @@ mod tests {
         assert_eq!(summary.duplicates, 0);
         assert!(summary.failed.is_empty());
     }
+
+    /// Sorted list of every path under `dir` (including `dir` itself), or
+    /// empty if `dir` doesn't exist. Used to assert no filesystem mutation.
+    fn snapshot_dir(dir: &Path) -> Vec<std::path::PathBuf> {
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut entries: Vec<std::path::PathBuf> = WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[tokio::test]
+    async fn duplicate_import_does_not_touch_library_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_paths(&tmp);
+        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
+        let index = MockAssetIndex::new();
+        let hash = crate::hash_file(&src).unwrap().to_string();
+        index.seed(&hash, AssetId::new());
+
+        // Precondition: library_dir hasn't been created yet.
+        assert!(!paths.library_dir.exists());
+        let before = snapshot_dir(&paths.library_dir);
+
+        let outcome = import_file(&src, &index, &paths).await;
+        assert!(
+            matches!(outcome, ImportOutcome::Duplicate(_)),
+            "expected Duplicate, got {outcome:?}"
+        );
+
+        // Contract: a dedup hit must not write anything to library_dir,
+        // not even create the directory itself. This locks in the
+        // hash-before-stage refactor against future drift.
+        let after = snapshot_dir(&paths.library_dir);
+        assert_eq!(
+            before, after,
+            "duplicate import mutated library_dir; before={before:?} after={after:?}",
+        );
+    }
 }
