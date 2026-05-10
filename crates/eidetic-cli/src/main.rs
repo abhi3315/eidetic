@@ -251,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut embedded = 0u32;
             let mut skipped = 0u32;
+            let mut failed = 0u32;
 
             for (i, (id, path)) in unembedded.into_iter().enumerate() {
                 let embedder = std::sync::Arc::clone(&embedder);
@@ -261,13 +262,18 @@ async fn main() -> anyhow::Result<()> {
                     .context("embedder thread panicked")?;
 
                 match result {
-                    Ok(emb) => {
-                        repo.store_embedding(id, emb.as_slice())
-                            .await
-                            .context("failed to store embedding")?;
-                        println!("[{}/{}] {}", i + 1, total, path.display());
-                        embedded += 1;
-                    }
+                    Ok(emb) => match repo.store_embedding(id, emb.as_slice()).await {
+                        Ok(()) => {
+                            println!("[{}/{}] {}", i + 1, total, path.display());
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            // Don't bail — re-running `eidetic embed` filters on
+                            // `embedding IS NULL`, so this row will be retried.
+                            eprintln!("  failed to store {}: {e}", path.display());
+                            failed += 1;
+                        }
+                    },
                     Err(e) => {
                         eprintln!("  skipped {}: {e}", path.display());
                         skipped += 1;
@@ -275,7 +281,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            println!("Done. Embedded {embedded}, skipped {skipped}.");
+            if failed > 0 {
+                println!(
+                    "Done. Embedded {embedded}, skipped {skipped}, failed {failed}. \
+                     Re-run `eidetic embed` to retry the failed rows."
+                );
+            } else {
+                println!("Done. Embedded {embedded}, skipped {skipped}.");
+            }
         }
 
         Command::Search {

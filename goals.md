@@ -19,10 +19,6 @@ One person: me. My personal photo library, on my own hardware.
 - **Not a competitor to Immich or PhotoPrism.** Different purpose: learning Rust deeply on a real systems project, plus owning a media engine end-to-end.
 - **Not a UI project.** CLI and (eventual) WebDAV are the only interfaces.
 
-## Future directions
-
-- WordPress plugin port for self-hosted publishers who want their site's media library on the same intelligence engine. Personal use comes first; the plugin is a later phase.
-
 ## Anti-goals
 
 - Generic web UI

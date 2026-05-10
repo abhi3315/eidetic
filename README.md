@@ -18,10 +18,14 @@ Written in Rust. Built primarily with AI assistance.
   - `--json` — full JSON array
 - `eidetic stats` — library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>` — SHA-256 a file, no setup needed
+- `eidetic eval --coco-csv <path> --coco-images <dir> [--limit N]` — text-to-image retrieval eval on the COCO 5K Karpathy split. Reports R@1/5/10 + MRR; bypasses the database.
 
 ## Quick start
 
 ```bash
+# 0. Install the CLI (or prefix every `eidetic` below with `cargo run --release -p eidetic-cli --`)
+cargo install --path crates/eidetic-cli
+
 # 1. Start Postgres (VectorChord variant required for vector search)
 docker compose up -d
 
@@ -29,17 +33,17 @@ docker compose up -d
 export EIDETIC_DATABASE_URL="postgres://eidetic:eidetic@localhost:5432/eidetic"
 
 # 3. Import your photos (migrations run automatically on first connect)
-cargo run --release -p eidetic-cli -- import ~/Pictures/
+eidetic import ~/Pictures/
 
 # 4. Generate embeddings (downloads SigLIP 2 model ~1.4 GiB on first run)
-cargo run --release -p eidetic-cli -- embed
+eidetic embed
 
 # 5. Search
-cargo run --release -p eidetic-cli -- search "golden hour at the beach"
-cargo run --release -p eidetic-cli -- search "birthday cake" --limit 5 --fields score,date,path
+eidetic search "golden hour at the beach"
+eidetic search "birthday cake" --limit 5 --fields score,date,path
 
 # 6. See what's in the library
-cargo run --release -p eidetic-cli -- stats
+eidetic stats
 ```
 
 ## Configuration
