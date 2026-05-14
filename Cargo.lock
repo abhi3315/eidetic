@@ -1093,6 +1093,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -1101,6 +1102,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "eidetic-core",
+ "eidetic-db",
  "infer",
  "kamadak-exif",
  "sha2 0.11.0",
