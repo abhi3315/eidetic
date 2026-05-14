@@ -3,12 +3,9 @@
 //! This crate owns:
 //! - The Postgres connection pool
 //! - The migration runner (migrations live at the workspace root)
-//! - Repository traits and their Postgres implementations
+//! - `PgAssetsRepo`: asset CRUD, dedup lookup, and vector search
 //!
-//! No other crate touches `sqlx::Pool` directly. Other crates depend on
-//! the repository traits (e.g. [`AssetsRepo`]), not on the pool itself.
-//! This keeps SQL out of the rest of the codebase and makes testing
-//! easier.
+//! No other crate touches `sqlx::Pool` directly.
 
 use eidetic_core::Config;
 use sqlx::PgPool;

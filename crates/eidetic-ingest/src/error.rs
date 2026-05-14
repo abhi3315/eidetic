@@ -10,7 +10,7 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error("database error: {0}")]
-    Db(#[from] eidetic_db::Error),
+    Db(#[source] eidetic_db::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
