@@ -105,7 +105,9 @@ mod tests {
             let bytes = std::fs::read(&path).unwrap();
             let mut h = Sha256Hasher::new();
             h.update(&bytes);
-            format!("{:x}", h.finalize())
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&h.finalize());
+            Sha256::from_bytes(out).to_string()
         };
         assert_eq!(streamed.to_string(), oneshot);
 
