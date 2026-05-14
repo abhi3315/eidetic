@@ -17,7 +17,7 @@ use std::str::FromStr;
 use tracing::info;
 
 pub mod assets;
-pub use assets::{LibraryStats, PgAssetsRepo, SearchResult};
+pub use assets::{InsertOutcome, LibraryStats, NewAsset, PgAssetsRepo, SearchResult};
 
 pub mod error;
 pub use error::{Error, Result};

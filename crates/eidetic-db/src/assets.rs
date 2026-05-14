@@ -1,8 +1,35 @@
 use chrono::{DateTime, Utc};
 use eidetic_core::AssetId;
-use eidetic_core::{AssetIndex, InsertOutcome, NewAsset};
 use sqlx::PgPool;
 use std::path::PathBuf;
+
+/// New row to write into the asset catalog.
+///
+/// Construction is left to callers (e.g. `eidetic-ingest::import_file`).
+/// `storage_path` is the canonical CAS path the caller has already committed.
+#[derive(Clone, Debug)]
+pub struct NewAsset {
+    pub hash: String,
+    pub original_filename: String,
+    pub storage_path: PathBuf,
+    pub file_size: u64,
+    pub mime_type: Option<String>,
+    pub date_taken: Option<DateTime<Utc>>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+}
+
+/// Result of [`PgAssetsRepo::insert_asset`].
+///
+/// `Inserted` means this call wrote the row; `Existing` means another
+/// row with the same hash was already present and we returned its id.
+#[derive(Debug)]
+pub enum InsertOutcome {
+    Inserted(AssetId),
+    Existing(AssetId),
+}
 
 pub struct PgAssetsRepo {
     pool: PgPool,
@@ -154,21 +181,18 @@ impl PgAssetsRepo {
             })
             .collect())
     }
-}
 
-#[allow(async_fn_in_trait)]
-impl AssetIndex for PgAssetsRepo {
-    async fn find_by_hash(&self, hash: &str) -> eidetic_core::IndexResult<Option<AssetId>> {
+    pub async fn find_by_hash(&self, hash: &str) -> crate::Result<Option<AssetId>> {
         let row: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM assets WHERE hash = $1")
             .bind(hash)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| Box::new(e) as eidetic_core::IndexError)?;
+            .map_err(crate::Error::Query)?;
 
         Ok(row.map(|(uuid,)| AssetId::from(uuid)))
     }
 
-    async fn insert_asset(&self, asset: NewAsset) -> eidetic_core::IndexResult<InsertOutcome> {
+    pub async fn insert_asset(&self, asset: NewAsset) -> crate::Result<InsertOutcome> {
         let new_id = AssetId::new();
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
@@ -191,7 +215,7 @@ impl AssetIndex for PgAssetsRepo {
         .bind(asset.camera_model.as_deref())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| Box::new(e) as eidetic_core::IndexError)?;
+        .map_err(crate::Error::Query)?;
 
         match row {
             Some((uuid,)) => Ok(InsertOutcome::Inserted(AssetId::from(uuid))),
@@ -201,7 +225,7 @@ impl AssetIndex for PgAssetsRepo {
                         .bind(&asset.hash)
                         .fetch_one(&self.pool)
                         .await
-                        .map_err(|e| Box::new(e) as eidetic_core::IndexError)?;
+                        .map_err(crate::Error::Query)?;
                 Ok(InsertOutcome::Existing(AssetId::from(uuid)))
             }
         }

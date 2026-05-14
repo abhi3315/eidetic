@@ -9,8 +9,8 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("asset index: {0}")]
-    Index(#[source] eidetic_core::IndexError),
+    #[error("database error: {0}")]
+    Db(#[from] eidetic_db::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
