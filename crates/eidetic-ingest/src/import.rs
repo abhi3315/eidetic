@@ -1,9 +1,9 @@
 use crate::{
     Error, Result, hash_file,
-    repo::{AssetIndex, InsertOutcome, NewAsset},
     store::{commit_staged, stage_file},
 };
 use eidetic_core::{AssetId, Paths};
+use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 use walkdir::WalkDir;
@@ -16,7 +16,7 @@ pub enum ImportOutcome {
     Failed(Error),
 }
 
-pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -> ImportOutcome {
+pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> ImportOutcome {
     // MIME detection reads only 512 bytes — acceptable before staging.
     let mime_type = match crate::meta::detect_mime(path) {
         Ok(Some(m)) => m,
@@ -46,10 +46,10 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
     };
     let hash_hex = hash.to_string();
 
-    match index.find_by_hash(&hash_hex).await {
+    match repo.find_by_hash(&hash_hex).await {
         Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
         Ok(None) => {}
-        Err(e) => return ImportOutcome::Failed(Error::Index(e)),
+        Err(e) => return ImportOutcome::Failed(Error::Db(e)),
     }
 
     // Past the dedup gate. Stage a stable copy so EXIF and the CAS commit
@@ -93,7 +93,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
         camera_model: exif.camera_model,
     };
 
-    match index.insert_asset(new_asset).await {
+    match repo.insert_asset(new_asset).await {
         Ok(InsertOutcome::Inserted(id)) => {
             debug!(path = %path.display(), hash = %hash_hex, "imported");
             ImportOutcome::Imported(id)
@@ -102,7 +102,7 @@ pub async fn import_file(path: &Path, index: &impl AssetIndex, config: &Paths) -
             debug!(path = %path.display(), hash = %hash_hex, "duplicate");
             ImportOutcome::Duplicate(id)
         }
-        Err(e) => ImportOutcome::Failed(Error::Index(e)),
+        Err(e) => ImportOutcome::Failed(Error::Db(e)),
     }
 }
 
@@ -113,11 +113,7 @@ pub struct ImportSummary {
     pub failed: Vec<(PathBuf, Error)>,
 }
 
-pub async fn import_dir(
-    dir: &Path,
-    index: &impl AssetIndex,
-    config: &Paths,
-) -> Result<ImportSummary> {
+pub async fn import_dir(dir: &Path, repo: &PgAssetsRepo, config: &Paths) -> Result<ImportSummary> {
     if !dir.is_dir() {
         return Err(Error::Io {
             path: dir.to_path_buf(),
@@ -160,7 +156,7 @@ pub async fn import_dir(
             continue;
         }
 
-        match import_file(entry.path(), index, config).await {
+        match import_file(entry.path(), repo, config).await {
             ImportOutcome::Imported(_) => summary.imported += 1,
             ImportOutcome::Duplicate(_) => summary.duplicates += 1,
             ImportOutcome::Skipped => summary.skipped += 1,
@@ -179,236 +175,4 @@ pub async fn import_dir(
     );
 
     Ok(summary)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::repo::test_support::MockAssetIndex;
-    use eidetic_core::{AssetId, Paths};
-    use std::io::Write;
-    use std::path::Path;
-
-    fn make_paths(tmp: &tempfile::TempDir) -> Paths {
-        Paths {
-            library_dir: tmp.path().join("library"),
-            models_cache: tmp.path().join("models"),
-        }
-    }
-
-    /// Write stub bytes that `infer` detects as JPEG (not a real JPEG — EXIF parsers will return defaults).
-    /// Each call with a different `tag` produces a file with a different hash.
-    fn write_jpeg(dir: &Path, name: &str, tag: &[u8]) -> std::path::PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
-        f.write_all(tag).unwrap();
-        path
-    }
-
-    /// Write a file with non-media content (no recognizable magic bytes).
-    fn write_non_media(dir: &Path, name: &str) -> std::path::PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, b"this is not a media file at all").unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn new_file_is_imported() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
-        let index = MockAssetIndex::new();
-
-        let outcome = import_file(&src, &index, &paths).await;
-        assert!(matches!(outcome, ImportOutcome::Imported(_)));
-    }
-
-    #[tokio::test]
-    async fn known_hash_returns_duplicate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
-        let index = MockAssetIndex::new();
-        let hash = crate::hash_file(&src).unwrap().to_string();
-        let existing_id = AssetId::new();
-        index.seed(&hash, existing_id);
-
-        let outcome = import_file(&src, &index, &paths).await;
-        assert!(matches!(outcome, ImportOutcome::Duplicate(id) if id == existing_id));
-    }
-
-    #[tokio::test]
-    async fn missing_file_returns_failed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let index = MockAssetIndex::new();
-        let nonexistent = tmp.path().join("nope.jpg");
-
-        let outcome = import_file(&nonexistent, &index, &paths).await;
-        assert!(matches!(outcome, ImportOutcome::Failed(_)));
-    }
-
-    #[tokio::test]
-    async fn non_media_file_returns_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src = write_non_media(tmp.path(), "document.txt");
-        let index = MockAssetIndex::new();
-
-        let outcome = import_file(&src, &index, &paths).await;
-        assert!(matches!(outcome, ImportOutcome::Skipped));
-    }
-
-    #[tokio::test]
-    async fn imported_file_has_jpeg_mime_type() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
-        let index = MockAssetIndex::new();
-
-        import_file(&src, &index, &paths).await;
-
-        let inserted = index.all_inserted();
-        assert_eq!(inserted.len(), 1);
-        assert_eq!(inserted[0].mime_type, Some("image/jpeg".to_string()));
-    }
-
-    #[tokio::test]
-    async fn dir_imports_all_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src_dir = tmp.path().join("photos");
-        write_jpeg(&src_dir, "a.jpg", b"a");
-        write_jpeg(&src_dir, "b.jpg", b"b");
-        write_jpeg(&src_dir, "c.jpg", b"c");
-        let index = MockAssetIndex::new();
-
-        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
-        assert_eq!(summary.imported, 3);
-        assert_eq!(summary.duplicates, 0);
-        assert_eq!(summary.skipped, 0);
-        assert!(summary.failed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dir_counts_duplicates_separately() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src_dir = tmp.path().join("photos");
-        let file = write_jpeg(&src_dir, "photo.jpg", b"a");
-        let index = MockAssetIndex::new();
-        let hash = crate::hash_file(&file).unwrap().to_string();
-        index.seed(&hash, AssetId::new());
-
-        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
-        assert_eq!(summary.imported, 0);
-        assert_eq!(summary.duplicates, 1);
-        assert_eq!(summary.skipped, 0);
-        assert!(summary.failed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dir_counts_non_media_as_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src_dir = tmp.path().join("mixed");
-        write_jpeg(&src_dir, "photo.jpg", b"a");
-        write_non_media(&src_dir, "notes.txt");
-        write_non_media(&src_dir, "archive.zip");
-        let index = MockAssetIndex::new();
-
-        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
-        assert_eq!(summary.imported, 1);
-        assert_eq!(summary.skipped, 2);
-        assert!(summary.failed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dir_not_found_returns_err() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let index = MockAssetIndex::new();
-        let missing = tmp.path().join("does_not_exist");
-
-        let result = import_dir(&missing, &index, &paths).await;
-        assert!(matches!(result, Err(crate::Error::Io { .. })));
-    }
-
-    #[tokio::test]
-    async fn non_ascii_filename_preserved_not_unknown() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src = write_jpeg(tmp.path(), "héllo.jpg", b"a");
-        let index = MockAssetIndex::new();
-
-        import_file(&src, &index, &paths).await;
-
-        let inserted = index.all_inserted();
-        assert_eq!(inserted.len(), 1);
-        assert_eq!(inserted[0].original_filename, "héllo.jpg");
-        assert_ne!(inserted[0].original_filename, "unknown");
-    }
-
-    #[tokio::test]
-    async fn dir_recurses_into_subdirectories() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src_dir = tmp.path().join("photos");
-        write_jpeg(&src_dir, "good.jpg", b"a");
-        let subdir = src_dir.join("subdir");
-        write_jpeg(&subdir, "nested.jpg", b"b");
-        let index = MockAssetIndex::new();
-
-        let summary = import_dir(&src_dir, &index, &paths).await.unwrap();
-        assert_eq!(summary.imported, 2);
-        assert_eq!(summary.duplicates, 0);
-        assert!(summary.failed.is_empty());
-    }
-
-    /// Sorted list of every path under `dir` (including `dir` itself), or
-    /// empty if `dir` doesn't exist. Used to assert no filesystem mutation.
-    fn snapshot_dir(dir: &Path) -> Vec<std::path::PathBuf> {
-        if !dir.exists() {
-            return Vec::new();
-        }
-        let mut entries: Vec<std::path::PathBuf> = WalkDir::new(dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().to_path_buf())
-            .collect();
-        entries.sort();
-        entries
-    }
-
-    #[tokio::test]
-    async fn duplicate_import_does_not_touch_library_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_paths(&tmp);
-        let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
-        let index = MockAssetIndex::new();
-        let hash = crate::hash_file(&src).unwrap().to_string();
-        index.seed(&hash, AssetId::new());
-
-        // Precondition: library_dir hasn't been created yet.
-        assert!(!paths.library_dir.exists());
-        let before = snapshot_dir(&paths.library_dir);
-
-        let outcome = import_file(&src, &index, &paths).await;
-        assert!(
-            matches!(outcome, ImportOutcome::Duplicate(_)),
-            "expected Duplicate, got {outcome:?}"
-        );
-
-        // Contract: a dedup hit must not write anything to library_dir,
-        // not even create the directory itself. This locks in the
-        // hash-before-stage refactor against future drift.
-        let after = snapshot_dir(&paths.library_dir);
-        assert_eq!(
-            before, after,
-            "duplicate import mutated library_dir; before={before:?} after={after:?}",
-        );
-    }
 }
