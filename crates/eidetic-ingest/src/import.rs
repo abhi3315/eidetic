@@ -81,13 +81,21 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
     };
 
     let thumbnails_generated = if mime_type.starts_with("image/") {
-        match crate::thumbnail::generate_thumbnails(&storage_path, &hash, &config.library_dir) {
+        let src = storage_path.clone();
+        let hash_clone = hash.clone();
+        let lib = config.library_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::thumbnail::generate_thumbnails(&src, &hash_clone, &lib)
+        })
+        .await
+        .expect("thumbnail thread panicked");
+        match result {
             Ok(()) => true,
             Err(e) => {
-                tracing::warn!(
+                tracing::info!(
                     path = %path.display(),
                     error = %e,
-                    "thumbnail generation failed; asset stored without thumbnails"
+                    "thumbnail generation failed; asset stored without thumbnails (eidetic thumbnail will retry)"
                 );
                 false
             }
