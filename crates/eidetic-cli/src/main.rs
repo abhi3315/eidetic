@@ -222,10 +222,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Embed => {
             let config = Config::from_env();
 
-            // Load the embedder on a blocking thread. We hand it to a worker
-            // task immediately afterwards, so the binding is local to that scope.
             let models_dir = config.paths.models_cache.clone();
-            println!("Loading model (downloads ~1.4 GiB on first run)…");
 
             let pool = eidetic_db::connect(&config)
                 .await
@@ -241,6 +238,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("Nothing to do.");
                 return Ok(());
             }
+
+            println!("Loading model (downloads ~1.4 GiB on first run)…");
 
             // Channel of (path, reply) jobs sent to the worker thread. The
             // worker owns the embedder; the async loop sends paths and awaits
@@ -274,9 +273,9 @@ async fn main() -> anyhow::Result<()> {
                 if job_tx.send((path.clone(), reply_tx)).await.is_err() {
                     break;
                 }
-                let result = reply_rx
-                    .await
-                    .context("embed worker dropped reply channel")?;
+                let result = reply_rx.await.context(
+                    "embed worker panicked or died mid-job — check for OOM or ONNX error above",
+                )?;
 
                 match result {
                     Ok(emb) => match repo.store_embedding(id, &emb).await {
@@ -285,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
                             embedded += 1;
                         }
                         Err(e) => {
+                            // Keep going — rows with NULL embedding are retried on the next run.
                             eprintln!("  failed to store {}: {e}", path.display());
                             failed += 1;
                         }
@@ -303,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
             worker
                 .await
                 .context("embed worker thread panicked")?
-                .context("failed to load SigLIP 2 model — check your internet connection")?;
+                .context("failed to load SigLIP 2 model — check your internet connection and that ~/.cache/eidetic/models is intact")?;
 
             if failed > 0 {
                 println!(
