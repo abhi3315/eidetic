@@ -20,6 +20,7 @@ pgvector = { workspace = true }
 
 [dev-dependencies]
 eidetic-ingest = { path = "../eidetic-ingest" }
+image = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true }
