@@ -41,7 +41,7 @@ Crates under `crates/`:
 | `eidetic-core` | Shared types: `AssetId`, `Sha256`, `Config`, `Paths`. Zero deps on tokio/sqlx/ort. | (nothing internal) |
 | `eidetic-db` | sqlx pool, migration runner. `PgAssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
 | `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage. Calls `PgAssetsRepo` directly. | `eidetic-core`, `eidetic-db` |
-| `eidetic-ml` | `Embedder` trait + impls (SigLIP 2 via `ort`). Mock impl for testing. | `eidetic-core` |
+| `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. | `eidetic-core` |
 | `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest` |
 
 Crates added later when there's actual code that wants to live in them:

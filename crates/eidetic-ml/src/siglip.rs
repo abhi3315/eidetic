@@ -1,8 +1,7 @@
-use crate::{Embedder, Embedding, Error, Result};
+use crate::{Error, Result};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
-use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
 #[cfg(target_os = "macos")]
@@ -87,10 +86,8 @@ fn current_variant() -> &'static ModelVariant {
 /// variant is selected via the `EIDETIC_MODEL` env var (`base` by default,
 /// `large` for `siglip2-large-patch16-384`).
 pub struct SiglipEmbedder {
-    // Session::run takes &mut self, so we use Mutex for interior mutability
-    // to satisfy the &self required by the Embedder trait.
-    vision_session: Mutex<Session>,
-    text_session: Mutex<Session>,
+    vision_session: Session,
+    text_session: Session,
     tokenizer: Tokenizer,
     variant: &'static ModelVariant,
 }
@@ -125,32 +122,32 @@ impl SiglipEmbedder {
             .map_err(|e| Error::Tokenize(format!("load tokenizer: {e}")))?;
 
         Ok(Self {
-            vision_session: Mutex::new(vision_session),
-            text_session: Mutex::new(text_session),
+            vision_session,
+            text_session,
             tokenizer,
             variant,
         })
     }
-}
 
-impl Embedder for SiglipEmbedder {
-    fn dim(&self) -> usize {
+    /// Output dimension. Stable for the lifetime of an embedder instance.
+    pub fn dim(&self) -> usize {
         self.variant.embed_dim
     }
 
-    fn embed(&self, path: &Path) -> Result<Embedding> {
+    /// Compute an L2-normalised embedding for the image at `path`.
+    ///
+    /// Synchronous; inference is CPU/GPU-bound. Callers running inside a
+    /// Tokio runtime should invoke this on a blocking thread (see the
+    /// `embed` command in `eidetic-cli` for the mpsc-worker pattern).
+    pub fn embed(&mut self, path: &Path) -> Result<Vec<f32>> {
         let image_size = self.variant.image_size;
         let pixels = preprocess_image(path, image_size)?;
         let shape = [1usize, 3, image_size as usize, image_size as usize];
         let tensor = Tensor::<f32>::from_array((shape, pixels))
             .map_err(|e| Error::Inference(format!("create tensor: {e}")))?;
 
-        let mut session = self
+        let outputs = self
             .vision_session
-            .lock()
-            .map_err(|e| Error::Inference(format!("lock vision session: {e}")))?;
-
-        let outputs = session
             .run(ort::inputs!["pixel_values" => tensor])
             .map_err(|e: ort::Error| Error::Inference(e.to_string()))?;
 
@@ -160,22 +157,19 @@ impl Embedder for SiglipEmbedder {
 
         let mut vec: Vec<f32> = data.to_vec();
         l2_normalize(&mut vec);
-        Ok(Embedding::new(vec))
+        Ok(vec)
     }
 
-    fn embed_text(&self, text: &str) -> Result<Embedding> {
+    /// Compute an L2-normalised embedding for a text string.
+    pub fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
         let ids = tokenize(&self.tokenizer, text)?;
 
         let seq_shape = [1usize, SEQ_LEN];
         let ids_tensor = Tensor::<i64>::from_array((seq_shape, ids))
             .map_err(|e| Error::Inference(format!("create ids tensor: {e}")))?;
 
-        let mut session = self
+        let outputs = self
             .text_session
-            .lock()
-            .map_err(|e| Error::Inference(format!("lock text session: {e}")))?;
-
-        let outputs = session
             .run(ort::inputs!["input_ids" => ids_tensor])
             .map_err(|e: ort::Error| Error::Inference(e.to_string()))?;
 
@@ -185,7 +179,7 @@ impl Embedder for SiglipEmbedder {
 
         let mut vec: Vec<f32> = data.to_vec();
         l2_normalize(&mut vec);
-        Ok(Embedding::new(vec))
+        Ok(vec)
     }
 }
 
@@ -471,15 +465,15 @@ mod tests {
                     .join(".cache/eidetic/models")
             });
 
-        let embedder = SiglipEmbedder::load(&models_dir).expect("load embedder");
+        let mut embedder = SiglipEmbedder::load(&models_dir).expect("load embedder");
 
         let test_image = std::env::var("EIDETIC_TEST_IMAGE")
             .map(std::path::PathBuf::from)
             .expect("set EIDETIC_TEST_IMAGE=/path/to/any.jpg");
 
         let emb = embedder.embed(&test_image).expect("embed image");
-        assert_eq!(emb.dim(), 768);
-        let dot: f32 = emb.as_slice().iter().map(|x| x * x).sum();
+        assert_eq!(emb.len(), 768);
+        let dot: f32 = emb.iter().map(|x| x * x).sum();
         assert!((dot - 1.0).abs() < 1e-4, "not normalized: dot={dot}");
     }
 }
