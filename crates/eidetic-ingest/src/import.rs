@@ -80,10 +80,26 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         Err(e) => return ImportOutcome::Failed(e),
     };
 
+    let thumbnails_generated = if mime_type.starts_with("image/") {
+        match crate::thumbnail::generate_thumbnails(&storage_path, &hash, &config.library_dir) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "thumbnail generation failed; asset stored without thumbnails"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     let new_asset = NewAsset {
         hash: hash_hex.clone(),
         original_filename,
-        storage_path,
+        storage_path: storage_path.clone(),
         file_size,
         mime_type: Some(mime_type),
         date_taken: exif.date_taken,
@@ -91,7 +107,7 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         longitude: exif.longitude,
         camera_make: exif.camera_make,
         camera_model: exif.camera_model,
-        thumbnails_generated: false,
+        thumbnails_generated,
     };
 
     match repo.insert_asset(new_asset).await {
