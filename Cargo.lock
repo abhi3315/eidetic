@@ -1103,6 +1103,7 @@ dependencies = [
  "chrono",
  "eidetic-core",
  "eidetic-db",
+ "image",
  "infer",
  "kamadak-exif",
  "sha2 0.11.0",
