@@ -91,6 +91,7 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         longitude: exif.longitude,
         camera_make: exif.camera_make,
         camera_model: exif.camera_model,
+        thumbnails_generated: false,
     };
 
     match repo.insert_asset(new_asset).await {

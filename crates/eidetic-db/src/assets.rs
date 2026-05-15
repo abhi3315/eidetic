@@ -19,6 +19,7 @@ pub struct NewAsset {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub thumbnails_generated: bool,
 }
 
 /// Result of [`PgAssetsRepo::insert_asset`].
@@ -197,8 +198,9 @@ impl PgAssetsRepo {
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
              (id, hash, original_filename, storage_path, file_size, mime_type, \
-              date_taken, latitude, longitude, camera_make, camera_model) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+              date_taken, latitude, longitude, camera_make, camera_model, \
+              thumbnails_generated) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
@@ -213,6 +215,7 @@ impl PgAssetsRepo {
         .bind(asset.longitude)
         .bind(asset.camera_make.as_deref())
         .bind(asset.camera_model.as_deref())
+        .bind(asset.thumbnails_generated)
         .fetch_optional(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
