@@ -127,6 +127,46 @@ impl PgAssetsRepo {
             .collect())
     }
 
+    /// Image assets that don't yet have thumbnails generated.
+    ///
+    /// Returns `(id, hash, storage_path)` so callers can locate the
+    /// source bytes (via `storage_path`) and derive the destination
+    /// thumbnail paths (via `hash`) without further DB roundtrips.
+    ///
+    /// Ordered by `id` for stable resumption across runs.
+    pub async fn fetch_unthumbnailed(
+        &self,
+    ) -> crate::Result<Vec<(AssetId, eidetic_core::Sha256, PathBuf)>> {
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, hash, storage_path FROM assets \
+             WHERE thumbnails_generated = FALSE \
+               AND mime_type LIKE 'image/%' \
+             ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(uuid, hash_hex, path)| {
+                let hash = eidetic_core::Sha256::from_hex(&hash_hex)
+                    .expect("hash column is CHAR(64) of lowercase hex written by our own code");
+                (AssetId::from(uuid), hash, PathBuf::from(path))
+            })
+            .collect())
+    }
+
+    /// Flip `thumbnails_generated` to TRUE for a single row.
+    pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
+        sqlx::query("UPDATE assets SET thumbnails_generated = TRUE WHERE id = $1")
+            .bind(id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
     pub async fn store_embedding(&self, id: AssetId, embedding: &[f32]) -> crate::Result<()> {
         let vec = pgvector::Vector::from(embedding.to_vec());
         sqlx::query("UPDATE assets SET embedding = $1 WHERE id = $2")
