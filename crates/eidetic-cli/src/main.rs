@@ -9,8 +9,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use eidetic_core::Config;
 use eidetic_ingest::ImportOutcome;
-use eidetic_ml::Embedder;
 use std::path::PathBuf;
+use tokio::sync::{mpsc, oneshot};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -222,14 +222,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Embed => {
             let config = Config::from_env();
 
+            // Load the embedder on a blocking thread. We hand it to a worker
+            // task immediately afterwards, so the binding is local to that scope.
             let models_dir = config.paths.models_cache.clone();
             println!("Loading model (downloads ~1.4 GiB on first run)…");
-            let embedder = std::sync::Arc::new(
-                tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
-                    .await
-                    .context("embedder thread panicked")?
-                    .context("failed to load SigLIP 2 model — check your internet connection")?,
-            );
 
             let pool = eidetic_db::connect(&config)
                 .await
@@ -246,6 +242,25 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            // Channel of (path, reply) jobs sent to the worker thread. The
+            // worker owns the embedder; the async loop sends paths and awaits
+            // results via per-job oneshot replies. Channel capacity 1 keeps
+            // the worker tightly coupled to the async loop — no large queue
+            // of pending embeds builds up if the DB write side stalls.
+            type EmbedJob = (PathBuf, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>);
+            let (job_tx, mut job_rx) = mpsc::channel::<EmbedJob>(1);
+
+            let worker = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<()> {
+                let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                while let Some((path, reply)) = job_rx.blocking_recv() {
+                    let result = embedder.embed(&path);
+                    // If the receiver was dropped (e.g. caller gave up), keep
+                    // serving the next job rather than aborting the worker.
+                    let _ = reply.send(result);
+                }
+                Ok(())
+            });
+
             let total = unembedded.len();
             println!("Found {total} images to embed");
 
@@ -254,22 +269,22 @@ async fn main() -> anyhow::Result<()> {
             let mut failed = 0u32;
 
             for (i, (id, path)) in unembedded.into_iter().enumerate() {
-                let embedder = std::sync::Arc::clone(&embedder);
-                let path_clone = path.clone();
-
-                let result = tokio::task::spawn_blocking(move || embedder.embed(&path_clone))
+                let (reply_tx, reply_rx) = oneshot::channel();
+                // If `send` fails, the worker died — surface its error below.
+                if job_tx.send((path.clone(), reply_tx)).await.is_err() {
+                    break;
+                }
+                let result = reply_rx
                     .await
-                    .context("embedder thread panicked")?;
+                    .context("embed worker dropped reply channel")?;
 
                 match result {
-                    Ok(emb) => match repo.store_embedding(id, emb.as_slice()).await {
+                    Ok(emb) => match repo.store_embedding(id, &emb).await {
                         Ok(()) => {
                             println!("[{}/{}] {}", i + 1, total, path.display());
                             embedded += 1;
                         }
                         Err(e) => {
-                            // Don't bail — re-running `eidetic embed` filters on
-                            // `embedding IS NULL`, so this row will be retried.
                             eprintln!("  failed to store {}: {e}", path.display());
                             failed += 1;
                         }
@@ -281,14 +296,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Drop the sender so the worker's `blocking_recv` returns `None`
+            // and the worker exits. Then await the worker's result so a load
+            // or panic during embed surfaces here instead of being lost.
+            drop(job_tx);
+            worker
+                .await
+                .context("embed worker thread panicked")?
+                .context("failed to load SigLIP 2 model — check your internet connection")?;
+
             if failed > 0 {
                 println!(
                     "Done. Embedded {embedded}, skipped {skipped}, failed {failed}. \
                      Re-run `eidetic embed` to retry the failed rows."
                 );
-                // Match the `import` command's convention: non-zero exit when
-                // any per-item failure occurred, so cron / shell pipelines
-                // (e.g. `eidetic embed && rsync …`) treat it as a failure.
                 std::process::exit(1);
             } else {
                 println!("Done. Embedded {embedded}, skipped {skipped}.");
@@ -316,17 +337,14 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::from_env();
 
             let models_dir = config.paths.models_cache.clone();
-            let embedder =
-                tokio::task::spawn_blocking(move || eidetic_ml::SiglipEmbedder::load(&models_dir))
-                    .await
-                    .context("embedder thread panicked")?
-                    .context("failed to load SigLIP 2 model — check your internet connection")?;
-
             let query_clone = query.clone();
-            let query_emb = tokio::task::spawn_blocking(move || embedder.embed_text(&query_clone))
-                .await
-                .context("embedder thread panicked")?
-                .context("text embedding failed")?;
+            let query_emb = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
+                let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                embedder.embed_text(&query_clone)
+            })
+            .await
+            .context("embedder thread panicked")?
+            .context("text embedding failed — check your internet connection and that the SigLIP 2 model is downloaded")?;
 
             let pool = eidetic_db::connect(&config)
                 .await

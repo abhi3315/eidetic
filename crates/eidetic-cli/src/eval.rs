@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 use eidetic_core::Config;
-use eidetic_ml::{Embedder, SiglipEmbedder};
+use eidetic_ml::SiglipEmbedder;
 use std::path::Path;
 
 struct EvalImage {
@@ -32,7 +32,7 @@ pub fn run(csv_path: &Path, images_dir: &Path, limit: Option<usize>) -> Result<(
 
     let config = Config::from_env();
     println!("Loading model (downloads ~1.4 GiB on first run)…");
-    let embedder = SiglipEmbedder::load(&config.paths.models_cache)
+    let mut embedder = SiglipEmbedder::load(&config.paths.models_cache)
         .context("failed to load SigLIP 2 model")?;
 
     // 1. Embed every image. Order in `img_embeddings` matches `images`.
@@ -43,7 +43,7 @@ pub fn run(csv_path: &Path, images_dir: &Path, limit: Option<usize>) -> Result<(
         let emb = embedder
             .embed(&path)
             .with_context(|| format!("embed image {}", path.display()))?;
-        img_embeddings.push(emb.as_slice().to_vec());
+        img_embeddings.push(emb);
         if (i + 1).is_multiple_of(100) || i + 1 == n_images {
             println!("  images: {} / {n_images}", i + 1);
         }
