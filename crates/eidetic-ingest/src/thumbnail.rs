@@ -5,7 +5,6 @@
 
 use crate::{Error, Result};
 use eidetic_core::Sha256;
-use image::ImageFormat;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use std::path::{Path, PathBuf};
@@ -91,10 +90,11 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
 
         let mut bytes: Vec<u8> = Vec::new();
         let encoder = JpegEncoder::new_with_quality(&mut bytes, JPEG_QUALITY);
-        rgb.write_with_encoder(encoder).map_err(|e| Error::Io {
-            path: dest.clone(),
-            source: std::io::Error::other(format!("jpeg encode: {e}")),
-        })?;
+        rgb.write_with_encoder(encoder)
+            .map_err(|source| Error::JpegEncode {
+                path: dest.clone(),
+                source,
+            })?;
 
         std::fs::write(&dest, &bytes).map_err(|source| Error::Io { path: dest, source })?;
     }
@@ -121,14 +121,9 @@ fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
     limits.max_image_height = Some(16384);
     reader.limits(limits);
 
-    // Suppress the unused-import warning if `ImageFormat` ends up unused
-    // after future refactors — currently kept for the doc trail of "this
-    // reader is format-agnostic, MIME has already been detected upstream".
-    let _ = ImageFormat::Jpeg;
-
-    reader.decode().map_err(|e| Error::Io {
+    reader.decode().map_err(|source| Error::ImageDecode {
         path: path.to_path_buf(),
-        source: std::io::Error::other(format!("image decode: {e}")),
+        source,
     })
 }
 
@@ -136,7 +131,7 @@ fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
 mod tests {
     use super::*;
     use eidetic_core::Sha256;
-    use image::{ImageBuffer, Rgb};
+    use image::{ImageBuffer, ImageFormat, Rgb};
     use std::path::PathBuf;
 
     fn fixture_hash() -> Sha256 {
@@ -233,5 +228,6 @@ mod tests {
 
         generate_thumbnails(&src, &hash, &nested_library).expect("generate");
         assert!(thumbnail_path(&nested_library, &hash, ThumbSize::Small).exists());
+        assert!(thumbnail_path(&nested_library, &hash, ThumbSize::Medium).exists());
     }
 }

@@ -9,6 +9,18 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("image decode failed for {path}: {source}")]
+    ImageDecode {
+        path: PathBuf,
+        #[source]
+        source: image::ImageError,
+    },
+    #[error("jpeg encode failed for {path}: {source}")]
+    JpegEncode {
+        path: PathBuf,
+        #[source]
+        source: image::ImageError,
+    },
     #[error("database error: {0}")]
     Db(#[source] eidetic_db::Error),
 }
