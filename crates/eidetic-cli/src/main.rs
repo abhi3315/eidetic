@@ -200,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  videos   {:>8}", s.videos);
             println!("Embedded   {:>8}", s.embedded);
             println!("Not yet    {:>8}", s.needs_embed);
+            println!("Thumbs pending {:>4}", s.thumbnails_pending);
             println!("Size       {:>8}", format_bytes(s.total_bytes as u64));
             if let Some(earliest) = s.earliest {
                 println!("Earliest   {}", earliest.format("%Y-%m-%d"));

@@ -42,6 +42,7 @@ pub struct LibraryStats {
     pub videos: i64,
     pub embedded: i64,
     pub needs_embed: i64,
+    pub thumbnails_pending: i64,
     pub total_bytes: i64,
     pub earliest: Option<DateTime<Utc>>,
     pub latest: Option<DateTime<Utc>>,
@@ -72,6 +73,7 @@ impl PgAssetsRepo {
             videos: i64,
             embedded: i64,
             needs_embed: i64,
+            thumbnails_pending: i64,
             total_bytes: i64,
             earliest: Option<DateTime<Utc>>,
             latest: Option<DateTime<Utc>>,
@@ -85,6 +87,8 @@ impl PgAssetsRepo {
                COUNT(*) FILTER (WHERE embedding IS NOT NULL)              AS embedded, \
                COUNT(*) FILTER (WHERE embedding IS NULL \
                                   AND mime_type LIKE 'image/%')           AS needs_embed, \
+               COUNT(*) FILTER (WHERE thumbnails_generated = FALSE \
+                                  AND mime_type LIKE 'image/%')           AS thumbnails_pending, \
                COALESCE(SUM(file_size), 0)::bigint                        AS total_bytes, \
                MIN(date_taken)                                            AS earliest, \
                MAX(date_taken)                                            AS latest \
@@ -100,6 +104,7 @@ impl PgAssetsRepo {
             videos: row.videos,
             embedded: row.embedded,
             needs_embed: row.needs_embed,
+            thumbnails_pending: row.thumbnails_pending,
             total_bytes: row.total_bytes,
             earliest: row.earliest,
             latest: row.latest,
