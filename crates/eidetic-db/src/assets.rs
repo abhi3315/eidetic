@@ -60,6 +60,31 @@ pub struct SearchResult {
     pub longitude: Option<f64>,
 }
 
+/// One row from `fetch_recent`. Just what the landing-page grid needs.
+pub struct RecentAsset {
+    pub id: AssetId,
+    pub hash: eidetic_core::Sha256,
+    pub original_filename: String,
+    pub imported_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Full asset row for the detail page.
+pub struct AssetDetail {
+    pub id: AssetId,
+    pub hash: eidetic_core::Sha256,
+    pub original_filename: String,
+    pub storage_path: PathBuf,
+    pub file_size: i64,
+    pub mime_type: Option<String>,
+    pub imported_at: chrono::DateTime<chrono::Utc>,
+    pub date_taken: Option<chrono::DateTime<chrono::Utc>>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub thumbnails_generated: bool,
+}
+
 impl PgAssetsRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -165,6 +190,84 @@ impl PgAssetsRepo {
             .await
             .map_err(crate::Error::Query)?;
         Ok(())
+    }
+
+    /// Most recently imported image assets, descending. Caps at `limit`.
+    pub async fn fetch_recent(&self, limit: u32) -> crate::Result<Vec<RecentAsset>> {
+        let rows: Vec<(uuid::Uuid, String, String, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                "SELECT id, hash, original_filename, imported_at \
+             FROM assets \
+             WHERE mime_type LIKE 'image/%' \
+             ORDER BY imported_at DESC \
+             LIMIT $1",
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(uuid, hash_hex, original_filename, imported_at)| {
+                let hash = eidetic_core::Sha256::from_hex(&hash_hex)
+                    .expect("hash column is CHAR(64) of lowercase hex");
+                RecentAsset {
+                    id: AssetId::from(uuid),
+                    hash,
+                    original_filename,
+                    imported_at,
+                }
+            })
+            .collect())
+    }
+
+    /// Single asset by id, or `None` if no row.
+    pub async fn fetch_by_id(&self, id: AssetId) -> crate::Result<Option<AssetDetail>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: uuid::Uuid,
+            hash: String,
+            original_filename: String,
+            storage_path: String,
+            file_size: i64,
+            mime_type: Option<String>,
+            imported_at: chrono::DateTime<chrono::Utc>,
+            date_taken: Option<chrono::DateTime<chrono::Utc>>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            camera_make: Option<String>,
+            camera_model: Option<String>,
+            thumbnails_generated: bool,
+        }
+
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT id, hash, original_filename, storage_path, file_size, mime_type, \
+                    imported_at, date_taken, latitude, longitude, camera_make, camera_model, \
+                    thumbnails_generated \
+             FROM assets WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(row.map(|r| AssetDetail {
+            id: AssetId::from(r.id),
+            hash: eidetic_core::Sha256::from_hex(&r.hash)
+                .expect("hash column is CHAR(64) of lowercase hex"),
+            original_filename: r.original_filename,
+            storage_path: PathBuf::from(r.storage_path),
+            file_size: r.file_size,
+            mime_type: r.mime_type,
+            imported_at: r.imported_at,
+            date_taken: r.date_taken,
+            latitude: r.latitude,
+            longitude: r.longitude,
+            camera_make: r.camera_make,
+            camera_model: r.camera_model,
+            thumbnails_generated: r.thumbnails_generated,
+        }))
     }
 
     pub async fn store_embedding(&self, id: AssetId, embedding: &[f32]) -> crate::Result<()> {
