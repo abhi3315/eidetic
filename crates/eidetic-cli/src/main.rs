@@ -42,6 +42,13 @@ enum Command {
     Embed,
     /// Generate missing thumbnails for previously-imported images.
     Thumbnail,
+    /// Start the HTTP server (localhost-bound).
+    Serve {
+        /// Address to bind. Defaults to 127.0.0.1:8080.
+        /// Override via --bind or EIDETIC_BIND env var.
+        #[arg(long)]
+        bind: Option<String>,
+    },
     /// Run COCO 5K (Karpathy) text-to-image retrieval eval. Bypasses the
     /// library entirely — embeds images and captions in-memory.
     Eval {
@@ -394,6 +401,32 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Done. Generated {generated}.");
             }
+        }
+
+        Command::Serve { bind } => {
+            use std::net::SocketAddr;
+
+            let config = Config::from_env();
+            let addr_str = bind
+                .or_else(|| std::env::var("EIDETIC_BIND").ok())
+                .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+            let addr: SocketAddr = addr_str
+                .parse()
+                .with_context(|| format!("invalid bind address: {addr_str}"))?;
+
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::PgAssetsRepo::new(pool);
+
+            let deps = eidetic_server::ServerDeps {
+                repo,
+                library_dir: config.paths.library_dir.clone(),
+                models_cache: config.paths.models_cache.clone(),
+            };
+
+            println!("Loading model (downloads ~1.4 GiB on first run)…");
+            eidetic_server::serve(addr, deps).await?;
         }
 
         Command::Search {

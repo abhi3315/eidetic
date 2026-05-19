@@ -1071,6 +1071,7 @@ dependencies = [
  "eidetic-db",
  "eidetic-ingest",
  "eidetic-ml",
+ "eidetic-server",
  "serde_json",
  "tokio",
  "tracing",
