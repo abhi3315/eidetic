@@ -42,6 +42,7 @@ async fn insert_asset_then_find_by_hash() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
 
     let outcome = repo.insert_asset(asset).await.expect("insert");
@@ -97,6 +98,7 @@ async fn insert_asset_stores_exif_fields() {
         longitude: Some(-122.4194),
         camera_make: Some("Canon".to_string()),
         camera_model: Some("EOS R5".to_string()),
+        thumbnails_generated: false,
     };
 
     repo.insert_asset(asset).await.expect("insert");
@@ -147,6 +149,7 @@ async fn insert_duplicate_returns_existing() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
 
     let first = repo.insert_asset(make_asset()).await.expect("first insert");
@@ -187,6 +190,7 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
     let asset_b = NewAsset {
         hash: "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000".to_string(),
@@ -199,6 +203,7 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
     let outcome_a = repo.insert_asset(asset_a).await.expect("insert a");
     repo.insert_asset(asset_b).await.expect("insert b");
@@ -240,6 +245,7 @@ async fn store_embedding_persists_float_values() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
     let outcome = repo.insert_asset(asset).await.expect("insert");
     let id = match outcome {
@@ -289,6 +295,7 @@ async fn search_similar_orders_by_cosine_similarity() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
     let asset_b = NewAsset {
         hash: "eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000".to_string(),
@@ -301,6 +308,7 @@ async fn search_similar_orders_by_cosine_similarity() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
 
     let id_a = match repo.insert_asset(asset_a).await.expect("insert a") {
@@ -354,6 +362,7 @@ async fn fetch_unembedded_orders_by_id_stably() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     };
     let h1 = "1111000011110000111100001111000011110000111100001111000011110000";
     let h2 = "2222000022220000222200002222000022220000222200002222000022220000";
@@ -424,4 +433,112 @@ async fn import_file_round_trips_through_pg_assets_repo() {
         ImportOutcome::Duplicate(dup_id) => assert_eq!(dup_id, id),
         other => panic!("expected Duplicate, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn fetch_unthumbnailed_returns_images_with_flag_false() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    let image_pending = NewAsset {
+        hash: "11110000111100001111000011110000111100001111000011110000ffffffff".to_string(),
+        original_filename: "pending.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/11/11/pending.jpg"),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        thumbnails_generated: false,
+    };
+    let image_done = NewAsset {
+        hash: "22220000222200002222000022220000222200002222000022220000ffffffff".to_string(),
+        original_filename: "done.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/22/22/done.jpg"),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        thumbnails_generated: true,
+    };
+    let video_pending = NewAsset {
+        hash: "33330000333300003333000033330000333300003333000033330000ffffffff".to_string(),
+        original_filename: "video.mp4".to_string(),
+        storage_path: PathBuf::from("/lib/33/33/video.mp4"),
+        file_size: 1,
+        mime_type: Some("video/mp4".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        thumbnails_generated: false,
+    };
+
+    repo.insert_asset(image_pending)
+        .await
+        .expect("insert pending image");
+    repo.insert_asset(image_done)
+        .await
+        .expect("insert done image");
+    repo.insert_asset(video_pending)
+        .await
+        .expect("insert video");
+
+    let pending = repo.fetch_unthumbnailed().await.expect("fetch");
+    assert_eq!(
+        pending.len(),
+        1,
+        "only the unthumbnailed image should come back; got {pending:?}"
+    );
+    let (_, _, path) = &pending[0];
+    assert!(path.to_str().unwrap().contains("pending.jpg"));
+}
+
+#[tokio::test]
+async fn mark_thumbnailed_flips_flag_to_true() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    let asset = NewAsset {
+        hash: "44440000444400004444000044440000444400004444000044440000ffffffff".to_string(),
+        original_filename: "mark_me.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/44/44/mark.jpg"),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        thumbnails_generated: false,
+    };
+    let outcome = repo.insert_asset(asset).await.expect("insert");
+    let id = match outcome {
+        InsertOutcome::Inserted(id) => id,
+        InsertOutcome::Existing(_) => panic!("expected Inserted"),
+    };
+
+    let before = repo.fetch_unthumbnailed().await.expect("fetch before");
+    assert_eq!(before.len(), 1);
+
+    repo.mark_thumbnailed(id).await.expect("mark");
+
+    let after = repo.fetch_unthumbnailed().await.expect("fetch after");
+    assert_eq!(after.len(), 0, "row should no longer be pending after mark");
 }

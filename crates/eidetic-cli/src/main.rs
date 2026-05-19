@@ -40,6 +40,8 @@ enum Command {
     Stats,
     /// Generate embeddings for all imported images that don't have one yet.
     Embed,
+    /// Generate missing thumbnails for previously-imported images.
+    Thumbnail,
     /// Run COCO 5K (Karpathy) text-to-image retrieval eval. Bypasses the
     /// library entirely — embeds images and captions in-memory.
     Eval {
@@ -200,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  videos   {:>8}", s.videos);
             println!("Embedded   {:>8}", s.embedded);
             println!("Not yet    {:>8}", s.needs_embed);
+            println!("Thumbs pending {:>4}", s.thumbnails_pending);
             println!("Size       {:>8}", format_bytes(s.total_bytes as u64));
             if let Some(earliest) = s.earliest {
                 println!("Earliest   {}", earliest.format("%Y-%m-%d"));
@@ -313,6 +316,83 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             } else {
                 println!("Done. Embedded {embedded}, skipped {skipped}.");
+            }
+        }
+
+        Command::Thumbnail => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::PgAssetsRepo::new(pool);
+
+            let pending = repo
+                .fetch_unthumbnailed()
+                .await
+                .context("failed to fetch unthumbnailed assets")?;
+
+            if pending.is_empty() {
+                println!("Nothing to do.");
+                return Ok(());
+            }
+
+            let total = pending.len();
+            println!("Generating thumbnails for {total} images…");
+
+            let mut generated = 0u32;
+            let mut failed = 0u32;
+
+            for (i, (id, hash, storage_path)) in pending.into_iter().enumerate() {
+                let lib = config.paths.library_dir.clone();
+                let storage_clone = storage_path.clone();
+                let hash_clone = hash.clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    eidetic_ingest::thumbnail::generate_thumbnails(
+                        &storage_clone,
+                        &hash_clone,
+                        &lib,
+                    )
+                })
+                .await
+                .context("thumbnail thread panicked")?;
+
+                match result {
+                    Ok(()) => match repo.mark_thumbnailed(id).await {
+                        Ok(()) => {
+                            println!("[{}/{}] {}", i + 1, total, storage_path.display());
+                            generated += 1;
+                        }
+                        Err(e) => {
+                            // Keep going — rows whose mark failed stay false
+                            // and are retried on the next run, same pattern
+                            // as eidetic embed.
+                            eprintln!(
+                                "  [{}/{}] mark failed for {}: {e}",
+                                i + 1,
+                                total,
+                                storage_path.display()
+                            );
+                            failed += 1;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "  [{}/{}] generate failed for {}: {e}",
+                            i + 1,
+                            total,
+                            storage_path.display()
+                        );
+                        failed += 1;
+                    }
+                }
+            }
+
+            if failed > 0 {
+                println!("Done. Generated {generated}, failed {failed}.");
+                std::process::exit(1);
+            } else {
+                println!("Done. Generated {generated}.");
             }
         }
 

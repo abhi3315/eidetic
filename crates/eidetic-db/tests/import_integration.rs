@@ -117,6 +117,7 @@ async fn known_hash_returns_duplicate() {
             longitude: None,
             camera_make: None,
             camera_model: None,
+            thumbnails_generated: false,
         })
         .await
         .expect("seed insert")
@@ -200,6 +201,7 @@ async fn dir_counts_duplicates_separately() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     })
     .await
     .expect("seed");
@@ -284,6 +286,7 @@ async fn duplicate_import_does_not_touch_library_dir() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        thumbnails_generated: false,
     })
     .await
     .expect("seed");

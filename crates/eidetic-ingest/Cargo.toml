@@ -16,6 +16,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 walkdir = { workspace = true }
 chrono = { workspace = true }
+image = { workspace = true }
 infer = { workspace = true }
 kamadak-exif = { workspace = true }
 tempfile = { workspace = true }

@@ -80,10 +80,34 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         Err(e) => return ImportOutcome::Failed(e),
     };
 
+    let thumbnails_generated = if mime_type.starts_with("image/") {
+        let src = storage_path.clone();
+        let hash_clone = hash.clone();
+        let lib = config.library_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::thumbnail::generate_thumbnails(&src, &hash_clone, &lib)
+        })
+        .await
+        .expect("thumbnail thread panicked");
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::info!(
+                    path = %path.display(),
+                    error = %e,
+                    "thumbnail generation failed; asset stored without thumbnails (eidetic thumbnail will retry)"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     let new_asset = NewAsset {
         hash: hash_hex.clone(),
         original_filename,
-        storage_path,
+        storage_path: storage_path.clone(),
         file_size,
         mime_type: Some(mime_type),
         date_taken: exif.date_taken,
@@ -91,6 +115,7 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         longitude: exif.longitude,
         camera_make: exif.camera_make,
         camera_model: exif.camera_model,
+        thumbnails_generated,
     };
 
     match repo.insert_asset(new_asset).await {

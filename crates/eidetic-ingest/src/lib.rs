@@ -5,6 +5,7 @@ mod hasher;
 mod import;
 mod meta;
 mod store;
+pub mod thumbnail;
 
 pub use error::{Error, Result};
 pub use hasher::hash_file;

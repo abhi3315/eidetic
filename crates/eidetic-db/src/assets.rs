@@ -19,6 +19,7 @@ pub struct NewAsset {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub thumbnails_generated: bool,
 }
 
 /// Result of [`PgAssetsRepo::insert_asset`].
@@ -41,6 +42,7 @@ pub struct LibraryStats {
     pub videos: i64,
     pub embedded: i64,
     pub needs_embed: i64,
+    pub thumbnails_pending: i64,
     pub total_bytes: i64,
     pub earliest: Option<DateTime<Utc>>,
     pub latest: Option<DateTime<Utc>>,
@@ -71,6 +73,7 @@ impl PgAssetsRepo {
             videos: i64,
             embedded: i64,
             needs_embed: i64,
+            thumbnails_pending: i64,
             total_bytes: i64,
             earliest: Option<DateTime<Utc>>,
             latest: Option<DateTime<Utc>>,
@@ -84,6 +87,8 @@ impl PgAssetsRepo {
                COUNT(*) FILTER (WHERE embedding IS NOT NULL)              AS embedded, \
                COUNT(*) FILTER (WHERE embedding IS NULL \
                                   AND mime_type LIKE 'image/%')           AS needs_embed, \
+               COUNT(*) FILTER (WHERE thumbnails_generated = FALSE \
+                                  AND mime_type LIKE 'image/%')           AS thumbnails_pending, \
                COALESCE(SUM(file_size), 0)::bigint                        AS total_bytes, \
                MIN(date_taken)                                            AS earliest, \
                MAX(date_taken)                                            AS latest \
@@ -99,6 +104,7 @@ impl PgAssetsRepo {
             videos: row.videos,
             embedded: row.embedded,
             needs_embed: row.needs_embed,
+            thumbnails_pending: row.thumbnails_pending,
             total_bytes: row.total_bytes,
             earliest: row.earliest,
             latest: row.latest,
@@ -119,6 +125,46 @@ impl PgAssetsRepo {
             .into_iter()
             .map(|(uuid, path)| (AssetId::from(uuid), PathBuf::from(path)))
             .collect())
+    }
+
+    /// Image assets that don't yet have thumbnails generated.
+    ///
+    /// Returns `(id, hash, storage_path)` so callers can locate the
+    /// source bytes (via `storage_path`) and derive the destination
+    /// thumbnail paths (via `hash`) without further DB roundtrips.
+    ///
+    /// Ordered by `id` for stable resumption across runs.
+    pub async fn fetch_unthumbnailed(
+        &self,
+    ) -> crate::Result<Vec<(AssetId, eidetic_core::Sha256, PathBuf)>> {
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, hash, storage_path FROM assets \
+             WHERE thumbnails_generated = FALSE \
+               AND mime_type LIKE 'image/%' \
+             ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(uuid, hash_hex, path)| {
+                let hash = eidetic_core::Sha256::from_hex(&hash_hex)
+                    .expect("hash column is CHAR(64) of lowercase hex written by our own code");
+                (AssetId::from(uuid), hash, PathBuf::from(path))
+            })
+            .collect())
+    }
+
+    /// Flip `thumbnails_generated` to TRUE for a single row.
+    pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
+        sqlx::query("UPDATE assets SET thumbnails_generated = TRUE WHERE id = $1")
+            .bind(id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(())
     }
 
     pub async fn store_embedding(&self, id: AssetId, embedding: &[f32]) -> crate::Result<()> {
@@ -197,8 +243,9 @@ impl PgAssetsRepo {
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
              (id, hash, original_filename, storage_path, file_size, mime_type, \
-              date_taken, latitude, longitude, camera_make, camera_model) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+              date_taken, latitude, longitude, camera_make, camera_model, \
+              thumbnails_generated) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
@@ -213,6 +260,7 @@ impl PgAssetsRepo {
         .bind(asset.longitude)
         .bind(asset.camera_make.as_deref())
         .bind(asset.camera_model.as_deref())
+        .bind(asset.thumbnails_generated)
         .fetch_optional(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
