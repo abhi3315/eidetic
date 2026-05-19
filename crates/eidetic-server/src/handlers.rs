@@ -6,9 +6,7 @@ use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub(crate) struct SearchQuery {
-    #[allow(dead_code)]
     pub q: Option<String>,
-    #[allow(dead_code)]
     pub limit: Option<u32>,
 }
 
@@ -42,12 +40,86 @@ pub(crate) async fn index(State(state): State<AppState>) -> Result<Html<String>,
 }
 
 pub(crate) async fn search(
-    State(_state): State<AppState>,
-    Query(_q): Query<SearchQuery>,
-) -> Result<Html<String>, ServerError> {
-    Ok(Html(
-        "<!doctype html><p>eidetic-server: search (TODO)</p>".to_string(),
-    ))
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<axum::response::Response, ServerError> {
+    use crate::views::{GridTile, asset_grid, layout, search_form};
+    use axum::http::StatusCode;
+    use axum::response::{Html, IntoResponse, Redirect};
+    use maud::html;
+    use tokio::sync::oneshot;
+
+    let query_text = match q.q.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Ok(Redirect::to("/").into_response()),
+    };
+    let limit = q.limit.unwrap_or(24).min(60);
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state
+        .embed_tx
+        .send((query_text.clone(), reply_tx))
+        .await
+        .map_err(|_| {
+            ServerError::EmbedFailed(eidetic_ml::Error::Inference(
+                "embedder worker dropped".into(),
+            ))
+        })?;
+
+    let query_vec = reply_rx
+        .await
+        .map_err(|_| {
+            ServerError::EmbedFailed(eidetic_ml::Error::Inference(
+                "embedder reply dropped".into(),
+            ))
+        })?
+        .map_err(ServerError::EmbedFailed)?;
+
+    let results = state
+        .repo
+        .search_similar(&query_vec, limit)
+        .await
+        .map_err(ServerError::DbFailed)?;
+
+    // SearchResult carries storage_path (CAS-shaped) but no hash. The CAS
+    // filename's stem IS the hash hex; derive it from there. If the path
+    // shape is somehow weird, fall back to a zero hash and the tile will
+    // show a broken-image icon (404 from /thumbs/m/<bogus>).
+    let tiles: Vec<GridTile> = results
+        .into_iter()
+        .map(|r| {
+            let hash = hash_from_path(&r.storage_path)
+                .and_then(|hex| eidetic_core::Sha256::from_hex(&hex))
+                .unwrap_or_else(|| eidetic_core::Sha256::from_bytes([0u8; 32]));
+            GridTile {
+                id: r.id,
+                hash,
+                alt: query_text.clone(),
+                score: Some(r.score),
+            }
+        })
+        .collect();
+
+    let body = html! {
+        (search_form(&query_text))
+        h2 { "Results for " (query_text) " (" (tiles.len()) ")" }
+        (asset_grid(&tiles))
+    };
+
+    Ok((
+        StatusCode::OK,
+        Html(layout(&query_text, body).into_string()),
+    )
+        .into_response())
+}
+
+/// Pull the hash hex out of a CAS storage path. The CAS commit places files at
+/// `<library>/<ab>/<cd>/<full-hex>.<ext>`, so the file stem is the hash. Returns
+/// `None` if the path doesn't have a parseable stem.
+fn hash_from_path(p: &std::path::Path) -> Option<String> {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
 }
 
 pub(crate) async fn asset_detail(
