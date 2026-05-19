@@ -31,21 +31,22 @@ pub struct ServerDeps {
 pub(crate) type EmbedJob = (String, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>);
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct AppState {
     pub(crate) repo: Arc<PgAssetsRepo>,
     pub(crate) library_dir: Arc<PathBuf>,
+    #[allow(dead_code)]
     pub(crate) embed_tx: mpsc::Sender<EmbedJob>,
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub(crate) enum ServerError {
     #[error("not found: {0}")]
     NotFound(String),
     #[error("bad request: {0}")]
+    #[allow(dead_code)]
     BadRequest(String),
     #[error("embed failed: {0}")]
+    #[allow(dead_code)]
     EmbedFailed(#[source] eidetic_ml::Error),
     #[error("database error: {0}")]
     DbFailed(#[source] eidetic_db::Error),

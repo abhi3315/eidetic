@@ -1,5 +1,4 @@
 //! Maud HTML helpers for the server.
-#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use eidetic_core::{AssetId, Sha256};
@@ -16,6 +15,7 @@ pub(crate) struct GridTile {
 
 /// Detail-page input. Mirrors `eidetic_db::AssetDetail`'s fields the page
 /// actually displays.
+#[allow(dead_code)]
 pub(crate) struct DetailView {
     pub(crate) id: AssetId,
     pub(crate) hash: Sha256,
@@ -99,6 +99,7 @@ pub(crate) fn asset_grid(tiles: &[GridTile]) -> Markup {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn detail_page(view: &DetailView) -> Markup {
     html! {
         div class="detail" {
@@ -141,6 +142,7 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
     }
 }
 
+#[allow(dead_code)]
 fn format_bytes(n: i64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
