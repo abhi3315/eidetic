@@ -51,20 +51,83 @@ pub(crate) async fn search(
 }
 
 pub(crate) async fn asset_detail(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
 ) -> Result<Html<String>, ServerError> {
-    Ok(Html(
-        "<!doctype html><p>eidetic-server: asset detail (TODO)</p>".to_string(),
-    ))
+    use crate::views::{DetailView, detail_page, layout};
+    use eidetic_core::AssetId;
+    use maud::html;
+
+    let asset_id = AssetId::from(id);
+    let detail = state
+        .repo
+        .fetch_by_id(asset_id)
+        .await
+        .map_err(ServerError::DbFailed)?
+        .ok_or_else(|| ServerError::NotFound(format!("asset {id}")))?;
+
+    let view = DetailView {
+        id: detail.id,
+        hash: detail.hash,
+        original_filename: detail.original_filename.clone(),
+        mime_type: detail.mime_type,
+        file_size: detail.file_size,
+        imported_at: detail.imported_at,
+        date_taken: detail.date_taken,
+        latitude: detail.latitude,
+        longitude: detail.longitude,
+        camera_make: detail.camera_make,
+        camera_model: detail.camera_model,
+        thumbnails_generated: detail.thumbnails_generated,
+    };
+
+    let title = detail.original_filename;
+    let body = html! { (detail_page(&view)) };
+    Ok(Html(layout(&title, body).into_string()))
 }
 
 pub(crate) async fn asset_raw(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response, ServerError> {
-    use axum::response::IntoResponse;
-    Ok((axum::http::StatusCode::NOT_IMPLEMENTED, "TODO").into_response())
+    use axum::body::Body;
+    use axum::http::{StatusCode, header};
+    use axum::response::Response;
+    use eidetic_core::AssetId;
+    use tokio_util::io::ReaderStream;
+
+    let asset_id = AssetId::from(id);
+    let detail = state
+        .repo
+        .fetch_by_id(asset_id)
+        .await
+        .map_err(ServerError::DbFailed)?
+        .ok_or_else(|| ServerError::NotFound(format!("asset {id}")))?;
+
+    let file = tokio::fs::File::open(&detail.storage_path)
+        .await
+        .map_err(ServerError::Io)?;
+
+    let mime = detail
+        .mime_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    // Backslash-escape any quotes in the filename for the legacy
+    // Content-Disposition form. Personal use; the cleaner RFC 6266
+    // filename* with UTF-8 encoding can come later.
+    let safe_filename = detail.original_filename.replace('"', "\\\"");
+    let disposition = format!("inline; filename=\"{safe_filename}\"");
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(body)
+        .expect("disposition is ASCII-safe by construction"))
 }
 
 pub(crate) async fn thumb(
