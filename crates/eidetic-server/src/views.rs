@@ -11,6 +11,44 @@ pub(crate) struct GridTile {
     pub(crate) alt: String,
     /// Optional cosine-similarity score [0, 1]. Some(score) means render a badge.
     pub(crate) score: Option<f32>,
+    pub(crate) mime_type: String,
+    pub(crate) thumbnails_generated: bool,
+    pub(crate) file_size: i64,
+}
+
+/// Max bytes we're willing to embed inline as `<img src="/raw">`.
+/// Above this, render a placeholder so a single grid tile doesn't drag
+/// in 50 MB of bandwidth.
+const MAX_INLINE_BYTES: i64 = 25 * 1024 * 1024; // 25 MiB
+
+/// Returns `true` iff the browser can natively render this MIME via `<img>`
+/// AND the file is under the inline size threshold.
+///
+/// MIME allowlist is deliberately conservative — HEIC works on Safari only,
+/// DNG/ARW/CR3 don't work anywhere. For those, plus oversized files, show a
+/// placeholder rather than a broken-image icon or a runaway download.
+fn should_render_inline(mime: &str, file_size: i64) -> bool {
+    let renderable = matches!(
+        mime,
+        "image/jpeg"
+            | "image/png"
+            | "image/gif"
+            | "image/webp"
+            | "image/avif"
+            | "image/bmp"
+            | "image/svg+xml"
+    );
+    renderable && file_size <= MAX_INLINE_BYTES
+}
+
+/// Upper-cased extension from a filename. `"IMG_1234.heic"` -> `"HEIC"`.
+/// Defaults to `"FILE"` when there's no extension.
+fn ext_badge(filename: &str) -> String {
+    std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase())
+        .unwrap_or_else(|| "FILE".to_string())
 }
 
 /// Detail-page input. Mirrors `eidetic_db::AssetDetail`'s fields the page
@@ -44,6 +82,9 @@ h2 { margin: 1.5rem 0 1rem; font-weight: 600; font-size: 1.1rem; color: #555; }
 .tile { position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 4px; background: #eee; }
 .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tile .score { position: absolute; bottom: 0.3rem; right: 0.3rem; background: rgba(0,0,0,0.7); color: white; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
+.tile-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.4rem; padding: 0.5rem; background: linear-gradient(135deg, #e8e8e8 0%, #d6d6d6 100%); }
+.tile-placeholder .ext-badge { background: #111; color: white; padding: 0.2rem 0.6rem; border-radius: 3px; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; }
+.tile-placeholder .filename { font-size: 0.7rem; color: #555; text-align: center; word-break: break-all; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .detail { display: grid; grid-template-columns: 2fr 1fr; gap: 2rem; }
 .detail img.preview { width: 100%; border-radius: 4px; background: #eee; }
 .detail dl { margin: 0; }
@@ -88,7 +129,21 @@ pub(crate) fn asset_grid(tiles: &[GridTile]) -> Markup {
         div class="grid" {
             @for tile in tiles {
                 a href=(format!("/assets/{}", tile.id)) class="tile" {
-                    img src=(format!("/thumbs/m/{}", tile.hash)) loading="lazy" alt=(tile.alt);
+                    @if tile.thumbnails_generated {
+                        img src=(format!("/thumbs/m/{}", tile.hash)) loading="lazy" alt=(tile.alt);
+                    } @else if should_render_inline(&tile.mime_type, tile.file_size) {
+                        // Browser-renderable image without a generated thumbnail — serve
+                        // the original. Size is bounded by MAX_INLINE_BYTES.
+                        img src=(format!("/assets/{}/raw", tile.id)) loading="lazy" alt=(tile.alt);
+                    } @else {
+                        // Video, RAW, oversized image, or HEIC-without-thumbnail.
+                        // Placeholder with extension badge + filename. Detail page
+                        // has the download link.
+                        div class="tile-placeholder" {
+                            span class="ext-badge" { (ext_badge(&tile.alt)) }
+                            span class="filename" { (tile.alt) }
+                        }
+                    }
                     @if let Some(score) = tile.score {
                         span class="score" { (format!("{:.0}%", score * 100.0)) }
                     }
@@ -99,6 +154,10 @@ pub(crate) fn asset_grid(tiles: &[GridTile]) -> Markup {
 }
 
 pub(crate) fn detail_page(view: &DetailView) -> Markup {
+    let render_original_inline = view
+        .mime_type
+        .as_deref()
+        .is_some_and(|m| should_render_inline(m, view.file_size));
     html! {
         div class="detail" {
             div {
@@ -106,9 +165,15 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
                     img class="preview"
                         src=(format!("/thumbs/m/{}", view.hash))
                         alt=(view.original_filename);
+                } @else if render_original_inline {
+                    img class="preview"
+                        src=(format!("/assets/{}/raw", view.id))
+                        alt=(view.original_filename);
                 } @else {
                     p class="empty" {
-                        "Thumbnails pending — run `eidetic thumbnail` to generate."
+                        "No preview available — this is "
+                        (view.mime_type.as_deref().unwrap_or("an unknown type"))
+                        " (" (format_bytes(view.file_size)) "). Use the download link below."
                     }
                 }
                 a class="download" href=(format!("/assets/{}/raw", view.id)) {
@@ -182,26 +247,124 @@ mod tests {
         assert!(!s.contains("<div class=\"grid\""));
     }
 
+    fn tile(alt: &str, mime: &str, thumbs: bool, size: i64, score: Option<f32>) -> GridTile {
+        GridTile {
+            id: AssetId::new(),
+            hash: sample_hash(),
+            alt: alt.into(),
+            score,
+            mime_type: mime.into(),
+            thumbnails_generated: thumbs,
+            file_size: size,
+        }
+    }
+
     #[test]
     fn asset_grid_renders_one_tile_per_input() {
         let tiles = vec![
-            GridTile {
-                id: AssetId::new(),
-                hash: sample_hash(),
-                alt: "first.jpg".into(),
-                score: None,
-            },
-            GridTile {
-                id: AssetId::new(),
-                hash: sample_hash(),
-                alt: "second.jpg".into(),
-                score: Some(0.87),
-            },
+            tile("first.jpg", "image/jpeg", true, 2 * 1024 * 1024, None),
+            tile(
+                "second.jpg",
+                "image/jpeg",
+                true,
+                2 * 1024 * 1024,
+                Some(0.87),
+            ),
         ];
         let s = asset_grid(&tiles).into_string();
         let tile_count = s.matches("class=\"tile\"").count();
         assert_eq!(tile_count, 2);
         assert!(s.contains("87%"));
+        // Thumbnailed tiles use the /thumbs/m/ URL.
+        assert!(s.contains("/thumbs/m/"));
+        assert!(!s.contains("tile-placeholder"));
+    }
+
+    #[test]
+    fn asset_grid_serves_original_for_unthumbnailed_renderable_image() {
+        let tiles = vec![tile(
+            "broken.jpg",
+            "image/jpeg",
+            false,
+            5 * 1024 * 1024,
+            None,
+        )];
+        let s = asset_grid(&tiles).into_string();
+        // No /thumbs/m/ link, but a /raw link with loading=lazy.
+        assert!(!s.contains("/thumbs/m/"));
+        assert!(s.contains("/raw"));
+        assert!(s.contains("loading=\"lazy\""));
+        assert!(!s.contains("tile-placeholder"));
+    }
+
+    #[test]
+    fn asset_grid_placeholders_for_videos() {
+        let tiles = vec![tile(
+            "beach.MOV",
+            "video/quicktime",
+            false,
+            120 * 1024 * 1024,
+            None,
+        )];
+        let s = asset_grid(&tiles).into_string();
+        assert!(s.contains("tile-placeholder"));
+        assert!(s.contains("MOV"));
+        assert!(s.contains("beach.MOV"));
+        assert!(!s.contains("<img"));
+    }
+
+    #[test]
+    fn asset_grid_placeholders_for_oversized_image_without_thumbnail() {
+        // 30 MB JPEG with no thumbnail — should fall through to placeholder
+        // even though MIME is renderable, because it's over MAX_INLINE_BYTES.
+        let tiles = vec![tile(
+            "huge.jpg",
+            "image/jpeg",
+            false,
+            30 * 1024 * 1024,
+            None,
+        )];
+        let s = asset_grid(&tiles).into_string();
+        assert!(s.contains("tile-placeholder"));
+        assert!(!s.contains("<img"));
+    }
+
+    #[test]
+    fn asset_grid_placeholders_for_unrenderable_image_mime() {
+        // DNG without a generated thumbnail (e.g., extraction failed for a
+        // pathological file). Browser can't render DNG bytes → placeholder.
+        let tiles = vec![tile(
+            "IMG_1234.DNG",
+            "image/x-adobe-dng",
+            false,
+            20 * 1024 * 1024,
+            None,
+        )];
+        let s = asset_grid(&tiles).into_string();
+        assert!(s.contains("tile-placeholder"));
+        assert!(s.contains("DNG"));
+    }
+
+    #[test]
+    fn should_render_inline_allowlist() {
+        assert!(should_render_inline("image/jpeg", 1024));
+        assert!(should_render_inline("image/png", 1024));
+        assert!(should_render_inline("image/webp", 1024));
+        assert!(should_render_inline("image/svg+xml", 1024));
+        // Browser can't render these as <img>.
+        assert!(!should_render_inline("image/x-adobe-dng", 1024));
+        assert!(!should_render_inline("image/heic", 1024));
+        assert!(!should_render_inline("video/quicktime", 1024));
+        // Oversized renderable type still falls through.
+        assert!(!should_render_inline("image/jpeg", 26 * 1024 * 1024));
+    }
+
+    #[test]
+    fn ext_badge_extracts_extension() {
+        assert_eq!(ext_badge("photo.heic"), "HEIC");
+        assert_eq!(ext_badge("VIDEO.MOV"), "MOV");
+        assert_eq!(ext_badge("no_extension"), "FILE");
+        assert_eq!(ext_badge("/path/to/file.jpg"), "JPG");
     }
 
     #[test]
@@ -227,24 +390,48 @@ mod tests {
         assert!(!s.contains("Thumbnails pending"));
     }
 
-    #[test]
-    fn detail_page_without_thumbnails_shows_pending_notice() {
-        let view = DetailView {
+    fn detail_view(mime: Option<&str>, thumbs: bool, size: i64) -> DetailView {
+        DetailView {
             id: AssetId::new(),
             hash: sample_hash(),
-            original_filename: "foo.jpg".to_string(),
-            mime_type: None,
-            file_size: 0,
+            original_filename: "foo".into(),
+            mime_type: mime.map(str::to_string),
+            file_size: size,
             imported_at: Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap(),
             date_taken: None,
             latitude: None,
             longitude: None,
             camera_make: None,
             camera_model: None,
-            thumbnails_generated: false,
-        };
+            thumbnails_generated: thumbs,
+        }
+    }
+
+    #[test]
+    fn detail_page_serves_original_for_renderable_unthumbnailed_image() {
+        let view = detail_view(Some("image/jpeg"), false, 3 * 1024 * 1024);
         let s = detail_page(&view).into_string();
-        assert!(s.contains("Thumbnails pending"));
+        assert!(s.contains("class=\"preview\""));
+        assert!(s.contains("/raw"));
+        assert!(!s.contains("No preview available"));
+    }
+
+    #[test]
+    fn detail_page_shows_no_preview_message_for_video() {
+        let view = detail_view(Some("video/quicktime"), false, 100 * 1024 * 1024);
+        let s = detail_page(&view).into_string();
+        assert!(s.contains("No preview available"));
+        assert!(s.contains("video/quicktime"));
+        assert!(!s.contains("class=\"preview\""));
+        // Download link is always present as the escape hatch.
+        assert!(s.contains("Download original"));
+    }
+
+    #[test]
+    fn detail_page_shows_no_preview_message_for_oversized_image() {
+        let view = detail_view(Some("image/jpeg"), false, 30 * 1024 * 1024);
+        let s = detail_page(&view).into_string();
+        assert!(s.contains("No preview available"));
         assert!(!s.contains("class=\"preview\""));
     }
 }

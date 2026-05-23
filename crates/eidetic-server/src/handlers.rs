@@ -27,6 +27,9 @@ pub(crate) async fn index(State(state): State<AppState>) -> Result<Html<String>,
             hash: r.hash,
             alt: r.original_filename,
             score: None,
+            mime_type: r.mime_type,
+            thumbnails_generated: r.thumbnails_generated,
+            file_size: r.file_size,
         })
         .collect();
 
@@ -91,11 +94,18 @@ pub(crate) async fn search(
             let hash = hash_from_path(&r.storage_path)
                 .and_then(|hex| eidetic_core::Sha256::from_hex(&hex))
                 .unwrap_or_else(|| eidetic_core::Sha256::from_bytes([0u8; 32]));
+            // Search results are always embedded, which means mime is image/*.
+            // Use empty string as a safe default if it's somehow None — the
+            // grid will fall through to the placeholder branch.
+            let mime_type = r.mime_type.unwrap_or_default();
             GridTile {
                 id: r.id,
                 hash,
                 alt: query_text.clone(),
                 score: Some(r.score),
+                mime_type,
+                thumbnails_generated: r.thumbnails_generated,
+                file_size: r.file_size,
             }
         })
         .collect();

@@ -11,3 +11,5 @@ description = "Shared types and configuration for Eidetic."
 serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+kamadak-exif = { workspace = true }
+thiserror = { workspace = true }

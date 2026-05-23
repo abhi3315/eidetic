@@ -11,6 +11,7 @@ Written in Rust. Built primarily with AI assistance.
   - Deduplicates by content hash
   - Extracts EXIF: date taken, GPS, camera make/model
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
+  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif), and DNG/Apple ProRAW (via embedded JPEG preview)
 - `eidetic embed` — generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
 - `eidetic search "dog on beach"` — find photos by natural-language description
   - `--limit N` — number of results (default 10)

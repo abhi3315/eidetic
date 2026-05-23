@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 use ort::session::Session;
 use ort::value::Tensor;
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
@@ -264,24 +265,40 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
         .map_err(|e| Error::ModelLoad(format!("{}: {e}", model_path.display())))
 }
 
-fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
-    crate::ensure_heic_registered();
+fn apply_limits_and_decode<R: Read + Seek + std::io::BufRead>(
+    mut reader: image::ImageReader<R>,
+) -> Result<image::DynamicImage> {
     // Cap allocation + dimensions before decode so a decompression-bomb file
-    // (crafted PNG/JPEG/WEBP/HEIC) can't OOM-kill the embed loop. 512 MB / 16384 px
-    // is well above any real photo and well below "exhaust process memory".
-    let mut reader = image::ImageReader::open(path)
-        .map_err(|e| Error::Inference(format!("cannot open image: {e}")))?
-        .with_guessed_format()
-        .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
+    // (crafted PNG/JPEG/WEBP/HEIC) can't OOM-kill the embed loop. 512 MB /
+    // 16384 px is well above any real photo and well below "exhaust process
+    // memory".
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(512 * 1024 * 1024);
     limits.max_image_width = Some(16384);
     limits.max_image_height = Some(16384);
     reader.limits(limits);
-
-    let img = reader
+    reader
         .decode()
-        .map_err(|e| Error::Inference(format!("cannot decode image: {e}")))?;
+        .map_err(|e| Error::Inference(format!("cannot decode image: {e}")))
+}
+
+fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
+    crate::ensure_heic_registered();
+
+    let img = if eidetic_core::dng::is_dng_path(path) {
+        let bytes = eidetic_core::dng::extract_largest_jpeg_preview(path)
+            .map_err(|e| Error::Inference(format!("dng preview extraction failed: {e}")))?;
+        let reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
+        apply_limits_and_decode(reader)?
+    } else {
+        let reader = image::ImageReader::open(path)
+            .map_err(|e| Error::Inference(format!("cannot open image: {e}")))?
+            .with_guessed_format()
+            .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
+        apply_limits_and_decode(reader)?
+    };
 
     let rgb = img
         .resize_exact(
