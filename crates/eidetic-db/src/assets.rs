@@ -199,6 +199,7 @@ impl PgAssetsRepo {
                 "SELECT id, hash, original_filename, imported_at \
              FROM assets \
              WHERE mime_type LIKE 'image/%' \
+               AND thumbnails_generated = TRUE \
              ORDER BY imported_at DESC \
              LIMIT $1",
             )

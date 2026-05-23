@@ -575,7 +575,7 @@ async fn fetch_recent_orders_by_imported_at_desc() {
             longitude: None,
             camera_make: None,
             camera_model: None,
-            thumbnails_generated: false,
+            thumbnails_generated: true,
         })
         .await
         .expect("insert");
@@ -588,6 +588,57 @@ async fn fetch_recent_orders_by_imported_at_desc() {
     assert_eq!(recent[0].original_filename, "img2.jpg");
     assert_eq!(recent[1].original_filename, "img1.jpg");
     assert_eq!(recent[2].original_filename, "img0.jpg");
+}
+
+#[tokio::test]
+async fn fetch_recent_excludes_assets_without_thumbnails() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    // Two image assets: one thumbnailed, one not. The unthumbnailed one
+    // must NOT appear in the landing-page grid — otherwise users see
+    // broken-image icons (the original symptom that motivated this
+    // filter).
+    repo.insert_asset(NewAsset {
+        hash: "bbbb000000000000000000000000000000000000000000000000000000000001".to_string(),
+        original_filename: "no_thumb.heic".to_string(),
+        storage_path: PathBuf::from("/lib/no_thumb.heic"),
+        file_size: 1,
+        mime_type: Some("image/heic".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        thumbnails_generated: false,
+    })
+    .await
+    .expect("insert heic");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    repo.insert_asset(NewAsset {
+        hash: "bbbb000000000000000000000000000000000000000000000000000000000002".to_string(),
+        original_filename: "has_thumb.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/has_thumb.jpg"),
+        file_size: 1,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        thumbnails_generated: true,
+    })
+    .await
+    .expect("insert jpg");
+
+    let recent = repo.fetch_recent(10).await.expect("fetch_recent");
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].original_filename, "has_thumb.jpg");
 }
 
 #[tokio::test]
