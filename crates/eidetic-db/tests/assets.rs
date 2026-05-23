@@ -542,3 +542,96 @@ async fn mark_thumbnailed_flips_flag_to_true() {
     let after = repo.fetch_unthumbnailed().await.expect("fetch after");
     assert_eq!(after.len(), 0, "row should no longer be pending after mark");
 }
+
+#[tokio::test]
+async fn fetch_recent_orders_by_imported_at_desc() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    // Insert 3 image assets. Postgres' DEFAULT NOW() will give them
+    // ascending imported_at, so the most-recent comes last by insertion
+    // order. fetch_recent should reverse that.
+    for (i, hash) in [
+        "aaaa000000000000000000000000000000000000000000000000000000000001",
+        "aaaa000000000000000000000000000000000000000000000000000000000002",
+        "aaaa000000000000000000000000000000000000000000000000000000000003",
+    ]
+    .iter()
+    .enumerate()
+    {
+        repo.insert_asset(NewAsset {
+            hash: hash.to_string(),
+            original_filename: format!("img{i}.jpg"),
+            storage_path: PathBuf::from(format!("/lib/{}.jpg", hash)),
+            file_size: 1,
+            mime_type: Some("image/jpeg".to_string()),
+            date_taken: None,
+            latitude: None,
+            longitude: None,
+            camera_make: None,
+            camera_model: None,
+            thumbnails_generated: false,
+        })
+        .await
+        .expect("insert");
+        // Tiny sleep so imported_at differs row-to-row.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let recent = repo.fetch_recent(10).await.expect("fetch_recent");
+    assert_eq!(recent.len(), 3);
+    assert_eq!(recent[0].original_filename, "img2.jpg");
+    assert_eq!(recent[1].original_filename, "img1.jpg");
+    assert_eq!(recent[2].original_filename, "img0.jpg");
+}
+
+#[tokio::test]
+async fn fetch_by_id_returns_full_row_or_none() {
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool);
+
+    let asset = NewAsset {
+        hash: "bbbb000000000000000000000000000000000000000000000000000000000001".to_string(),
+        original_filename: "detail.jpg".to_string(),
+        storage_path: PathBuf::from("/lib/detail.jpg"),
+        file_size: 4096,
+        mime_type: Some("image/jpeg".to_string()),
+        date_taken: chrono::DateTime::parse_from_rfc3339("2024-06-15T10:30:00Z")
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc)),
+        latitude: Some(37.7749),
+        longitude: Some(-122.4194),
+        camera_make: Some("Canon".to_string()),
+        camera_model: Some("EOS R5".to_string()),
+        thumbnails_generated: true,
+    };
+    let id = match repo.insert_asset(asset).await.expect("insert") {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected Inserted"),
+    };
+
+    let detail = repo.fetch_by_id(id).await.expect("fetch").expect("present");
+    assert_eq!(detail.original_filename, "detail.jpg");
+    assert_eq!(detail.file_size, 4096);
+    assert_eq!(detail.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(detail.camera_make.as_deref(), Some("Canon"));
+    assert_eq!(detail.camera_model.as_deref(), Some("EOS R5"));
+    assert!((detail.latitude.unwrap() - 37.7749).abs() < 1e-6);
+    assert!(detail.thumbnails_generated);
+
+    let missing = repo
+        .fetch_by_id(eidetic_core::AssetId::new())
+        .await
+        .expect("fetch");
+    assert!(missing.is_none());
+}

@@ -42,12 +42,12 @@ Crates under `crates/`:
 | `eidetic-db` | sqlx pool, migration runner. `PgAssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
 | `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation. Calls `PgAssetsRepo` directly. | `eidetic-core`, `eidetic-db` |
 | `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. | `eidetic-core` |
-| `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest` |
+| `eidetic-server` | Axum HTTP server. `serve()` owns the embedder worker and the route table (`/`, `/search`, `/assets/:id`, `/assets/:id/raw`, `/thumbs/:size/:hash`). Localhost-bound, no auth. | `eidetic-core`, `eidetic-db`, `eidetic-ml` |
+| `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest`, `eidetic-server` |
 
 Crates added later when there's actual code that wants to live in them:
 
 - `eidetic-search` — composes `eidetic-ml` + `eidetic-db` for semantic search.
-- `eidetic-server` — binary, HTTP + WebDAV.
 - `eidetic-e2e` — workspace-level end-to-end tests as a dedicated test crate (Cargo doesn't pick up `tests/` at workspace root).
 
 **Rule:** there must be at least one concrete caller in another crate before a new crate exists. No empty skeletons.
