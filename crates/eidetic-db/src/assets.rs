@@ -53,6 +53,8 @@ pub struct SearchResult {
     pub storage_path: PathBuf,
     pub score: f32,
     pub mime_type: Option<String>,
+    pub file_size: i64,
+    pub thumbnails_generated: bool,
     pub date_taken: Option<DateTime<Utc>>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
@@ -60,11 +62,15 @@ pub struct SearchResult {
     pub longitude: Option<f64>,
 }
 
-/// One row from `fetch_recent`. Just what the landing-page grid needs.
+/// One row from `fetch_recent`. Carries the fields the landing-page grid
+/// needs to decide thumbnail-vs-inline-original-vs-placeholder per tile.
 pub struct RecentAsset {
     pub id: AssetId,
     pub hash: eidetic_core::Sha256,
     pub original_filename: String,
+    pub mime_type: String,
+    pub thumbnails_generated: bool,
+    pub file_size: i64,
     pub imported_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -194,31 +200,52 @@ impl PgAssetsRepo {
 
     /// Most recently imported image assets, descending. Caps at `limit`.
     pub async fn fetch_recent(&self, limit: u32) -> crate::Result<Vec<RecentAsset>> {
-        let rows: Vec<(uuid::Uuid, String, String, chrono::DateTime<chrono::Utc>)> =
-            sqlx::query_as(
-                "SELECT id, hash, original_filename, imported_at \
+        type Row = (
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            bool,
+            i64,
+            chrono::DateTime<chrono::Utc>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, hash, original_filename, mime_type, thumbnails_generated, file_size, imported_at \
              FROM assets \
-             WHERE mime_type LIKE 'image/%' \
+             WHERE mime_type IS NOT NULL \
              ORDER BY imported_at DESC \
              LIMIT $1",
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(crate::Error::Query)?;
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
 
         Ok(rows
             .into_iter()
-            .map(|(uuid, hash_hex, original_filename, imported_at)| {
-                let hash = eidetic_core::Sha256::from_hex(&hash_hex)
-                    .expect("hash column is CHAR(64) of lowercase hex");
-                RecentAsset {
-                    id: AssetId::from(uuid),
-                    hash,
+            .map(
+                |(
+                    uuid,
+                    hash_hex,
                     original_filename,
+                    mime_type,
+                    thumbnails_generated,
+                    file_size,
                     imported_at,
-                }
-            })
+                )| {
+                    let hash = eidetic_core::Sha256::from_hex(&hash_hex)
+                        .expect("hash column is CHAR(64) of lowercase hex");
+                    RecentAsset {
+                        id: AssetId::from(uuid),
+                        hash,
+                        original_filename,
+                        mime_type,
+                        thumbnails_generated,
+                        file_size,
+                        imported_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -292,6 +319,8 @@ impl PgAssetsRepo {
             storage_path: String,
             score: f32,
             mime_type: Option<String>,
+            file_size: i64,
+            thumbnails_generated: bool,
             date_taken: Option<DateTime<Utc>>,
             camera_make: Option<String>,
             camera_model: Option<String>,
@@ -301,7 +330,7 @@ impl PgAssetsRepo {
 
         let vec = pgvector::Vector::from(query_vec.to_vec());
         let rows: Vec<SearchRow> = sqlx::query_as(
-            "SELECT id, storage_path, mime_type, date_taken, \
+            "SELECT id, storage_path, mime_type, file_size, thumbnails_generated, date_taken, \
                     camera_make, camera_model, latitude, longitude, \
                     (1.0 - (embedding <=> $1))::real AS score \
              FROM assets \
@@ -322,6 +351,8 @@ impl PgAssetsRepo {
                 storage_path: PathBuf::from(r.storage_path),
                 score: r.score,
                 mime_type: r.mime_type,
+                file_size: r.file_size,
+                thumbnails_generated: r.thumbnails_generated,
                 date_taken: r.date_taken,
                 camera_make: r.camera_make,
                 camera_model: r.camera_model,
