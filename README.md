@@ -97,6 +97,18 @@ docker compose down -v
 
 Migrations run automatically on every `eidetic` startup that connects to the database. They are idempotent and safe to run repeatedly.
 
+## System dependencies
+
+Eidetic uses `libheif` to decode HEIC/HEIF photos (the format iPhones produce by default). Install it once:
+
+- **macOS:** `brew install libheif`
+- **Ubuntu / Debian:** `sudo apt install libheif-dev libheif-plugin-x265`
+- **Other Linux:** install the `libheif` development package and the x265 encoder plugin via your distribution's package manager.
+
+`libheif-plugin-x265` is only needed if you run the test suite (the HEIC tests encode synthetic fixtures at setup). For just building and running Eidetic against existing HEIC files, the decoder side of `libheif-dev` is enough. macOS Homebrew's `libheif` bundles x265 directly, so no extra step there.
+
+If `libheif` isn't installed, Eidetic builds fine but fails at runtime with a dynamic-linker error when a HEIC file is encountered.
+
 ## Build
 
 ```bash
