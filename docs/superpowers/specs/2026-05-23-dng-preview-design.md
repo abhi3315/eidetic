@@ -119,7 +119,7 @@ LIMIT $1
 becomes:
 
 ```sql
-SELECT id, hash, original_filename, mime_type, thumbnails_generated, imported_at
+SELECT id, hash, original_filename, mime_type, thumbnails_generated, file_size, imported_at
 FROM assets
 WHERE mime_type IS NOT NULL
 ORDER BY imported_at DESC
@@ -128,7 +128,7 @@ LIMIT $1
 
 (The `mime_type IS NOT NULL` keeps the imported-but-unknown-format rows out, matching the import-time gate at `import.rs:26-31`.)
 
-`RecentAsset` (`assets.rs:63-69`) gains two fields:
+`RecentAsset` (`assets.rs:63-69`) gains three fields:
 
 ```rust
 pub struct RecentAsset {
@@ -137,6 +137,7 @@ pub struct RecentAsset {
     pub original_filename: String,
     pub mime_type: String,           // NEW — always Some() after the filter above
     pub thumbnails_generated: bool,  // NEW
+    pub file_size: i64,              // NEW — drives the 25 MB inline-render threshold
     pub imported_at: chrono::DateTime<chrono::Utc>,
 }
 ```
@@ -155,6 +156,7 @@ pub(crate) struct GridTile {
     pub(crate) score: Option<f32>,
     pub(crate) mime_type: String,           // NEW
     pub(crate) thumbnails_generated: bool,  // NEW
+    pub(crate) file_size: i64,              // NEW
 }
 ```
 
@@ -175,16 +177,16 @@ becomes:
 ```rust
 @if tile.thumbnails_generated {
     img src=(format!("/thumbs/m/{}", tile.hash)) loading="lazy" alt=(tile.alt);
-} @else if is_browser_renderable(&tile.mime_type) {
-    // Image format the browser can render natively (jpeg/png/webp/...).
-    // Browser loads the original; acceptable because this set is small after
-    // DNG support lands.
+} @else if should_render_inline(&tile.mime_type, tile.file_size) {
+    // Image format the browser can render natively AND under the size
+    // threshold. Browser loads the original; bounded bandwidth.
     img src=(format!("/assets/{}/raw", tile.id))
         loading="lazy"
         alt=(tile.alt);
 } @else {
-    // Video, RAW, HEIC-without-thumbnail, or any other non-browser-renderable
-    // type. Show a placeholder; the detail page handles inspection.
+    // Video, RAW, HEIC-without-thumbnail, files > 25 MB, or any other
+    // non-inline case. Show a placeholder; detail page still has the
+    // download link.
     div class="tile-placeholder" {
         span class="ext-badge" { (ext_from_filename(&tile.alt)) }
         span class="filename" { (tile.alt) }
@@ -192,19 +194,28 @@ becomes:
 }
 ```
 
-`is_browser_renderable` is a private helper in `views.rs`:
+`should_render_inline` is a private helper in `views.rs`:
 
 ```rust
-/// MIME types that all major browsers (Chrome, Firefox, Safari) reliably
-/// render via `<img>`. Deliberately conservative — HEIC works on Safari
-/// only, DNG/ARW/CR3 don't work anywhere. For those, show a placeholder
-/// instead of a broken-image icon.
-fn is_browser_renderable(mime: &str) -> bool {
-    matches!(
+/// Max bytes we're willing to embed inline as <img src="/raw">.
+/// Above this, render a placeholder instead so the browser doesn't
+/// download 50 MB just to display a tile in the grid.
+const MAX_INLINE_BYTES: i64 = 25 * 1024 * 1024; // 25 MiB
+
+/// Returns true iff the browser can natively render this MIME via <img>
+/// AND the file is under the inline size threshold.
+///
+/// MIME allowlist is deliberately conservative — HEIC works on Safari
+/// only, DNG/ARW/CR3 don't work anywhere. For those (or oversized
+/// files), show a placeholder rather than a broken-image icon or a
+/// 50 MB download.
+fn should_render_inline(mime: &str, file_size: i64) -> bool {
+    let renderable = matches!(
         mime,
         "image/jpeg" | "image/png" | "image/gif" | "image/webp"
         | "image/avif" | "image/bmp" | "image/svg+xml"
-    )
+    );
+    renderable && file_size <= MAX_INLINE_BYTES
 }
 ```
 
@@ -230,18 +241,22 @@ Mockup:
 ```rust
 @if view.thumbnails_generated {
     img class="preview" src=(format!("/thumbs/m/{}", view.hash)) alt=(view.original_filename);
-} @else if view.mime_type.as_deref().is_some_and(is_browser_renderable) {
+} @else if view.mime_type.as_deref()
+    .is_some_and(|m| should_render_inline(m, view.file_size))
+{
     img class="preview" src=(format!("/assets/{}/raw", view.id)) alt=(view.original_filename);
 } @else {
     p class="empty" {
         "No preview available — this asset is "
         (view.mime_type.as_deref().unwrap_or("unknown type"))
-        ". Use the download link below."
+        " ("
+        (format_bytes(view.file_size))
+        "). Use the download link below."
     }
 }
 ```
 
-`is_browser_renderable` is shared with the grid (same helper). The "Download original" link stays where it is. No size threshold needed: the detail page is one asset at a time, and the user clicked through specifically to see it.
+`should_render_inline` (mime allowlist + 25 MB ceiling) is shared with the grid. Same predictable rule everywhere. The "Download original" link stays where it is — it's the user's escape hatch when the file can't render inline.
 
 ---
 
@@ -348,9 +363,9 @@ Some DNG previews are downscaled aggressively (e.g., 512px). Our medium thumbnai
 
 ### "Show original" bandwidth
 
-The grid serves originals only for the small failure set (images without a generated thumbnail). Worst case: a handful of 40 MB images render in a single grid view — acceptable for personal use, scales to ~10s of tiles before browser memory becomes a concern. If the failure set ever grows large, revisit with a size-based fallback.
+The grid serves originals only for the small failure set (images without a generated thumbnail) AND only when the file is ≤ 25 MiB. Above the threshold → placeholder. So per-tile bandwidth is bounded; worst case is a grid full of ~25 MB tiles, which is acceptable for personal use. Detail page applies the same rule.
 
-Detail page is one asset at a time; the user clicked through deliberately. No threshold there either.
+If you ever land on a grid where many tiles render originals because thumbnails consistently fail for some reason, that's a signal something upstream is broken — investigate the import/thumbnail path, don't tweak the threshold.
 
 ### Other RAW formats showing up later
 
@@ -403,7 +418,7 @@ Each step ends with `cargo clippy --workspace --all-targets -- -D warnings` gree
 
 1. **DNG fixture provenance.** Will ask Abhishek to capture one ProRAW photo of a flat surface on the iPhone; resize to ~5 KB (preserving DNG container + embedded preview structure) via ExifTool; commit as `crates/eidetic-core/tests/fixtures/tiny.dng` under the workspace MIT/Apache-2.0 license. License-clean by his authorship of a wall photo.
 
-2. **Inline-vs-download threshold on the detail page.** Removed. Detail page is one asset; the user clicked through deliberately. No threshold.
+2. **Inline-vs-download size threshold.** 25 MiB everywhere — grid and detail page. Anything bigger, or any non-browser-renderable MIME, renders a placeholder; the "Download original" link is the escape hatch. Predictable bandwidth, single rule to reason about.
 
 3. **Grid behaviour.** Show everything, always. Image-without-thumbnail renders the original via `<img src="/raw">`. Video-without-thumbnail renders a placeholder. No toggle, no `mime_type LIKE 'image/%'` filter.
 
