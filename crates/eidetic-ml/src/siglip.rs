@@ -265,8 +265,9 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
 }
 
 fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
+    crate::ensure_heic_registered();
     // Cap allocation + dimensions before decode so a decompression-bomb file
-    // (crafted PNG/JPEG/WEBP) can't OOM-kill the embed loop. 512 MB / 16384 px
+    // (crafted PNG/JPEG/WEBP/HEIC) can't OOM-kill the embed loop. 512 MB / 16384 px
     // is well above any real photo and well below "exhaust process memory".
     let mut reader = image::ImageReader::open(path)
         .map_err(|e| Error::Inference(format!("cannot open image: {e}")))?

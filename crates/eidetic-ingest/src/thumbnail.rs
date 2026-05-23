@@ -105,7 +105,11 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
 /// Open and decode an image with the same decompression-bomb limits the
 /// ML preprocessing uses. Identical guards: 512 MB allocation cap, 16384
 /// max width/height.
+///
+/// HEIC/HEIF inputs route through libheif via the registered decoder
+/// hook; the existing limits propagate (V3 verified).
 fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
+    crate::ensure_heic_registered();
     let mut reader = image::ImageReader::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
