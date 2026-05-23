@@ -1093,7 +1093,9 @@ name = "eidetic-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "kamadak-exif",
  "serde",
+ "thiserror",
  "uuid",
 ]
 

@@ -5,6 +5,7 @@
 //! dependencies here pollutes the dependency graph for everyone.
 
 pub mod config;
+pub mod dng;
 pub mod ids;
 
 pub use config::{Config, Paths};

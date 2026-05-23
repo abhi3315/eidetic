@@ -89,7 +89,7 @@ Branching by extension is a small ugly thing the HEIC spec carefully avoided. Fo
 | Option | Cost | Verdict |
 |---|---|---|
 | Duplicate in both crates (HEIC pattern) | ~80 lines × 2 = 160 lines duplicated | Rejected — HEIC's `ensure_heic_registered` was 5 lines, DNG is bigger. |
-| Put in `eidetic-core` as `eidetic_core::dng::decode_dng_preview` | adds `kamadak-exif` + `image` workspace deps to core | **Chosen.** Both deps are pure-Rust, lightweight. AGENTS.md's "lightweight foundation" rule was about avoiding heavy C-binding deps (libheif, ort); pure-Rust EXIF + image decoding are fine. |
+| Put in `eidetic-core` as `eidetic_core::dng::extract_largest_jpeg_preview` (returns `Vec<u8>`) | adds `kamadak-exif` workspace dep to core only — `image` stays out | **Chosen.** Core does the TIFF parsing + JPEG bytes extraction; callers decode using their own `image` dep. `kamadak-exif` is small and pure-Rust. AGENTS.md's "lightweight foundation" rule (no `tokio`/`sqlx`/`ort`) stays intact. |
 | New `eidetic-decode` crate | one more workspace member for ~80 lines | Rejected — same mass concern as the HEIC spec's `eidetic-media` discussion. Not enough code to justify. |
 
 `eidetic-core/Cargo.toml` gains `image` + `kamadak-exif` deps. The HEIC helpers stay where they are; this PR doesn't refactor them. (A future cleanup PR could move both into `eidetic-core::decoders`; out of scope here.)
@@ -289,7 +289,7 @@ No new workspace-level deps. Reuses:
 
 **Crate-level dep additions:**
 
-- `crates/eidetic-core/Cargo.toml` gains `image = { workspace = true }` and `kamadak-exif = { workspace = true }`. Both are pure-Rust; the "lightweight foundation" rule in AGENTS.md is about avoiding heavy C-binding deps (libheif, ort), not about all deps.
+- `crates/eidetic-core/Cargo.toml` gains `kamadak-exif = { workspace = true }`. That's the only new dep on core. `image` stays out — callers decode using their existing `image` dep.
 
 (Fallback if V2 fails: hand-rolled TIFF IFD parser in `eidetic-core::dng`; ~100 lines, no new dep, same dep additions.)
 
