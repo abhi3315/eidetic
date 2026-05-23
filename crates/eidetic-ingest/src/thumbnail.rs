@@ -7,6 +7,7 @@ use crate::{Error, Result};
 use eidetic_core::Sha256;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
+use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 
 /// JPEG quality used for all sizes.
@@ -107,24 +108,43 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
 /// max width/height.
 ///
 /// HEIC/HEIF inputs route through libheif via the registered decoder
-/// hook; the existing limits propagate (V3 verified).
+/// hook. DNG inputs go through `eidetic_core::dng::extract_largest_jpeg_preview`
+/// which slices the embedded JPEG out of the TIFF container; we then decode
+/// those bytes via the same `ImageReader` path so limits apply uniformly.
 fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
     crate::ensure_heic_registered();
-    let mut reader = image::ImageReader::open(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    reader = reader.with_guessed_format().map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
 
+    if eidetic_core::dng::is_dng_path(path) {
+        let bytes = eidetic_core::dng::extract_largest_jpeg_preview(path).map_err(Error::Dng)?;
+        let reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        return apply_limits_and_decode(reader, path);
+    }
+
+    let reader = image::ImageReader::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reader = reader.with_guessed_format().map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    apply_limits_and_decode(reader, path)
+}
+
+fn apply_limits_and_decode<R: Read + Seek + std::io::BufRead>(
+    mut reader: image::ImageReader<R>,
+    path: &Path,
+) -> Result<image::DynamicImage> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(512 * 1024 * 1024);
     limits.max_image_width = Some(16384);
     limits.max_image_height = Some(16384);
     reader.limits(limits);
-
     reader.decode().map_err(|source| Error::ImageDecode {
         path: path.to_path_buf(),
         source,

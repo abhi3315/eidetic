@@ -23,6 +23,8 @@ pub enum Error {
     },
     #[error("database error: {0}")]
     Db(#[source] eidetic_db::Error),
+    #[error("dng preview extraction failed: {0}")]
+    Dng(#[source] eidetic_core::dng::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
