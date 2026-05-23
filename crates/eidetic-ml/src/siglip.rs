@@ -335,6 +335,48 @@ fn l2_normalize(v: &mut [f32]) {
 mod tests {
     use super::*;
 
+    fn make_synthetic_heic(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
+        use libheif_rs::{
+            Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif,
+            RgbChroma,
+        };
+
+        let lib_heif = LibHeif::new();
+        let mut encoder = lib_heif
+            .encoder_for_format(CompressionFormat::Hevc)
+            .expect("HEVC encoder available (V6 verified — needs x265)");
+        encoder
+            .set_quality(EncoderQuality::LossLess)
+            .expect("set quality");
+
+        let mut image = Image::new(w, h, ColorSpace::Rgb(RgbChroma::Rgb)).expect("new heif image");
+        image
+            .create_plane(Channel::Interleaved, w, h, 24)
+            .expect("create plane");
+
+        let planes = image.planes_mut();
+        let plane = planes.interleaved.expect("interleaved plane");
+        let stride = plane.stride;
+        for y in 0..h {
+            let row = stride * y as usize;
+            for x in 0..w {
+                let i = row + (x as usize) * 3;
+                plane.data[i] = (x % 256) as u8;
+                plane.data[i + 1] = (y % 256) as u8;
+                plane.data[i + 2] = ((x + y) % 256) as u8;
+            }
+        }
+
+        let mut ctx = HeifContext::new().expect("new context");
+        ctx.encode_image(&image, &mut encoder, None)
+            .expect("encode HEIC");
+        let bytes = ctx.write_to_bytes().expect("write to bytes");
+
+        let path = dir.join("src.heic");
+        std::fs::write(&path, &bytes).expect("write heic fixture");
+        path
+    }
+
     #[test]
     fn l2_normalize_unit_vector_unchanged() {
         let mut v = vec![1.0f32, 0.0, 0.0];
@@ -454,6 +496,16 @@ mod tests {
         // Empty string is "set but empty" — treat as a typo, not as unset.
         let err = parse_accelerator(Some("")).unwrap_err();
         assert!(err.to_string().contains("Unknown EIDETIC_ACCELERATOR"));
+    }
+
+    #[test]
+    fn preprocess_image_accepts_heic_source() {
+        crate::ensure_heic_registered();
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let src = make_synthetic_heic(tmp.path(), 64, 64);
+
+        let pixels = preprocess_image(&src, 224).expect("preprocess HEIC");
+        assert_eq!(pixels.len(), 3 * 224 * 224);
     }
 
     #[test]

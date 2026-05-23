@@ -1146,6 +1146,7 @@ dependencies = [
  "libheif-rs",
  "ndarray",
  "ort",
+ "tempfile",
  "thiserror",
  "tokenizers",
  "tracing",
