@@ -17,6 +17,7 @@ tokio = { workspace = true }
 walkdir = { workspace = true }
 chrono = { workspace = true }
 image = { workspace = true }
+libheif-rs = { workspace = true }
 infer = { workspace = true }
 kamadak-exif = { workspace = true }
 tempfile = { workspace = true }

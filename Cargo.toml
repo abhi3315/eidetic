@@ -36,6 +36,9 @@ hf-hub = "0.5"
 # Image loading and resizing
 image = "0.25"
 
+# HEIC/HEIF decoding (registers as a decoder hook on the `image` crate)
+libheif-rs = { version = "2.2", default-features = false, features = ["image", "v1_17"] }
+
 # N-dimensional arrays for tensor construction
 ndarray = "0.17"
 

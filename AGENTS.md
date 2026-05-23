@@ -40,8 +40,8 @@ Crates under `crates/`:
 |---|---|---|
 | `eidetic-core` | Shared types: `AssetId`, `Sha256`, `Config`, `Paths`. Zero deps on tokio/sqlx/ort. | (nothing internal) |
 | `eidetic-db` | sqlx pool, migration runner. `PgAssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
-| `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation. Calls `PgAssetsRepo` directly. | `eidetic-core`, `eidetic-db` |
-| `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. | `eidetic-core` |
+| `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation (JPEG/PNG/WEBP + HEIC via libheif decoder hook). Calls `PgAssetsRepo` directly. Owns `ensure_heic_registered` — any new decode site in this crate must call it. | `eidetic-core`, `eidetic-db` |
+| `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. Decodes JPEG/PNG/WEBP/HEIC via the `image` crate (HEIC routes through the libheif hook registered by `ensure_heic_registered`). | `eidetic-core` |
 | `eidetic-server` | Axum HTTP server. `serve()` owns the embedder worker and the route table (`/`, `/search`, `/assets/:id`, `/assets/:id/raw`, `/thumbs/:size/:hash`). Localhost-bound, no auth. | `eidetic-core`, `eidetic-db`, `eidetic-ml` |
 | `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest`, `eidetic-server` |
 

@@ -25,3 +25,5 @@ Thumbs.db
 # Agent scratch
 .claude/
 temp/
+.worktrees
+/tmp

@@ -105,7 +105,11 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
 /// Open and decode an image with the same decompression-bomb limits the
 /// ML preprocessing uses. Identical guards: 512 MB allocation cap, 16384
 /// max width/height.
+///
+/// HEIC/HEIF inputs route through libheif via the registered decoder
+/// hook; the existing limits propagate (V3 verified).
 fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
+    crate::ensure_heic_registered();
     let mut reader = image::ImageReader::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -146,6 +150,50 @@ mod tests {
         let path = dir.join("src.jpg");
         img.save_with_format(&path, ImageFormat::Jpeg)
             .expect("write fixture jpeg");
+        path
+    }
+
+    fn make_synthetic_heic(dir: &Path, w: u32, h: u32) -> PathBuf {
+        use libheif_rs::{
+            Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif,
+            RgbChroma,
+        };
+
+        let lib_heif = LibHeif::new();
+        let mut encoder = lib_heif
+            .encoder_for_format(CompressionFormat::Hevc)
+            .expect("HEVC encoder available (V6 verified — needs x265)");
+        encoder
+            .set_quality(EncoderQuality::LossLess)
+            .expect("set quality");
+
+        // 24 bits-per-pixel = 3 channels * 8 bits, matching libheif-rs's own
+        // write_test.rs.
+        let mut image = Image::new(w, h, ColorSpace::Rgb(RgbChroma::Rgb)).expect("new heif image");
+        image
+            .create_plane(Channel::Interleaved, w, h, 24)
+            .expect("create plane");
+
+        let planes = image.planes_mut();
+        let plane = planes.interleaved.expect("interleaved plane");
+        let stride = plane.stride;
+        for y in 0..h {
+            let row = stride * y as usize;
+            for x in 0..w {
+                let i = row + (x as usize) * 3;
+                plane.data[i] = (x % 256) as u8;
+                plane.data[i + 1] = (y % 256) as u8;
+                plane.data[i + 2] = ((x + y) % 256) as u8;
+            }
+        }
+
+        let mut ctx = HeifContext::new().expect("new context");
+        ctx.encode_image(&image, &mut encoder, None)
+            .expect("encode HEIC");
+        let bytes = ctx.write_to_bytes().expect("write to bytes");
+
+        let path = dir.join("src.heic");
+        std::fs::write(&path, &bytes).expect("write heic fixture");
         path
     }
 
@@ -229,5 +277,32 @@ mod tests {
         generate_thumbnails(&src, &hash, &nested_library).expect("generate");
         assert!(thumbnail_path(&nested_library, &hash, ThumbSize::Small).exists());
         assert!(thumbnail_path(&nested_library, &hash, ThumbSize::Medium).exists());
+    }
+
+    #[test]
+    fn generate_writes_thumbnails_from_heic_source() {
+        crate::ensure_heic_registered();
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let src = make_synthetic_heic(tmp.path(), 64, 64);
+        let library = tmp.path().join("library");
+        let hash = fixture_hash();
+
+        generate_thumbnails(&src, &hash, &library).expect("generate from HEIC");
+
+        let small = thumbnail_path(&library, &hash, ThumbSize::Small);
+        let medium = thumbnail_path(&library, &hash, ThumbSize::Medium);
+        assert!(small.exists(), "small thumbnail missing at {small:?}");
+        assert!(medium.exists(), "medium thumbnail missing at {medium:?}");
+    }
+
+    #[test]
+    fn heic_decode_returns_dynamic_image_with_correct_dimensions() {
+        crate::ensure_heic_registered();
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let src = make_synthetic_heic(tmp.path(), 64, 32);
+
+        let img = load_image_with_limits(&src).expect("decode synthetic HEIC");
+        assert_eq!(img.width(), 64);
+        assert_eq!(img.height(), 32);
     }
 }
