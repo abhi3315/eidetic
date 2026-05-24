@@ -9,8 +9,7 @@ use tracing::info;
 
 pub mod assets;
 pub use assets::{
-    AssetDetail, ExifUpdate, InsertOutcome, LibraryStats, NewAsset, PgAssetsRepo, RecentAsset,
-    SearchResult,
+    AssetDetail, InsertOutcome, LibraryStats, NewAsset, PgAssetsRepo, RecentAsset, SearchResult,
 };
 
 pub mod error;

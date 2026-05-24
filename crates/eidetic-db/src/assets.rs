@@ -35,31 +35,6 @@ pub enum InsertOutcome {
     Existing(AssetId),
 }
 
-/// Payload for `PgAssetsRepo::update_exif_columns`. Carries every column the
-/// backfill subcommand may rewrite (the existing tier-1 fields plus the new
-/// tier-2 ones plus the JSONB tail), so a row whose typed fields shrink
-/// between extractions converges to the latest read instead of accreting
-/// stale state.
-#[derive(Clone, Debug, Default)]
-pub struct ExifUpdate {
-    pub date_taken: Option<DateTime<Utc>>,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub camera_make: Option<String>,
-    pub camera_model: Option<String>,
-    pub lens_make: Option<String>,
-    pub lens_model: Option<String>,
-    pub focal_length: Option<f32>,
-    pub focal_length_35mm: Option<f32>,
-    pub aperture: Option<f32>,
-    pub shutter: Option<String>,
-    pub iso: Option<i32>,
-    pub orientation: Option<i16>,
-    pub altitude: Option<f64>,
-    pub gps_direction: Option<f64>,
-    pub raw: Option<serde_json::Value>,
-}
-
 pub struct PgAssetsRepo {
     pool: PgPool,
 }
@@ -216,71 +191,6 @@ impl PgAssetsRepo {
                 (AssetId::from(uuid), hash, PathBuf::from(path))
             })
             .collect())
-    }
-
-    /// Image rows whose `exif_raw` column is NULL. The NULL marker means
-    /// "not yet processed"; rows that were processed but had no parseable
-    /// EXIF carry an empty-object sentinel and don't match this query.
-    /// Mirrors `fetch_unembedded` / `fetch_unthumbnailed` in restricting to
-    /// `mime_type LIKE 'image/%'` so video rows are never enumerated.
-    pub async fn fetch_pending_exif_backfill(
-        &self,
-    ) -> crate::Result<Vec<(AssetId, PathBuf, String)>> {
-        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, storage_path, original_filename FROM assets \
-             WHERE exif_raw IS NULL AND mime_type LIKE 'image/%' \
-             ORDER BY imported_at",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
-
-        Ok(rows
-            .into_iter()
-            .map(|(uuid, path, filename)| (AssetId::from(uuid), PathBuf::from(path), filename))
-            .collect())
-    }
-
-    pub async fn update_exif_columns(
-        &self,
-        id: AssetId,
-        exif: &crate::ExifUpdate,
-    ) -> crate::Result<()> {
-        let exif_raw = exif
-            .raw
-            .clone()
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        sqlx::query(
-            "UPDATE assets SET \
-               date_taken = $2, latitude = $3, longitude = $4, \
-               camera_make = $5, camera_model = $6, \
-               lens_make = $7, lens_model = $8, \
-               focal_length = $9, focal_length_35mm = $10, aperture = $11, \
-               shutter = $12, iso = $13, orientation = $14, \
-               altitude = $15, gps_direction = $16, exif_raw = $17 \
-             WHERE id = $1",
-        )
-        .bind(id.as_uuid())
-        .bind(exif.date_taken)
-        .bind(exif.latitude)
-        .bind(exif.longitude)
-        .bind(exif.camera_make.as_deref())
-        .bind(exif.camera_model.as_deref())
-        .bind(exif.lens_make.as_deref())
-        .bind(exif.lens_model.as_deref())
-        .bind(exif.focal_length)
-        .bind(exif.focal_length_35mm)
-        .bind(exif.aperture)
-        .bind(exif.shutter.as_deref())
-        .bind(exif.iso)
-        .bind(exif.orientation)
-        .bind(exif.altitude)
-        .bind(exif.gps_direction)
-        .bind(exif_raw)
-        .execute(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
-        Ok(())
     }
 
     pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
