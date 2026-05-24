@@ -93,9 +93,8 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-// Open the GeoNames-backed geocoder, downloading the dataset on first use.
-// Returns None on download or open failure so import never blocks on a
-// nice-to-have; the user sees a stderr note and place columns stay NULL.
+// Returns None on failure so a flaky network or busted cache never blocks an
+// import; the user sees a stderr warning and place columns stay NULL.
 fn open_geocoder() -> Option<eidetic_core::geocoder::Geocoder> {
     use eidetic_core::geocoder::Geocoder;
     let dir = Geocoder::default_data_dir();

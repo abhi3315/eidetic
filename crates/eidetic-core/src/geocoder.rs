@@ -96,9 +96,8 @@ impl Geocoder {
         })
     }
 
-    /// Download the three GeoNames files into `data_dir` if any are missing.
-    /// Synchronous, prints progress to stderr. Uses `.partial` files plus an
-    /// atomic rename so an interrupted run leaves no half-written real file.
+    /// Download missing GeoNames files into `data_dir`. Writes via `.partial`
+    /// then renames so an interrupted run never leaves a torn real file.
     pub fn ensure_dataset(data_dir: &Path) -> Result<(), Error> {
         let cities = data_dir.join("cities500.txt");
         let admin1 = data_dir.join("admin1CodesASCII.txt");
@@ -363,9 +362,6 @@ mod tests {
 
     #[test]
     fn picks_the_closer_of_two_candidate_cities() {
-        // Dharamsala (32.215, 76.319) is in the fixture alongside Dalhousie
-        // (32.539, 75.972). A coord right on top of Dharamsala must not
-        // resolve to Dalhousie just because Dalhousie was loaded first.
         let g = Geocoder::open(&fixture_dir()).expect("open");
         let p = g.lookup(32.21, 76.32).expect("lookup");
         assert_eq!(p.place, "Dharamsala");
@@ -398,16 +394,12 @@ mod tests {
 
     #[test]
     fn ensure_dataset_is_a_noop_when_all_files_already_present() {
-        // The download path itself needs the network; the no-op early-exit
-        // when the cache is populated is what makes repeated CLI runs cheap,
-        // and it's testable without a network call.
         Geocoder::ensure_dataset(&fixture_dir()).expect("ensure_dataset");
     }
 
     #[test]
     fn haversine_matches_known_great_circle_distances() {
-        // SF to NYC is ~4135 km; SF to LA is ~559 km. Loose tolerances
-        // because we use mean-radius, not WGS-84.
+        // Loose tolerances because we use mean-radius, not WGS-84.
         let sf_nyc = haversine_m(37.7749, -122.4194, 40.7128, -74.0060);
         assert!(
             (sf_nyc - 4_135_000.0).abs() < 15_000.0,
