@@ -2,24 +2,24 @@
 
 Self-hosted media intelligence system. A personal photo and video library with semantic search, deduplication, and (eventually) face grouping and prompt-driven reel generation.
 
-Written in Rust. Built primarily with AI assistance.
+Written in Rust.
 
 ## What works today
 
-- `eidetic import <file|dir>` — import photos/videos into the library
+- `eidetic import <file|dir>`: import photos/videos into the library
   - Filters non-media files by magic bytes (not extension)
   - Deduplicates by content hash
   - Extracts EXIF: date taken, GPS, camera make/model
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
   - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif), and DNG/Apple ProRAW (via embedded JPEG preview)
-- `eidetic embed` — generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
-- `eidetic search "dog on beach"` — find photos by natural-language description
-  - `--limit N` — number of results (default 10)
-  - `--fields score,date,path` — tab-separated column output
-  - `--json` — full JSON array
-- `eidetic stats` — library summary (asset counts, size, date range, embedding coverage)
-- `eidetic hash <file>` — SHA-256 a file, no setup needed
-- `eidetic eval --coco-csv <path> --coco-images <dir> [--limit N]` — text-to-image retrieval eval on the COCO 5K Karpathy split. Reports R@1/5/10 + MRR; bypasses the database.
+- `eidetic embed`: generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
+- `eidetic search "dog on beach"`: find photos by natural-language description
+  - `--limit N`: number of results (default 10)
+  - `--fields score,date,path`: tab-separated column output
+  - `--json`: full JSON array
+- `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
+- `eidetic hash <file>`: SHA-256 a file, no setup needed
+- `eidetic eval --coco-csv <path> --coco-images <dir> [--limit N]`: text-to-image retrieval eval on the COCO 5K Karpathy split. Reports R@1/5/10 + MRR; bypasses the database.
 
 ## Quick start
 
@@ -60,7 +60,7 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download) or `large` (1024-dim, 3.6 GB, ~5x slower). |
 | `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider. `cpu` or `coreml`. CoreML is wired up and can be enabled, but **does not currently accelerate this workload**. See "Why CoreML is opt-in" below. |
 
-Copy `.env.example` to `.env` and adjust as needed. There is no config file — env vars are the only configuration layer for now.
+Copy `.env.example` to `.env` and adjust as needed. There is no config file; env vars are the only configuration layer for now.
 
 ### Why CoreML is opt-in
 
@@ -71,13 +71,13 @@ CoreML EP is wired up via `ort 2.0.0-rc.12` and registers correctly on macOS, bu
 | As-shipped from `onnx-community` | **148 ms/img** | 265 ms/img |
 | With `onnxruntime.transformers.optimizer` fusions | 151 ms/img | 231 ms/img |
 
-End-to-end COCO 5K eval (Rust): CPU 35 min, CoreML 2.36× slower. Recall@1, R@5, R@10 are bit-identical between the two — accuracy is not the issue.
+End-to-end COCO 5K eval (Rust): CPU 35 min, CoreML 2.36× slower. Recall@1, R@5, R@10 are bit-identical between the two, so accuracy is not the issue.
 
 Why this is happening (all documented unfixed bugs):
 
 - The `onnx-community` SigLIP 2 export uses `auto_pad=SAME_LOWER` on the patch-embedding Conv. CoreML's `MLProgram` compiler refuses to compile this op ([apple/coremltools#2127](https://github.com/apple/coremltools/issues/2127), open since Jan 2024). The legacy `NeuralNetwork` format compiles, but fragments the graph into ~95 CoreML subgraphs that never reach ANE.
 - fp16 model weights produce slightly faster CoreML execution, but ort's optimizer crashes on `SimplifiedLayerNormFusion` for fp16 transformers ([microsoft/onnxruntime#25824](https://github.com/microsoft/onnxruntime/issues/25824)). Forcing `GraphOptimizationLevel::Level1` works around the crash but fp16 on Apple's CPU is itself slower than fp32 (no native fp16 ALUs).
-- ANE never engages even when CoreML runs the fp16 path — measured 0% utilization, 0 W.
+- ANE never engages even when CoreML runs the fp16 path. Measured 0% utilization, 0 W.
 
 Current behavior: `EIDETIC_ACCELERATOR=coreml` registers the CoreML EP and runs correctly, but for typical workloads (importing a photo library, ad-hoc searches) you should leave the variable unset and use CPU. The flag and the wiring are kept so that future ort releases or alternate ONNX exports of SigLIP 2 don't require a code change.
 
@@ -125,9 +125,9 @@ cargo test --workspace
 
 ## Documentation
 
-- [`AGENTS.md`](AGENTS.md) — context for AI agents working on this codebase
-- [`docs/adr/`](docs/adr/) — architecture decisions
-- [`goals.md`](goals.md) — what this project is and isn't
+- [`AGENTS.md`](AGENTS.md): context for AI agents working on this codebase
+- [`docs/adr/`](docs/adr/): architecture decisions
+- [`goals.md`](goals.md): what this project is and isn't
 
 ## License
 
