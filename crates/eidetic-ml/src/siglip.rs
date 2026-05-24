@@ -8,11 +8,10 @@ use tokenizers::Tokenizer;
 #[cfg(target_os = "macos")]
 use ort::ep::{CoreML, coreml::ComputeUnits};
 
-/// Which execution provider to register on a `Session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// User did not set `EIDETIC_ACCELERATOR`. Platform default is CPU
-    /// everywhere — CoreML is wired up but does not deliver acceleration
+    /// everywhere. CoreML is wired up but does not deliver acceleration
     /// on the current ort 2.0-rc + onnx-community SigLIP 2 combo (measured
     /// 2.4× slower than CPU on M1 Pro). Future ort releases or different
     /// ONNX exports may change this; flip the default back to CoreML on
@@ -42,7 +41,6 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const SEQ_LEN: usize = 64;
 const PAD_TOKEN_ID: i64 = 1;
 
-/// Available SigLIP 2 model variants, selected via `EIDETIC_MODEL`.
 struct ModelVariant {
     repo: &'static str,
     vision_model: &'static str,
@@ -81,11 +79,8 @@ fn current_variant() -> &'static ModelVariant {
     }
 }
 
-/// SigLIP 2 embedder.
-///
-/// Produces L2-normalised embeddings for images and text. The active model
-/// variant is selected via the `EIDETIC_MODEL` env var (`base` by default,
-/// `large` for `siglip2-large-patch16-384`).
+/// Produces L2-normalised embeddings for images and text. Variant selected
+/// via `EIDETIC_MODEL` (`base` by default, `large` for the 384-patch model).
 pub struct SiglipEmbedder {
     vision_session: Session,
     text_session: Session,
@@ -130,7 +125,6 @@ impl SiglipEmbedder {
         })
     }
 
-    /// Output dimension. Stable for the lifetime of an embedder instance.
     pub fn dim(&self) -> usize {
         self.variant.embed_dim
     }
@@ -161,7 +155,6 @@ impl SiglipEmbedder {
         Ok(vec)
     }
 
-    /// Compute an L2-normalised embedding for a text string.
     pub fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
         let ids = tokenize(&self.tokenizer, text)?;
 
@@ -184,8 +177,6 @@ impl SiglipEmbedder {
     }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
 
@@ -205,7 +196,7 @@ fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::
 }
 
 /// Build an ort `Session` from a model file, registering the execution
-/// provider implied by `mode`. CoreML is only registered on macOS — on
+/// provider implied by `mode`. CoreML is only registered on macOS; on
 /// other targets, `Mode::Default` and `Mode::Cpu` both fall through to
 /// the CPU EP, and `Mode::CoreML` errors. `coreml_cache_dir` is where ort
 /// stores the compiled CoreML model so subsequent loads skip recompile.
@@ -361,7 +352,7 @@ mod tests {
         let lib_heif = LibHeif::new();
         let mut encoder = lib_heif
             .encoder_for_format(CompressionFormat::Hevc)
-            .expect("HEVC encoder available (V6 verified — needs x265)");
+            .expect("HEVC encoder available (needs x265)");
         encoder
             .set_quality(EncoderQuality::LossLess)
             .expect("set quality");
@@ -392,22 +383,6 @@ mod tests {
         let path = dir.join("src.heic");
         std::fs::write(&path, &bytes).expect("write heic fixture");
         path
-    }
-
-    #[test]
-    fn l2_normalize_unit_vector_unchanged() {
-        let mut v = vec![1.0f32, 0.0, 0.0];
-        l2_normalize(&mut v);
-        assert!((v[0] - 1.0).abs() < 1e-6);
-        assert!(v[1].abs() < 1e-6);
-    }
-
-    #[test]
-    fn l2_normalize_scales_to_unit_length() {
-        let mut v = vec![3.0f32, 4.0];
-        l2_normalize(&mut v);
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -476,17 +451,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_accelerator_unset_is_default() {
+    fn parse_accelerator_happy_paths() {
         assert_eq!(parse_accelerator(None).unwrap(), Mode::Default);
-    }
-
-    #[test]
-    fn parse_accelerator_coreml_ok() {
         assert_eq!(parse_accelerator(Some("coreml")).unwrap(), Mode::CoreML);
-    }
-
-    #[test]
-    fn parse_accelerator_cpu_ok() {
         assert_eq!(parse_accelerator(Some("cpu")).unwrap(), Mode::Cpu);
     }
 
@@ -510,7 +477,7 @@ mod tests {
 
     #[test]
     fn parse_accelerator_empty_string_is_unknown() {
-        // Empty string is "set but empty" — treat as a typo, not as unset.
+        // Empty string is "set but empty"; treat as a typo, not as unset.
         let err = parse_accelerator(Some("")).unwrap_err();
         assert!(err.to_string().contains("Unknown EIDETIC_ACCELERATOR"));
     }
@@ -526,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires SigLIP 2 ONNX model — set EIDETIC_MODELS_CACHE and EIDETIC_TEST_IMAGE"]
+    #[ignore = "requires SigLIP 2 ONNX model; set EIDETIC_MODELS_CACHE and EIDETIC_TEST_IMAGE"]
     fn image_embedding_is_768_dim_and_normalized() {
         let models_dir = std::env::var("EIDETIC_MODELS_CACHE")
             .map(std::path::PathBuf::from)

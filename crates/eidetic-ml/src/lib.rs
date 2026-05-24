@@ -1,5 +1,3 @@
-//! ML inference for Eidetic.
-
 mod error;
 mod siglip;
 
