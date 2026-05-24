@@ -575,3 +575,96 @@ async fn fetch_by_id_returns_full_row_or_none() {
         .expect("fetch");
     assert!(missing.is_none());
 }
+
+#[tokio::test]
+async fn backfill_workflow_skips_videos_and_marks_processed() {
+    use eidetic_db::ExifUpdate;
+
+    let (_container, url) = start_db().await;
+    let config = Config {
+        database_url: url,
+        ..Default::default()
+    };
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = PgAssetsRepo::new(pool.clone());
+
+    let mut image = NewAsset {
+        hash: "1111111111111111111111111111111111111111111111111111111111111111".into(),
+        original_filename: "img.jpg".into(),
+        storage_path: PathBuf::from("/lib/11/11/img.jpg"),
+        file_size: 1024,
+        mime_type: Some("image/jpeg".into()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        lens_make: None,
+        lens_model: None,
+        focal_length: None,
+        focal_length_35mm: None,
+        aperture: None,
+        shutter: None,
+        iso: None,
+        orientation: None,
+        altitude: None,
+        gps_direction: None,
+        exif_raw: None,
+        thumbnails_generated: false,
+    };
+    let video = NewAsset {
+        hash: "2222222222222222222222222222222222222222222222222222222222222222".into(),
+        original_filename: "clip.mov".into(),
+        storage_path: PathBuf::from("/lib/22/22/clip.mov"),
+        mime_type: Some("video/quicktime".into()),
+        ..image.clone()
+    };
+    image.original_filename = "img.jpg".into();
+
+    let id_image = match repo.insert_asset(image).await.unwrap() {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected fresh insert"),
+    };
+    let _id_video = match repo.insert_asset(video).await.unwrap() {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected fresh insert"),
+    };
+
+    // insert_asset writes the {}-sentinel for new rows; force NULL to simulate
+    // the post-migration state of the 779 pre-existing rows.
+    sqlx::query("UPDATE assets SET exif_raw = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let pending = repo.fetch_pending_exif_backfill().await.unwrap();
+    assert_eq!(pending.len(), 1, "video row must be skipped");
+    assert_eq!(pending[0].0, id_image);
+
+    let update = ExifUpdate {
+        camera_make: Some("TestCam".into()),
+        focal_length: Some(5.96),
+        iso: Some(400),
+        raw: Some(serde_json::json!({"Make": "\"TestCam\""})),
+        ..Default::default()
+    };
+    repo.update_exif_columns(id_image, &update).await.unwrap();
+
+    let after = repo.fetch_pending_exif_backfill().await.unwrap();
+    assert!(after.is_empty(), "row with raw set drops out of pending");
+
+    // Empty EXIF still writes the {}-sentinel so the row is not re-attempted.
+    sqlx::query("UPDATE assets SET exif_raw = NULL WHERE id = $1")
+        .bind(id_image.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    repo.update_exif_columns(id_image, &ExifUpdate::default())
+        .await
+        .unwrap();
+    let final_pending = repo.fetch_pending_exif_backfill().await.unwrap();
+    assert!(
+        final_pending.is_empty(),
+        "empty-EXIF write still marks row processed"
+    );
+}

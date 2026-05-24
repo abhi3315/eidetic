@@ -77,6 +77,29 @@ pub fn extract_exif(path: &Path) -> ExifData {
     }
 }
 
+impl From<ExifData> for eidetic_db::ExifUpdate {
+    fn from(d: ExifData) -> Self {
+        Self {
+            date_taken: d.date_taken,
+            latitude: d.latitude,
+            longitude: d.longitude,
+            camera_make: d.camera_make,
+            camera_model: d.camera_model,
+            lens_make: d.lens_make,
+            lens_model: d.lens_model,
+            focal_length: d.focal_length,
+            focal_length_35mm: d.focal_length_35mm,
+            aperture: d.aperture,
+            shutter: d.shutter,
+            iso: d.iso,
+            orientation: d.orientation,
+            altitude: d.altitude,
+            gps_direction: d.gps_direction,
+            raw: d.raw,
+        }
+    }
+}
+
 fn read_first_rational(exif: &exif::Exif, tag: Tag) -> Option<(u32, u32)> {
     match &exif.get_field(tag, In::PRIMARY)?.value {
         Value::Rational(r) => r.first().filter(|r| r.denom != 0).map(|r| (r.num, r.denom)),

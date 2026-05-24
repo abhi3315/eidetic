@@ -37,6 +37,12 @@ enum Command {
     Embed,
     /// Generate missing thumbnails for previously-imported images.
     Thumbnail,
+    /// Re-parse EXIF for image rows where `exif_raw` is NULL.
+    BackfillExif {
+        /// Print what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Start the HTTP server (localhost-bound).
     Serve {
         /// Address to bind. Defaults to 127.0.0.1:8080.
@@ -395,6 +401,87 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             } else {
                 println!("Done. Generated {generated}.");
+            }
+        }
+
+        Command::BackfillExif { dry_run } => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::PgAssetsRepo::new(pool);
+
+            let pending = repo
+                .fetch_pending_exif_backfill()
+                .await
+                .context("failed to fetch pending exif rows")?;
+
+            if pending.is_empty() {
+                println!("0 pending; nothing to do.");
+                return Ok(());
+            }
+
+            let total = pending.len();
+            let action = if dry_run {
+                "Would backfill"
+            } else {
+                "Backfilling"
+            };
+            println!("{action} EXIF for {total} image assets…");
+
+            let mut updated = 0u32;
+            let mut empty = 0u32;
+            let mut missing = 0u32;
+
+            for (i, (id, storage_path, filename)) in pending.into_iter().enumerate() {
+                if !storage_path.exists() {
+                    eprintln!(
+                        "  [{}/{}] file missing on disk: {} ({})",
+                        i + 1,
+                        total,
+                        filename,
+                        storage_path.display()
+                    );
+                    missing += 1;
+                    continue;
+                }
+
+                let exif = eidetic_ingest::extract_exif(&storage_path);
+                let field_count = exif
+                    .raw
+                    .as_ref()
+                    .and_then(|v| v.as_object().map(|o| o.len()))
+                    .unwrap_or(0);
+
+                if field_count == 0 {
+                    empty += 1;
+                }
+
+                if dry_run {
+                    println!("[{}/{}] {filename} — {field_count} fields", i + 1, total);
+                    continue;
+                }
+
+                let update: eidetic_db::ExifUpdate = exif.into();
+                match repo.update_exif_columns(id, &update).await {
+                    Ok(()) => {
+                        println!("[{}/{}] {filename} — {field_count} fields", i + 1, total);
+                        updated += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  [{}/{}] update failed for {filename}: {e}", i + 1, total);
+                    }
+                }
+            }
+
+            if dry_run {
+                println!(
+                    "Dry run complete. {empty} rows had no parseable EXIF; {missing} missing on disk."
+                );
+            } else {
+                println!(
+                    "Done. {updated} rows updated, {empty} had no parseable EXIF, {missing} missing on disk."
+                );
             }
         }
 
