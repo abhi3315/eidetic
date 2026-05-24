@@ -1,6 +1,3 @@
-//! End-to-end integration: thumbnail generation through import_file +
-//! the backfill flow (fetch_unthumbnailed → generate → mark_thumbnailed).
-
 use eidetic_core::{Config, Paths};
 use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
 use eidetic_ingest::{ImportOutcome, hash_file, import_file, thumbnail};
@@ -84,7 +81,7 @@ async fn imported_video_stays_thumbnails_generated_false() {
 
     // Stub video: 12 bytes of an MP4-ish header that `infer` accepts.
     // The byte pattern 00 00 00 20 66 74 79 70 69 73 6F 6D = "....ftypisom"
-    // is the canonical mp4 brand identifier — `infer` returns video/mp4.
+    // is the canonical mp4 brand identifier, so `infer` returns video/mp4.
     let src = tmp.path().join("clip.mp4");
     std::fs::write(
         &src,
@@ -113,7 +110,7 @@ async fn imported_video_stays_thumbnails_generated_false() {
 async fn corrupt_image_lands_but_thumbnails_stay_pending() {
     let (repo, paths, tmp, _container) = fixture().await;
 
-    // 4-byte JPEG-magic stub — passes `infer` (which only checks the
+    // 4-byte JPEG-magic stub: passes `infer` (which only checks the
     // first few bytes) but `image::decode` rejects it. The asset row
     // should land; the row should appear in fetch_unthumbnailed for retry.
     let src = tmp.path().join("corrupt.jpg");

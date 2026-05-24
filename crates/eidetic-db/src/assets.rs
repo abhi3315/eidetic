@@ -3,10 +3,6 @@ use eidetic_core::AssetId;
 use sqlx::PgPool;
 use std::path::PathBuf;
 
-/// New row to write into the asset catalog.
-///
-/// Construction is left to callers (e.g. `eidetic-ingest::import_file`).
-/// `storage_path` is the canonical CAS path the caller has already committed.
 #[derive(Clone, Debug)]
 pub struct NewAsset {
     pub hash: String,
@@ -22,10 +18,6 @@ pub struct NewAsset {
     pub thumbnails_generated: bool,
 }
 
-/// Result of [`PgAssetsRepo::insert_asset`].
-///
-/// `Inserted` means this call wrote the row; `Existing` means another
-/// row with the same hash was already present and we returned its id.
 #[derive(Debug)]
 pub enum InsertOutcome {
     Inserted(AssetId),
@@ -62,8 +54,6 @@ pub struct SearchResult {
     pub longitude: Option<f64>,
 }
 
-/// One row from `fetch_recent`. Carries the fields the landing-page grid
-/// needs to decide thumbnail-vs-inline-original-vs-placeholder per tile.
 pub struct RecentAsset {
     pub id: AssetId,
     pub hash: eidetic_core::Sha256,
@@ -74,7 +64,6 @@ pub struct RecentAsset {
     pub imported_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Full asset row for the detail page.
 pub struct AssetDetail {
     pub id: AssetId,
     pub hash: eidetic_core::Sha256,
@@ -158,12 +147,6 @@ impl PgAssetsRepo {
             .collect())
     }
 
-    /// Image assets that don't yet have thumbnails generated.
-    ///
-    /// Returns `(id, hash, storage_path)` so callers can locate the
-    /// source bytes (via `storage_path`) and derive the destination
-    /// thumbnail paths (via `hash`) without further DB roundtrips.
-    ///
     /// Ordered by `id` for stable resumption across runs.
     pub async fn fetch_unthumbnailed(
         &self,
@@ -188,7 +171,6 @@ impl PgAssetsRepo {
             .collect())
     }
 
-    /// Flip `thumbnails_generated` to TRUE for a single row.
     pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
         sqlx::query("UPDATE assets SET thumbnails_generated = TRUE WHERE id = $1")
             .bind(id.as_uuid())
@@ -198,7 +180,6 @@ impl PgAssetsRepo {
         Ok(())
     }
 
-    /// Most recently imported image assets, descending. Caps at `limit`.
     pub async fn fetch_recent(&self, limit: u32) -> crate::Result<Vec<RecentAsset>> {
         type Row = (
             uuid::Uuid,
@@ -249,7 +230,6 @@ impl PgAssetsRepo {
             .collect())
     }
 
-    /// Single asset by id, or `None` if no row.
     pub async fn fetch_by_id(&self, id: AssetId) -> crate::Result<Option<AssetDetail>> {
         #[derive(sqlx::FromRow)]
         struct Row {

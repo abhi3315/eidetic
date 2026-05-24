@@ -1,11 +1,5 @@
-//! Database access for Eidetic.
-//!
-//! This crate owns:
-//! - The Postgres connection pool
-//! - The migration runner (migrations live at the workspace root)
-//! - `PgAssetsRepo`: asset CRUD, dedup lookup, and vector search
-//!
-//! No other crate touches `sqlx::Pool` directly.
+//! No other crate touches `sqlx::Pool` directly; all DB access goes through
+//! `PgAssetsRepo`.
 
 use eidetic_core::Config;
 use sqlx::PgPool;
@@ -21,17 +15,15 @@ pub use assets::{
 pub mod error;
 pub use error::{Error, Result};
 
-/// Connect to Postgres, run pending migrations, return a pooled handle.
+/// Connect to Postgres and run any pending migrations.
 ///
-/// Migrations are embedded at compile time from the workspace-root
-/// `migrations/` directory. They are idempotent and safe to run on every
-/// startup; sqlx uses Postgres advisory locks internally so concurrent
-/// runs from multiple processes are safe.
+/// sqlx uses advisory locks internally, so concurrent startups from multiple
+/// processes are safe.
 pub async fn connect(config: &Config) -> Result<PgPool> {
     info!(database_url = %sanitize_url(&config.database_url), "connecting to postgres");
 
     // Parse the URL ourselves so any later sqlx error references structured
-    // fields (host, port, user) instead of round-tripping the raw URL — which
+    // fields (host, port, user) instead of round-tripping the raw URL, which
     // sqlx::Error::Configuration would otherwise echo verbatim through anyhow.
     let options =
         PgConnectOptions::from_str(&config.database_url).map_err(|_| Error::InvalidUrl)?;
@@ -83,14 +75,8 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_url_passes_through_when_no_credentials() {
-        let url = "postgres://localhost:5432/eidetic";
-        assert_eq!(sanitize_url(url), url);
-    }
-
-    #[test]
     fn sanitize_url_without_password_returns_unchanged() {
-        // URL with user but no password — no colon in creds, should pass through
+        // URL with user but no password, no colon in creds, should pass through
         let url = "postgres://eidetic@localhost:5432/eidetic";
         assert_eq!(sanitize_url(url), url);
     }

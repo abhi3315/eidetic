@@ -1,9 +1,3 @@
-//! Integration tests for `eidetic_ingest::import_file` / `import_dir`
-//! against a real `PgAssetsRepo` backed by a testcontainers Postgres.
-//!
-//! These replace the `MockAssetIndex`-driven unit tests that lived in
-//! `crates/eidetic-ingest/src/import.rs` before the trait was deleted.
-
 use eidetic_core::{Config, Paths};
 use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
 use eidetic_ingest::{ImportOutcome, hash_file, import_dir, import_file};
@@ -28,12 +22,6 @@ async fn start_db() -> (testcontainers::ContainerAsync<GenericImage>, String) {
     (container, url)
 }
 
-/// Boot a fresh DB, return everything the tests need:
-/// - a `PgAssetsRepo` for the public API
-/// - the raw `PgPool` for column-level assertions
-/// - a `Paths` whose `library_dir` lives under a fresh tempdir
-/// - the `TempDir` (kept alive so the tempdir isn't dropped)
-/// - the container handle (kept alive so the DB isn't torn down)
 async fn fixture() -> (
     PgAssetsRepo,
     PgPool,
