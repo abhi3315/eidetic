@@ -1086,7 +1086,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "eidetic-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "eidetic-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "kamadak-exif",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "eidetic-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "eidetic-core",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "eidetic-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "eidetic-core",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "eidetic-ml"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eidetic-core",
  "hf-hub",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "eidetic-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
