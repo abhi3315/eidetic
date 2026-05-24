@@ -1,10 +1,3 @@
-//! Handler-level tests: build the Axum router via `test_router`,
-//! exercise routes via `tower::ServiceExt::oneshot`, assert status
-//! codes and content snippets.
-//!
-//! Uses a real testcontainer Postgres because PR #15 deleted the
-//! AssetIndex trait; there is no in-memory mock to substitute.
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use eidetic_core::{Config, Paths};
@@ -27,7 +20,6 @@ async fn start_db() -> (testcontainers::ContainerAsync<GenericImage>, String) {
     (container, url)
 }
 
-/// Build an AppState wired to a real repo + a dead-end embedder channel.
 async fn fixture() -> (
     eidetic_server::TestRouter,
     PgAssetsRepo,

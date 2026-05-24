@@ -95,7 +95,7 @@ pub(crate) async fn search(
                 .and_then(|hex| eidetic_core::Sha256::from_hex(&hex))
                 .unwrap_or_else(|| eidetic_core::Sha256::from_bytes([0u8; 32]));
             // Search results are always embedded, which means mime is image/*.
-            // Use empty string as a safe default if it's somehow None — the
+            // Use empty string as a safe default if it's somehow None; the
             // grid will fall through to the placeholder branch.
             let mime_type = r.mime_type.unwrap_or_default();
             GridTile {
@@ -123,9 +123,6 @@ pub(crate) async fn search(
         .into_response())
 }
 
-/// Pull the hash hex out of a CAS storage path. The CAS commit places files at
-/// `<library>/<ab>/<cd>/<full-hex>.<ext>`, so the file stem is the hash. Returns
-/// `None` if the path doesn't have a parseable stem.
 fn hash_from_path(p: &std::path::Path) -> Option<String> {
     p.file_stem()
         .and_then(|s| s.to_str())

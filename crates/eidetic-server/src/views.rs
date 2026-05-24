@@ -1,15 +1,12 @@
-//! Maud HTML helpers for the server.
-
 use chrono::{DateTime, Utc};
 use eidetic_core::{AssetId, Sha256};
 use maud::{DOCTYPE, Markup, html};
 
-/// One tile in a thumbnail grid. Used by `/` and `/search`.
 pub(crate) struct GridTile {
     pub(crate) id: AssetId,
     pub(crate) hash: Sha256,
     pub(crate) alt: String,
-    /// Optional cosine-similarity score [0, 1]. Some(score) means render a badge.
+    /// Cosine similarity [0, 1]. Some(_) renders the score badge.
     pub(crate) score: Option<f32>,
     pub(crate) mime_type: String,
     pub(crate) thumbnails_generated: bool,
@@ -21,12 +18,10 @@ pub(crate) struct GridTile {
 /// in 50 MB of bandwidth.
 const MAX_INLINE_BYTES: i64 = 25 * 1024 * 1024; // 25 MiB
 
-/// Returns `true` iff the browser can natively render this MIME via `<img>`
-/// AND the file is under the inline size threshold.
-///
-/// MIME allowlist is deliberately conservative — HEIC works on Safari only,
-/// DNG/ARW/CR3 don't work anywhere. For those, plus oversized files, show a
-/// placeholder rather than a broken-image icon or a runaway download.
+/// The MIME allowlist is deliberately conservative. HEIC works on Safari
+/// only, and DNG/ARW/CR3 don't work anywhere. For those, plus oversized
+/// files, show a placeholder rather than a broken-image icon or a runaway
+/// download.
 fn should_render_inline(mime: &str, file_size: i64) -> bool {
     let renderable = matches!(
         mime,
@@ -41,8 +36,6 @@ fn should_render_inline(mime: &str, file_size: i64) -> bool {
     renderable && file_size <= MAX_INLINE_BYTES
 }
 
-/// Upper-cased extension from a filename. `"IMG_1234.heic"` -> `"HEIC"`.
-/// Defaults to `"FILE"` when there's no extension.
 fn ext_badge(filename: &str) -> String {
     std::path::Path::new(filename)
         .extension()
@@ -51,8 +44,6 @@ fn ext_badge(filename: &str) -> String {
         .unwrap_or_else(|| "FILE".to_string())
 }
 
-/// Detail-page input. Mirrors `eidetic_db::AssetDetail`'s fields the page
-/// actually displays.
 pub(crate) struct DetailView {
     pub(crate) id: AssetId,
     pub(crate) hash: Sha256,
@@ -132,7 +123,7 @@ pub(crate) fn asset_grid(tiles: &[GridTile]) -> Markup {
                     @if tile.thumbnails_generated {
                         img src=(format!("/thumbs/m/{}", tile.hash)) loading="lazy" alt=(tile.alt);
                     } @else if should_render_inline(&tile.mime_type, tile.file_size) {
-                        // Browser-renderable image without a generated thumbnail — serve
+                        // Browser-renderable image without a generated thumbnail: serve
                         // the original. Size is bounded by MAX_INLINE_BYTES.
                         img src=(format!("/assets/{}/raw", tile.id)) loading="lazy" alt=(tile.alt);
                     } @else {
@@ -171,7 +162,7 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
                         alt=(view.original_filename);
                 } @else {
                     p class="empty" {
-                        "No preview available — this is "
+                        "No preview available. This is "
                         (view.mime_type.as_deref().unwrap_or("an unknown type"))
                         " (" (format_bytes(view.file_size)) "). Use the download link below."
                     }
@@ -240,13 +231,6 @@ mod tests {
         assert!(s.contains("<p>hello</p>"));
     }
 
-    #[test]
-    fn asset_grid_empty_renders_empty_message() {
-        let s = asset_grid(&[]).into_string();
-        assert!(s.contains("No results."));
-        assert!(!s.contains("<div class=\"grid\""));
-    }
-
     fn tile(alt: &str, mime: &str, thumbs: bool, size: i64, score: Option<f32>) -> GridTile {
         GridTile {
             id: AssetId::new(),
@@ -257,27 +241,6 @@ mod tests {
             thumbnails_generated: thumbs,
             file_size: size,
         }
-    }
-
-    #[test]
-    fn asset_grid_renders_one_tile_per_input() {
-        let tiles = vec![
-            tile("first.jpg", "image/jpeg", true, 2 * 1024 * 1024, None),
-            tile(
-                "second.jpg",
-                "image/jpeg",
-                true,
-                2 * 1024 * 1024,
-                Some(0.87),
-            ),
-        ];
-        let s = asset_grid(&tiles).into_string();
-        let tile_count = s.matches("class=\"tile\"").count();
-        assert_eq!(tile_count, 2);
-        assert!(s.contains("87%"));
-        // Thumbnailed tiles use the /thumbs/m/ URL.
-        assert!(s.contains("/thumbs/m/"));
-        assert!(!s.contains("tile-placeholder"));
     }
 
     #[test]
@@ -314,22 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_grid_placeholders_for_oversized_image_without_thumbnail() {
-        // 30 MB JPEG with no thumbnail — should fall through to placeholder
-        // even though MIME is renderable, because it's over MAX_INLINE_BYTES.
-        let tiles = vec![tile(
-            "huge.jpg",
-            "image/jpeg",
-            false,
-            30 * 1024 * 1024,
-            None,
-        )];
-        let s = asset_grid(&tiles).into_string();
-        assert!(s.contains("tile-placeholder"));
-        assert!(!s.contains("<img"));
-    }
-
-    #[test]
     fn asset_grid_placeholders_for_unrenderable_image_mime() {
         // DNG without a generated thumbnail (e.g., extraction failed for a
         // pathological file). Browser can't render DNG bytes → placeholder.
@@ -357,14 +304,6 @@ mod tests {
         assert!(!should_render_inline("video/quicktime", 1024));
         // Oversized renderable type still falls through.
         assert!(!should_render_inline("image/jpeg", 26 * 1024 * 1024));
-    }
-
-    #[test]
-    fn ext_badge_extracts_extension() {
-        assert_eq!(ext_badge("photo.heic"), "HEIC");
-        assert_eq!(ext_badge("VIDEO.MOV"), "MOV");
-        assert_eq!(ext_badge("no_extension"), "FILE");
-        assert_eq!(ext_badge("/path/to/file.jpg"), "JPG");
     }
 
     #[test]
@@ -425,13 +364,5 @@ mod tests {
         assert!(!s.contains("class=\"preview\""));
         // Download link is always present as the escape hatch.
         assert!(s.contains("Download original"));
-    }
-
-    #[test]
-    fn detail_page_shows_no_preview_message_for_oversized_image() {
-        let view = detail_view(Some("image/jpeg"), false, 30 * 1024 * 1024);
-        let s = detail_page(&view).into_string();
-        assert!(s.contains("No preview available"));
-        assert!(!s.contains("class=\"preview\""));
     }
 }

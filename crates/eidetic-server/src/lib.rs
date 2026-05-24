@@ -1,6 +1,3 @@
-//! Axum HTTP server for Eidetic.
-//!
-//! Exposes the library through a browser: search, thumbnails, raw downloads.
 //! Localhost-bound, no authentication. See
 //! `docs/superpowers/specs/2026-05-19-http-server-design.md` for scope.
 
@@ -20,14 +17,12 @@ use tracing::info;
 mod handlers;
 mod views;
 
-/// Dependencies the server needs to be wired up.
 pub struct ServerDeps {
     pub repo: PgAssetsRepo,
     pub library_dir: PathBuf,
     pub models_cache: PathBuf,
 }
 
-/// Job sent from a handler to the embedder worker.
 pub(crate) type EmbedJob = (String, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>);
 
 #[derive(Clone)]
@@ -88,7 +83,6 @@ impl IntoResponse for ServerError {
     }
 }
 
-/// Start the HTTP server. Returns on shutdown.
 pub async fn serve(addr: SocketAddr, deps: ServerDeps) -> anyhow::Result<()> {
     use anyhow::Context;
 
@@ -136,17 +130,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Type returned by [`test_router`] for downstream test crates.
 pub type TestRouter = Router;
 
-/// Build a router wired to `repo` and `library_dir`, with a dead-end
-/// embedder channel. For tests only — searches with a non-empty `q` will
-/// fail because no embedder worker reads the channel. The empty-redirect
-/// path still works.
+/// Build a router wired to `repo` and `library_dir`, with a dead-end embedder
+/// channel. For tests only; searches with a non-empty `q` will fail because no
+/// embedder worker reads the channel. The empty-redirect path still works.
 pub fn test_router(repo: PgAssetsRepo, library_dir: PathBuf) -> Router {
     let (embed_tx, _embed_rx) = mpsc::channel::<EmbedJob>(1);
     // _embed_rx drops at end of scope; embed_tx.send() in tests will fail.
-    // That's fine — handler tests for /search use the empty-q redirect path.
+    // That's fine: handler tests for /search use the empty-q redirect path.
     let state = AppState {
         repo: Arc::new(repo),
         library_dir: Arc::new(library_dir),
