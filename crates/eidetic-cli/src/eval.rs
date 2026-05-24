@@ -1,10 +1,3 @@
-//! COCO 5K (Karpathy test split) text-to-image retrieval eval.
-//!
-//! Self-contained: bypasses the database and embeds everything in-memory.
-//! Run against `nlphuji/mscoco_2014_5k_test_image_text_retrieval` or any
-//! CSV that has `filename`, `cocoid`, and a JSON-encoded `raw` column of
-//! captions.
-
 use anyhow::{Context, Result, bail};
 use eidetic_core::Config;
 use eidetic_ml::SiglipEmbedder;
@@ -63,7 +56,7 @@ pub fn run(csv_path: &Path, images_dir: &Path, limit: Option<usize>) -> Result<(
 
             // Both sides are L2-normalized in SigLIP, so dot = cosine similarity.
             // Count how many images outrank the correct one. Ties broken by
-            // index, which is fine — they're effectively rare on f32.
+            // index, which is fine; they're effectively rare on f32.
             let correct_score = dot(q, &img_embeddings[correct_idx]);
             let beat_or_tied = img_embeddings
                 .iter()
@@ -87,7 +80,7 @@ pub fn run(csv_path: &Path, images_dir: &Path, limit: Option<usize>) -> Result<(
     let mrr: f64 = ranks.iter().map(|&r| 1.0 / r as f64).sum::<f64>() / ranks.len() as f64;
 
     println!();
-    println!("Results — text→image retrieval over {n_images} images, {n_captions} captions:");
+    println!("Results for text→image retrieval over {n_images} images, {n_captions} captions:");
     println!("  Recall@1   {:6.2}%", recall_at(1) * 100.0);
     println!("  Recall@5   {:6.2}%", recall_at(5) * 100.0);
     println!("  Recall@10  {:6.2}%", recall_at(10) * 100.0);

@@ -1,8 +1,3 @@
-//! `eidetic` — personal media intelligence engine, command-line interface.
-//!
-//! This binary contains no business logic. Each subcommand wires up the
-//! library crates and dispatches to them. Logic lives in the libraries.
-
 mod eval;
 
 use anyhow::Context;
@@ -50,7 +45,7 @@ enum Command {
         bind: Option<String>,
     },
     /// Run COCO 5K (Karpathy) text-to-image retrieval eval. Bypasses the
-    /// library entirely — embeds images and captions in-memory.
+    /// library entirely; embeds images and captions in-memory.
     Eval {
         /// Path to the COCO captions CSV (e.g. test_5k_mscoco_2014.csv).
         #[arg(long)]
@@ -173,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                         println!("Skipped   {} (not a media file)", path.display());
                     }
                     ImportOutcome::Failed(e) => {
-                        eprintln!("Failed    {} — {e}", path.display());
+                        eprintln!("Failed    {}: {e}", path.display());
                         std::process::exit(1);
                     }
                 }
@@ -187,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Skipped    {:>6} files", summary.skipped);
                 println!("Failed     {:>6} files", summary.failed.len());
                 for (p, e) in &summary.failed {
-                    eprintln!("  {} — {e}", p.display());
+                    eprintln!("  {}: {e}", p.display());
                 }
 
                 if !summary.failed.is_empty() {
@@ -254,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
             // Channel of (path, reply) jobs sent to the worker thread. The
             // worker owns the embedder; the async loop sends paths and awaits
             // results via per-job oneshot replies. Channel capacity 1 keeps
-            // the worker tightly coupled to the async loop — no large queue
+            // the worker tightly coupled to the async loop, so no large queue
             // of pending embeds builds up if the DB write side stalls.
             type EmbedJob = (PathBuf, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>);
             let (job_tx, mut job_rx) = mpsc::channel::<EmbedJob>(1);
@@ -279,12 +274,12 @@ async fn main() -> anyhow::Result<()> {
 
             for (i, (id, path)) in unembedded.into_iter().enumerate() {
                 let (reply_tx, reply_rx) = oneshot::channel();
-                // If `send` fails, the worker died — surface its error below.
+                // If `send` fails, the worker died. Surface its error below.
                 if job_tx.send((path.clone(), reply_tx)).await.is_err() {
                     break;
                 }
                 let result = reply_rx.await.context(
-                    "embed worker panicked or died mid-job — check for OOM or ONNX error above",
+                    "embed worker panicked or died mid-job; check for OOM or ONNX error above",
                 )?;
 
                 match result {
@@ -294,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
                             embedded += 1;
                         }
                         Err(e) => {
-                            // Keep going — rows with NULL embedding are retried on the next run.
+                            // Keep going. Rows with NULL embedding are retried on the next run.
                             eprintln!("  failed to store {}: {e}", path.display());
                             failed += 1;
                         }
@@ -313,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
             worker
                 .await
                 .context("embed worker thread panicked")?
-                .context("failed to load SigLIP 2 model — check your internet connection and that ~/.cache/eidetic/models is intact")?;
+                .context("failed to load SigLIP 2 model; check your internet connection and that ~/.cache/eidetic/models is intact")?;
 
             if failed > 0 {
                 println!(
@@ -371,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                             generated += 1;
                         }
                         Err(e) => {
-                            // Keep going — rows whose mark failed stay false
+                            // Keep going. Rows whose mark failed stay false
                             // and are retried on the next run, same pattern
                             // as eidetic embed.
                             eprintln!(
@@ -457,7 +452,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
             .context("embedder thread panicked")?
-            .context("text embedding failed — check your internet connection and that the SigLIP 2 model is downloaded")?;
+            .context("text embedding failed; check your internet connection and that the SigLIP 2 model is downloaded")?;
 
             let pool = eidetic_db::connect(&config)
                 .await
