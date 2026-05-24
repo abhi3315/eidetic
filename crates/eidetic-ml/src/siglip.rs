@@ -283,7 +283,7 @@ fn apply_limits_and_decode<R: Read + Seek + std::io::BufRead>(
 fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
     crate::ensure_heic_registered();
 
-    let img = if eidetic_core::dng::is_dng_path(path) {
+    let mut img = if eidetic_core::dng::is_dng_path(path) {
         let bytes = eidetic_core::dng::extract_largest_jpeg_preview(path)
             .map_err(|e| Error::Inference(format!("dng preview extraction failed: {e}")))?;
         let reader = image::ImageReader::new(Cursor::new(bytes))
@@ -297,6 +297,17 @@ fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
             .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
         apply_limits_and_decode(reader)?
     };
+
+    // Same rotation logic as ingest::thumbnail::load_image_with_limits.
+    // HEIC: libheif rotated already, skip. Everything else: apply the EXIF
+    // Orientation transform so SigLIP sees the photo right-side-up.
+    if !eidetic_core::exif::is_heic_path(path)
+        && let Some(orient) = eidetic_core::exif::read_orientation(path)
+        && let Some(transform) = image::metadata::Orientation::from_exif(orient)
+        && transform != image::metadata::Orientation::NoTransforms
+    {
+        img.apply_orientation(transform);
+    }
 
     let rgb = img
         .resize_exact(

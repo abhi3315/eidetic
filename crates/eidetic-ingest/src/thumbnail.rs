@@ -94,7 +94,7 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
 fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
     crate::ensure_heic_registered();
 
-    if eidetic_core::dng::is_dng_path(path) {
+    let mut img = if eidetic_core::dng::is_dng_path(path) {
         let bytes = eidetic_core::dng::extract_largest_jpeg_preview(path).map_err(Error::Dng)?;
         let reader = image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
@@ -102,18 +102,31 @@ fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
                 path: path.to_path_buf(),
                 source,
             })?;
-        return apply_limits_and_decode(reader, path);
+        apply_limits_and_decode(reader, path)?
+    } else {
+        let reader = image::ImageReader::open(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let reader = reader.with_guessed_format().map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        apply_limits_and_decode(reader, path)?
+    };
+
+    // HEIC went through libheif which applied the irot transform already.
+    // Everything else (JPEG, DNG preview, PNG with EXIF, etc.) carries raw
+    // sensor-orientation pixels + an EXIF Orientation tag; rotate to match.
+    if !eidetic_core::exif::is_heic_path(path)
+        && let Some(orient) = eidetic_core::exif::read_orientation(path)
+        && let Some(transform) = image::metadata::Orientation::from_exif(orient)
+        && transform != image::metadata::Orientation::NoTransforms
+    {
+        img.apply_orientation(transform);
     }
 
-    let reader = image::ImageReader::open(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let reader = reader.with_guessed_format().map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    apply_limits_and_decode(reader, path)
+    Ok(img)
 }
 
 fn apply_limits_and_decode<R: Read + Seek + std::io::BufRead>(
