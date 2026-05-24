@@ -164,6 +164,10 @@ pub(crate) async fn asset_detail(
         shutter: detail.shutter,
         iso: detail.iso,
         altitude: detail.altitude,
+        country_name: detail.country_name,
+        admin1: detail.admin1,
+        place: detail.place,
+        place_distance_m: detail.place_distance_m,
         thumbnails_generated: detail.thumbnails_generated,
     };
 

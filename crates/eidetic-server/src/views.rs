@@ -63,6 +63,10 @@ pub(crate) struct DetailView {
     pub(crate) shutter: Option<String>,
     pub(crate) iso: Option<i32>,
     pub(crate) altitude: Option<f64>,
+    pub(crate) country_name: Option<String>,
+    pub(crate) admin1: Option<String>,
+    pub(crate) place: Option<String>,
+    pub(crate) place_distance_m: Option<f32>,
     pub(crate) thumbnails_generated: bool,
 }
 
@@ -215,6 +219,17 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
                     @if let Some(iso) = view.iso {
                         dt { "ISO" } dd { (iso) }
                     }
+                    @if let Some(place) = &view.place {
+                        dt { "Place" }
+                        dd {
+                            (place)
+                            @if let Some(a) = &view.admin1 { ", " (a) }
+                            @if let Some(c) = &view.country_name { ", " (c) }
+                            @if let Some(d) = view.place_distance_m {
+                                " (" (format_distance(d)) ")"
+                            }
+                        }
+                    }
                     @if let (Some(lat), Some(lon)) = (view.latitude, view.longitude) {
                         dt { "GPS" }
                         dd {
@@ -227,6 +242,14 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
                 }
             }
         }
+    }
+}
+
+fn format_distance(m: f32) -> String {
+    if m >= 1_000.0 {
+        format!("{:.1} km", m / 1_000.0)
+    } else {
+        format!("{:.0} m", m)
     }
 }
 
@@ -361,6 +384,10 @@ mod tests {
             shutter: None,
             iso: None,
             altitude: None,
+            country_name: None,
+            admin1: None,
+            place: None,
+            place_distance_m: None,
             thumbnails_generated: true,
         };
         let s = detail_page(&view).into_string();
@@ -390,6 +417,10 @@ mod tests {
             shutter: None,
             iso: None,
             altitude: None,
+            country_name: None,
+            admin1: None,
+            place: None,
+            place_distance_m: None,
             thumbnails_generated: thumbs,
         }
     }
@@ -412,5 +443,29 @@ mod tests {
         assert!(!s.contains("class=\"preview\""));
         // Download link is always present as the escape hatch.
         assert!(s.contains("Download original"));
+    }
+
+    #[test]
+    fn detail_page_renders_place_above_gps() {
+        let mut view = detail_view(Some("image/jpeg"), true, 1024);
+        view.place = Some("Dalhousie".into());
+        view.admin1 = Some("Himachal Pradesh".into());
+        view.country_name = Some("India".into());
+        view.place_distance_m = Some(2794.0);
+        view.latitude = Some(32.539);
+        view.longitude = Some(75.972);
+        let s = detail_page(&view).into_string();
+        let place_idx = s.find("Place").expect("Place label missing");
+        let gps_idx = s.find("GPS").expect("GPS label missing");
+        assert!(place_idx < gps_idx, "Place must render above GPS");
+        assert!(s.contains("Dalhousie, Himachal Pradesh, India"));
+        assert!(s.contains("2.8 km"));
+    }
+
+    #[test]
+    fn detail_page_omits_place_row_when_no_place_data() {
+        let view = detail_view(Some("image/jpeg"), true, 1024);
+        let s = detail_page(&view).into_string();
+        assert!(!s.contains(">Place<"));
     }
 }
