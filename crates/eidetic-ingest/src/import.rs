@@ -22,14 +22,24 @@ pub async fn import_file(
     config: &Paths,
     geocoder: Option<&Geocoder>,
 ) -> ImportOutcome {
+    match try_import_file(path, repo, config, geocoder).await {
+        Ok(outcome) => outcome,
+        Err(e) => ImportOutcome::Failed(e),
+    }
+}
+
+async fn try_import_file(
+    path: &Path,
+    repo: &PgAssetsRepo,
+    config: &Paths,
+    geocoder: Option<&Geocoder>,
+) -> Result<ImportOutcome> {
     // MIME detection reads only 512 bytes, acceptable before staging.
-    let mime_type = match crate::meta::detect_mime(path) {
-        Ok(Some(m)) => m,
-        Ok(None) => return ImportOutcome::Skipped,
-        Err(e) => return ImportOutcome::Failed(e),
+    let Some(mime_type) = crate::meta::detect_mime(path)? else {
+        return Ok(ImportOutcome::Skipped);
     };
     if !mime_type.starts_with("image/") && !mime_type.starts_with("video/") {
-        return ImportOutcome::Skipped;
+        return Ok(ImportOutcome::Skipped);
     }
 
     let ext = path
@@ -45,34 +55,23 @@ pub async fn import_file(
     // Hash the source directly so we can short-circuit duplicates before
     // copying the file to staging. On a re-import of a synced photo dir
     // this avoids gigabytes of pointless I/O per duplicate.
-    let hash = match hash_file(path) {
-        Ok(h) => h,
-        Err(e) => return ImportOutcome::Failed(e),
-    };
+    let hash = hash_file(path)?;
     let hash_hex = hash.to_string();
 
-    match repo.find_by_hash(&hash_hex).await {
-        Ok(Some(existing_id)) => return ImportOutcome::Duplicate(existing_id),
-        Ok(None) => {}
-        Err(e) => return ImportOutcome::Failed(Error::Db(e)),
+    if let Some(existing_id) = repo.find_by_hash(&hash_hex).await? {
+        return Ok(ImportOutcome::Duplicate(existing_id));
     }
 
     // Past the dedup gate. Stage a stable copy so EXIF and the CAS commit
     // both read the same bytes that will end up canonical at the CAS path.
-    let stage = match stage_file(path, &config.library_dir) {
-        Ok(s) => s,
-        Err(e) => return ImportOutcome::Failed(e),
-    };
+    let stage = stage_file(path, &config.library_dir)?;
 
-    let file_size = match std::fs::metadata(stage.path()) {
-        Ok(m) => m.len(),
-        Err(source) => {
-            return ImportOutcome::Failed(Error::Io {
-                path: stage.path().to_path_buf(),
-                source,
-            });
-        }
-    };
+    let file_size = std::fs::metadata(stage.path())
+        .map_err(|source| Error::Io {
+            path: stage.path().to_path_buf(),
+            source,
+        })?
+        .len();
 
     let exif = if mime_type.starts_with("image/") {
         crate::meta::extract_exif(stage.path())
@@ -80,10 +79,7 @@ pub async fn import_file(
         crate::meta::ExifData::default()
     };
 
-    let storage_path = match commit_staged(stage, &hash, ext.as_deref(), &config.library_dir) {
-        Ok(p) => p,
-        Err(e) => return ImportOutcome::Failed(e),
-    };
+    let storage_path = commit_staged(stage, &hash, ext.as_deref(), &config.library_dir)?;
 
     let thumbnails_generated = if mime_type.starts_with("image/") {
         let src = storage_path.clone();
@@ -144,16 +140,15 @@ pub async fn import_file(
         thumbnails_generated,
     };
 
-    match repo.insert_asset(new_asset).await {
-        Ok(InsertOutcome::Inserted(id)) => {
+    match repo.insert_asset(new_asset).await? {
+        InsertOutcome::Inserted(id) => {
             debug!(path = %path.display(), hash = %hash_hex, "imported");
-            ImportOutcome::Imported(id)
+            Ok(ImportOutcome::Imported(id))
         }
-        Ok(InsertOutcome::Existing(id)) => {
+        InsertOutcome::Existing(id) => {
             debug!(path = %path.display(), hash = %hash_hex, "duplicate");
-            ImportOutcome::Duplicate(id)
+            Ok(ImportOutcome::Duplicate(id))
         }
-        Err(e) => ImportOutcome::Failed(Error::Db(e)),
     }
 }
 

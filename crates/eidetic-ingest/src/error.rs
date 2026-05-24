@@ -22,7 +22,7 @@ pub enum Error {
         source: image::ImageError,
     },
     #[error("database error: {0}")]
-    Db(#[source] eidetic_db::Error),
+    Db(#[from] eidetic_db::Error),
     #[error("dng preview extraction failed: {0}")]
     Dng(#[source] eidetic_core::dng::Error),
 }
