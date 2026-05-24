@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod dng;
+pub mod geocoder;
 pub mod ids;
 
 pub use config::{Config, Paths};

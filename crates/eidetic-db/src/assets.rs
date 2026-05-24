@@ -203,6 +203,29 @@ impl PgAssetsRepo {
             .collect())
     }
 
+    pub async fn update_place_columns(
+        &self,
+        id: AssetId,
+        place: &eidetic_core::geocoder::Place,
+    ) -> crate::Result<()> {
+        sqlx::query(
+            "UPDATE assets SET \
+               country_code = $2, country_name = $3, admin1 = $4, \
+               place = $5, place_distance_m = $6 \
+             WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .bind(&place.country_code)
+        .bind(&place.country_name)
+        .bind(&place.admin1)
+        .bind(&place.place)
+        .bind(place.distance_m)
+        .execute(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
     pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
         sqlx::query("UPDATE assets SET thumbnails_generated = TRUE WHERE id = $1")
             .bind(id.as_uuid())
