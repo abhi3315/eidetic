@@ -109,6 +109,13 @@ impl SiglipEmbedder {
         let tokenizer_path = download(models_dir, variant.repo, TOKENIZER_FILE)?;
 
         let mode = parse_accelerator(std::env::var("EIDETIC_ACCELERATOR").ok().as_deref())?;
+        if matches!(mode, Mode::CoreML) {
+            tracing::warn!(
+                "EIDETIC_ACCELERATOR=coreml is set, but CoreML is measured slower than CPU \
+                 on SigLIP 2 (CoreML 265 ms/img vs CPU 148 ms/img; end-to-end 2.36x slower). \
+                 See README \"Why CoreML is opt-in\" — unset the variable to use CPU."
+            );
+        }
         let coreml_cache_dir = models_dir.join("coreml-cache");
 
         let vision_session = build_session(&vision_path, mode, &coreml_cache_dir)?;
