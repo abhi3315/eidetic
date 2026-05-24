@@ -88,6 +88,17 @@ pub struct AssetDetail {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f32>,
+    pub focal_length_35mm: Option<f32>,
+    pub aperture: Option<f32>,
+    pub shutter: Option<String>,
+    pub iso: Option<i32>,
+    pub orientation: Option<i16>,
+    pub altitude: Option<f64>,
+    pub gps_direction: Option<f64>,
+    pub exif_raw: Option<serde_json::Value>,
     pub thumbnails_generated: bool,
 }
 
@@ -256,12 +267,25 @@ impl PgAssetsRepo {
             longitude: Option<f64>,
             camera_make: Option<String>,
             camera_model: Option<String>,
+            lens_make: Option<String>,
+            lens_model: Option<String>,
+            focal_length: Option<f32>,
+            focal_length_35mm: Option<f32>,
+            aperture: Option<f32>,
+            shutter: Option<String>,
+            iso: Option<i32>,
+            orientation: Option<i16>,
+            altitude: Option<f64>,
+            gps_direction: Option<f64>,
+            exif_raw: Option<serde_json::Value>,
             thumbnails_generated: bool,
         }
 
         let row: Option<Row> = sqlx::query_as(
             "SELECT id, hash, original_filename, storage_path, file_size, mime_type, \
                     imported_at, date_taken, latitude, longitude, camera_make, camera_model, \
+                    lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
+                    shutter, iso, orientation, altitude, gps_direction, exif_raw, \
                     thumbnails_generated \
              FROM assets WHERE id = $1",
         )
@@ -284,6 +308,17 @@ impl PgAssetsRepo {
             longitude: r.longitude,
             camera_make: r.camera_make,
             camera_model: r.camera_model,
+            lens_make: r.lens_make,
+            lens_model: r.lens_model,
+            focal_length: r.focal_length,
+            focal_length_35mm: r.focal_length_35mm,
+            aperture: r.aperture,
+            shutter: r.shutter,
+            iso: r.iso,
+            orientation: r.orientation,
+            altitude: r.altitude,
+            gps_direction: r.gps_direction,
+            exif_raw: r.exif_raw,
             thumbnails_generated: r.thumbnails_generated,
         }))
     }

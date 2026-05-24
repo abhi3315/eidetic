@@ -56,6 +56,13 @@ pub(crate) struct DetailView {
     pub(crate) longitude: Option<f64>,
     pub(crate) camera_make: Option<String>,
     pub(crate) camera_model: Option<String>,
+    pub(crate) lens_model: Option<String>,
+    pub(crate) focal_length: Option<f32>,
+    pub(crate) focal_length_35mm: Option<f32>,
+    pub(crate) aperture: Option<f32>,
+    pub(crate) shutter: Option<String>,
+    pub(crate) iso: Option<i32>,
+    pub(crate) altitude: Option<f64>,
     pub(crate) thumbnails_generated: bool,
 }
 
@@ -187,8 +194,35 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
                     } @else if let Some(make) = &view.camera_make {
                         dt { "Camera" } dd { (make) }
                     }
+                    @if let Some(lens) = &view.lens_model {
+                        dt { "Lens" } dd { (lens) }
+                    }
+                    @if let Some(f) = view.focal_length {
+                        dt { "Focal length" }
+                        dd {
+                            (format!("{f:.1} mm"))
+                            @if let Some(eq) = view.focal_length_35mm {
+                                " (" (format!("{eq:.0}")) " mm equiv.)"
+                            }
+                        }
+                    }
+                    @if let Some(a) = view.aperture {
+                        dt { "Aperture" } dd { (format!("f/{a:.1}")) }
+                    }
+                    @if let Some(s) = &view.shutter {
+                        dt { "Shutter" } dd { (s) " s" }
+                    }
+                    @if let Some(iso) = view.iso {
+                        dt { "ISO" } dd { (iso) }
+                    }
                     @if let (Some(lat), Some(lon)) = (view.latitude, view.longitude) {
-                        dt { "GPS" } dd { (format!("{lat:.4}, {lon:.4}")) }
+                        dt { "GPS" }
+                        dd {
+                            (format!("{lat:.4}, {lon:.4}"))
+                            @if let Some(alt) = view.altitude {
+                                " (" (format!("{alt:.0}")) " m)"
+                            }
+                        }
                     }
                 }
             }
@@ -320,6 +354,13 @@ mod tests {
             longitude: None,
             camera_make: None,
             camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            focal_length_35mm: None,
+            aperture: None,
+            shutter: None,
+            iso: None,
+            altitude: None,
             thumbnails_generated: true,
         };
         let s = detail_page(&view).into_string();
@@ -342,6 +383,13 @@ mod tests {
             longitude: None,
             camera_make: None,
             camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            focal_length_35mm: None,
+            aperture: None,
+            shutter: None,
+            iso: None,
+            altitude: None,
             thumbnails_generated: thumbs,
         }
     }
