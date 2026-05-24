@@ -11,6 +11,17 @@ pub struct ExifData {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f32>,
+    pub focal_length_35mm: Option<f32>,
+    pub aperture: Option<f32>,
+    pub shutter: Option<String>,
+    pub iso: Option<i32>,
+    pub orientation: Option<i16>,
+    pub altitude: Option<f64>,
+    pub gps_direction: Option<f64>,
+    pub raw: Option<serde_json::Value>,
 }
 
 pub fn detect_mime(path: &Path) -> Result<Option<String>> {
@@ -48,7 +59,104 @@ pub fn extract_exif(path: &Path) -> ExifData {
         longitude: read_gps_coord(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, &['W']),
         camera_make: read_ascii(&exif, Tag::Make),
         camera_model: read_ascii(&exif, Tag::Model),
+        lens_make: read_ascii(&exif, Tag::LensMake),
+        lens_model: read_ascii(&exif, Tag::LensModel),
+        focal_length: read_first_rational(&exif, Tag::FocalLength)
+            .map(|(n, d)| n as f32 / d as f32),
+        focal_length_35mm: read_first_unsigned(&exif, Tag::FocalLengthIn35mmFilm).map(|n| n as f32),
+        aperture: read_first_rational(&exif, Tag::FNumber).map(|(n, d)| n as f32 / d as f32),
+        shutter: read_shutter(&exif),
+        iso: read_first_unsigned(&exif, Tag::PhotographicSensitivity)
+            .or_else(|| read_first_unsigned(&exif, Tag::ISOSpeed))
+            .map(|n| n as i32),
+        orientation: read_first_unsigned(&exif, Tag::Orientation).map(|n| n as i16),
+        altitude: read_altitude(&exif),
+        gps_direction: read_first_rational(&exif, Tag::GPSImgDirection)
+            .map(|(n, d)| n as f64 / d as f64),
+        raw: Some(build_raw_jsonb(&exif)),
     }
+}
+
+impl From<ExifData> for eidetic_db::ExifUpdate {
+    fn from(d: ExifData) -> Self {
+        Self {
+            date_taken: d.date_taken,
+            latitude: d.latitude,
+            longitude: d.longitude,
+            camera_make: d.camera_make,
+            camera_model: d.camera_model,
+            lens_make: d.lens_make,
+            lens_model: d.lens_model,
+            focal_length: d.focal_length,
+            focal_length_35mm: d.focal_length_35mm,
+            aperture: d.aperture,
+            shutter: d.shutter,
+            iso: d.iso,
+            orientation: d.orientation,
+            altitude: d.altitude,
+            gps_direction: d.gps_direction,
+            raw: d.raw,
+        }
+    }
+}
+
+fn read_first_rational(exif: &exif::Exif, tag: Tag) -> Option<(u32, u32)> {
+    match &exif.get_field(tag, In::PRIMARY)?.value {
+        Value::Rational(r) => r.first().filter(|r| r.denom != 0).map(|r| (r.num, r.denom)),
+        _ => None,
+    }
+}
+
+fn read_first_unsigned(exif: &exif::Exif, tag: Tag) -> Option<u32> {
+    match &exif.get_field(tag, In::PRIMARY)?.value {
+        Value::Short(v) => v.first().map(|&n| n as u32),
+        Value::Long(v) => v.first().copied(),
+        Value::Byte(v) => v.first().map(|&n| n as u32),
+        _ => None,
+    }
+}
+
+fn read_shutter(exif: &exif::Exif) -> Option<String> {
+    let (num, denom) = read_first_rational(exif, Tag::ExposureTime)?;
+    Some(format_shutter(num, denom))
+}
+
+fn format_shutter(num: u32, denom: u32) -> String {
+    if num == 1 && denom >= 1 {
+        format!("1/{denom}")
+    } else {
+        let secs = num as f64 / denom as f64;
+        format!("{secs:.3}")
+    }
+}
+
+fn read_altitude(exif: &exif::Exif) -> Option<f64> {
+    let (num, denom) = read_first_rational(exif, Tag::GPSAltitude)?;
+    let meters = num as f64 / denom as f64;
+    let below = matches!(
+        exif.get_field(Tag::GPSAltitudeRef, In::PRIMARY)
+            .map(|f| &f.value),
+        Some(Value::Byte(b)) if b.first() == Some(&1)
+    );
+    Some(if below { -meters } else { meters })
+}
+
+// Per-tag display strings keyed by the tag's Display form (e.g. "LensMake",
+// "FNumber"; "Tag(Tiff, 50706)" for tags kamadak doesn't name). IFD 1
+// (thumbnail metadata) is omitted because it duplicates IFD 0 and adds the
+// JPEG-thumb pointer we don't store. MakerNote is omitted because kamadak
+// surfaces it as a multi-KB opaque hex blob.
+fn build_raw_jsonb(exif: &exif::Exif) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for field in exif.fields() {
+        if field.ifd_num != In::PRIMARY || field.tag == Tag::MakerNote {
+            continue;
+        }
+        let key = field.tag.to_string();
+        let value = field.display_value().with_unit(exif).to_string();
+        obj.insert(key, serde_json::Value::String(value));
+    }
+    serde_json::Value::Object(obj)
 }
 
 fn read_ascii(exif: &exif::Exif, tag: Tag) -> Option<String> {
@@ -231,5 +339,21 @@ mod tests {
             data.longitude
         );
         assert_eq!(data.camera_make.as_deref(), Some("TestCam"));
+
+        // JSONB walker reflects parsed fields. ASCII values keep their quotes
+        // per kamadak's display convention.
+        let raw = data.raw.as_ref().expect("raw populated when EXIF parses");
+        let obj = raw.as_object().unwrap();
+        assert_eq!(
+            obj.get("Make").and_then(|v| v.as_str()),
+            Some("\"TestCam\"")
+        );
+        assert!(obj.contains_key("GPSLatitude"));
+    }
+
+    #[test]
+    fn format_shutter_branches() {
+        assert_eq!(format_shutter(1, 25), "1/25");
+        assert_eq!(format_shutter(30, 10), "3.000");
     }
 }

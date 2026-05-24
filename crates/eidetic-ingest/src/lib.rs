@@ -8,7 +8,7 @@ pub mod thumbnail;
 pub use error::{Error, Result};
 pub use hasher::hash_file;
 pub use import::{ImportOutcome, ImportSummary, import_dir, import_file};
-pub use meta::ExifData;
+pub use meta::{ExifData, extract_exif};
 pub use store::{commit_staged, stage_file};
 
 /// Register libheif as a decoder hook on the `image` crate.

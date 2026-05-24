@@ -15,6 +15,17 @@ pub struct NewAsset {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f32>,
+    pub focal_length_35mm: Option<f32>,
+    pub aperture: Option<f32>,
+    pub shutter: Option<String>,
+    pub iso: Option<i32>,
+    pub orientation: Option<i16>,
+    pub altitude: Option<f64>,
+    pub gps_direction: Option<f64>,
+    pub exif_raw: Option<serde_json::Value>,
     pub thumbnails_generated: bool,
 }
 
@@ -22,6 +33,31 @@ pub struct NewAsset {
 pub enum InsertOutcome {
     Inserted(AssetId),
     Existing(AssetId),
+}
+
+/// Payload for `PgAssetsRepo::update_exif_columns`. Carries every column the
+/// backfill subcommand may rewrite (the existing tier-1 fields plus the new
+/// tier-2 ones plus the JSONB tail), so a row whose typed fields shrink
+/// between extractions converges to the latest read instead of accreting
+/// stale state.
+#[derive(Clone, Debug, Default)]
+pub struct ExifUpdate {
+    pub date_taken: Option<DateTime<Utc>>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f32>,
+    pub focal_length_35mm: Option<f32>,
+    pub aperture: Option<f32>,
+    pub shutter: Option<String>,
+    pub iso: Option<i32>,
+    pub orientation: Option<i16>,
+    pub altitude: Option<f64>,
+    pub gps_direction: Option<f64>,
+    pub raw: Option<serde_json::Value>,
 }
 
 pub struct PgAssetsRepo {
@@ -77,6 +113,17 @@ pub struct AssetDetail {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f32>,
+    pub focal_length_35mm: Option<f32>,
+    pub aperture: Option<f32>,
+    pub shutter: Option<String>,
+    pub iso: Option<i32>,
+    pub orientation: Option<i16>,
+    pub altitude: Option<f64>,
+    pub gps_direction: Option<f64>,
+    pub exif_raw: Option<serde_json::Value>,
     pub thumbnails_generated: bool,
 }
 
@@ -171,6 +218,71 @@ impl PgAssetsRepo {
             .collect())
     }
 
+    /// Image rows whose `exif_raw` column is NULL. The NULL marker means
+    /// "not yet processed"; rows that were processed but had no parseable
+    /// EXIF carry an empty-object sentinel and don't match this query.
+    /// Mirrors `fetch_unembedded` / `fetch_unthumbnailed` in restricting to
+    /// `mime_type LIKE 'image/%'` so video rows are never enumerated.
+    pub async fn fetch_pending_exif_backfill(
+        &self,
+    ) -> crate::Result<Vec<(AssetId, PathBuf, String)>> {
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, storage_path, original_filename FROM assets \
+             WHERE exif_raw IS NULL AND mime_type LIKE 'image/%' \
+             ORDER BY imported_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(uuid, path, filename)| (AssetId::from(uuid), PathBuf::from(path), filename))
+            .collect())
+    }
+
+    pub async fn update_exif_columns(
+        &self,
+        id: AssetId,
+        exif: &crate::ExifUpdate,
+    ) -> crate::Result<()> {
+        let exif_raw = exif
+            .raw
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        sqlx::query(
+            "UPDATE assets SET \
+               date_taken = $2, latitude = $3, longitude = $4, \
+               camera_make = $5, camera_model = $6, \
+               lens_make = $7, lens_model = $8, \
+               focal_length = $9, focal_length_35mm = $10, aperture = $11, \
+               shutter = $12, iso = $13, orientation = $14, \
+               altitude = $15, gps_direction = $16, exif_raw = $17 \
+             WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .bind(exif.date_taken)
+        .bind(exif.latitude)
+        .bind(exif.longitude)
+        .bind(exif.camera_make.as_deref())
+        .bind(exif.camera_model.as_deref())
+        .bind(exif.lens_make.as_deref())
+        .bind(exif.lens_model.as_deref())
+        .bind(exif.focal_length)
+        .bind(exif.focal_length_35mm)
+        .bind(exif.aperture)
+        .bind(exif.shutter.as_deref())
+        .bind(exif.iso)
+        .bind(exif.orientation)
+        .bind(exif.altitude)
+        .bind(exif.gps_direction)
+        .bind(exif_raw)
+        .execute(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
     pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
         sqlx::query("UPDATE assets SET thumbnails_generated = TRUE WHERE id = $1")
             .bind(id.as_uuid())
@@ -245,12 +357,25 @@ impl PgAssetsRepo {
             longitude: Option<f64>,
             camera_make: Option<String>,
             camera_model: Option<String>,
+            lens_make: Option<String>,
+            lens_model: Option<String>,
+            focal_length: Option<f32>,
+            focal_length_35mm: Option<f32>,
+            aperture: Option<f32>,
+            shutter: Option<String>,
+            iso: Option<i32>,
+            orientation: Option<i16>,
+            altitude: Option<f64>,
+            gps_direction: Option<f64>,
+            exif_raw: Option<serde_json::Value>,
             thumbnails_generated: bool,
         }
 
         let row: Option<Row> = sqlx::query_as(
             "SELECT id, hash, original_filename, storage_path, file_size, mime_type, \
                     imported_at, date_taken, latitude, longitude, camera_make, camera_model, \
+                    lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
+                    shutter, iso, orientation, altitude, gps_direction, exif_raw, \
                     thumbnails_generated \
              FROM assets WHERE id = $1",
         )
@@ -273,6 +398,17 @@ impl PgAssetsRepo {
             longitude: r.longitude,
             camera_make: r.camera_make,
             camera_model: r.camera_model,
+            lens_make: r.lens_make,
+            lens_model: r.lens_model,
+            focal_length: r.focal_length,
+            focal_length_35mm: r.focal_length_35mm,
+            aperture: r.aperture,
+            shutter: r.shutter,
+            iso: r.iso,
+            orientation: r.orientation,
+            altitude: r.altitude,
+            gps_direction: r.gps_direction,
+            exif_raw: r.exif_raw,
             thumbnails_generated: r.thumbnails_generated,
         }))
     }
@@ -354,12 +490,22 @@ impl PgAssetsRepo {
 
     pub async fn insert_asset(&self, asset: NewAsset) -> crate::Result<InsertOutcome> {
         let new_id = AssetId::new();
+        // Backfill semantic: an asset that parsed-but-had-no-EXIF still gets
+        // an empty-object sentinel so `WHERE exif_raw IS NULL` distinguishes
+        // "never processed" from "processed, nothing there."
+        let exif_raw = asset
+            .exif_raw
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
              (id, hash, original_filename, storage_path, file_size, mime_type, \
               date_taken, latitude, longitude, camera_make, camera_model, \
+              lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
+              shutter, iso, orientation, altitude, gps_direction, exif_raw, \
               thumbnails_generated) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
@@ -374,6 +520,17 @@ impl PgAssetsRepo {
         .bind(asset.longitude)
         .bind(asset.camera_make.as_deref())
         .bind(asset.camera_model.as_deref())
+        .bind(asset.lens_make.as_deref())
+        .bind(asset.lens_model.as_deref())
+        .bind(asset.focal_length)
+        .bind(asset.focal_length_35mm)
+        .bind(asset.aperture)
+        .bind(asset.shutter.as_deref())
+        .bind(asset.iso)
+        .bind(asset.orientation)
+        .bind(asset.altitude)
+        .bind(asset.gps_direction)
+        .bind(exif_raw)
         .bind(asset.thumbnails_generated)
         .fetch_optional(&self.pool)
         .await

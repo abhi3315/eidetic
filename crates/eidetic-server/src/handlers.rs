@@ -157,6 +157,13 @@ pub(crate) async fn asset_detail(
         longitude: detail.longitude,
         camera_make: detail.camera_make,
         camera_model: detail.camera_model,
+        lens_model: detail.lens_model,
+        focal_length: detail.focal_length,
+        focal_length_35mm: detail.focal_length_35mm,
+        aperture: detail.aperture,
+        shutter: detail.shutter,
+        iso: detail.iso,
+        altitude: detail.altitude,
         thumbnails_generated: detail.thumbnails_generated,
     };
 

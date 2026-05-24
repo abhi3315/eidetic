@@ -20,6 +20,7 @@ image = { workspace = true }
 libheif-rs = { workspace = true }
 infer = { workspace = true }
 kamadak-exif = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
