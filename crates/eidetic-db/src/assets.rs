@@ -26,6 +26,11 @@ pub struct NewAsset {
     pub altitude: Option<f64>,
     pub gps_direction: Option<f64>,
     pub exif_raw: Option<serde_json::Value>,
+    pub country_code: Option<String>,
+    pub country_name: Option<String>,
+    pub admin1: Option<String>,
+    pub place: Option<String>,
+    pub place_distance_m: Option<f32>,
     pub thumbnails_generated: bool,
 }
 
@@ -99,6 +104,11 @@ pub struct AssetDetail {
     pub altitude: Option<f64>,
     pub gps_direction: Option<f64>,
     pub exif_raw: Option<serde_json::Value>,
+    pub country_code: Option<String>,
+    pub country_name: Option<String>,
+    pub admin1: Option<String>,
+    pub place: Option<String>,
+    pub place_distance_m: Option<f32>,
     pub thumbnails_generated: bool,
 }
 
@@ -278,6 +288,11 @@ impl PgAssetsRepo {
             altitude: Option<f64>,
             gps_direction: Option<f64>,
             exif_raw: Option<serde_json::Value>,
+            country_code: Option<String>,
+            country_name: Option<String>,
+            admin1: Option<String>,
+            place: Option<String>,
+            place_distance_m: Option<f32>,
             thumbnails_generated: bool,
         }
 
@@ -286,6 +301,7 @@ impl PgAssetsRepo {
                     imported_at, date_taken, latitude, longitude, camera_make, camera_model, \
                     lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
                     shutter, iso, orientation, altitude, gps_direction, exif_raw, \
+                    country_code, country_name, admin1, place, place_distance_m, \
                     thumbnails_generated \
              FROM assets WHERE id = $1",
         )
@@ -319,6 +335,11 @@ impl PgAssetsRepo {
             altitude: r.altitude,
             gps_direction: r.gps_direction,
             exif_raw: r.exif_raw,
+            country_code: r.country_code,
+            country_name: r.country_name,
+            admin1: r.admin1,
+            place: r.place,
+            place_distance_m: r.place_distance_m,
             thumbnails_generated: r.thumbnails_generated,
         }))
     }
@@ -413,9 +434,11 @@ impl PgAssetsRepo {
               date_taken, latitude, longitude, camera_make, camera_model, \
               lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
               shutter, iso, orientation, altitude, gps_direction, exif_raw, \
+              country_code, country_name, admin1, place, place_distance_m, \
               thumbnails_generated) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+                     $23, $24, $25, $26, $27, $28) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
@@ -441,6 +464,11 @@ impl PgAssetsRepo {
         .bind(asset.altitude)
         .bind(asset.gps_direction)
         .bind(exif_raw)
+        .bind(asset.country_code.as_deref())
+        .bind(asset.country_name.as_deref())
+        .bind(asset.admin1.as_deref())
+        .bind(asset.place.as_deref())
+        .bind(asset.place_distance_m)
         .bind(asset.thumbnails_generated)
         .fetch_optional(&self.pool)
         .await

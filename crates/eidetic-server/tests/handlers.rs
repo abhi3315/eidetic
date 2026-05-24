@@ -198,6 +198,11 @@ async fn raw_streams_original_with_mime_and_disposition() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
     let id = match repo.insert_asset(asset).await.expect("insert") {

@@ -52,6 +52,11 @@ async fn insert_asset_then_find_by_hash() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
 
@@ -115,6 +120,11 @@ async fn insert_duplicate_returns_existing() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
 
@@ -167,6 +177,11 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
     let asset_b = NewAsset {
@@ -191,6 +206,11 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
     let outcome_a = repo.insert_asset(asset_a).await.expect("insert a");
@@ -252,6 +272,11 @@ async fn search_similar_orders_by_cosine_similarity() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
     let asset_b = NewAsset {
@@ -276,6 +301,11 @@ async fn search_similar_orders_by_cosine_similarity() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
 
@@ -341,6 +371,11 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
     let image_done = NewAsset {
@@ -365,6 +400,11 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: true,
     };
     let video_pending = NewAsset {
@@ -389,6 +429,11 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
 
@@ -444,6 +489,11 @@ async fn mark_thumbnailed_flips_flag_to_true() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     };
     let outcome = repo.insert_asset(asset).await.expect("insert");
@@ -504,6 +554,11 @@ async fn fetch_recent_orders_by_imported_at_desc() {
             altitude: None,
             gps_direction: None,
             exif_raw: None,
+            country_code: None,
+            country_name: None,
+            admin1: None,
+            place: None,
+            place_distance_m: None,
             thumbnails_generated: false,
         })
         .await
@@ -553,6 +608,11 @@ async fn fetch_by_id_returns_full_row_or_none() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: true,
     };
     let id = match repo.insert_asset(asset).await.expect("insert") {

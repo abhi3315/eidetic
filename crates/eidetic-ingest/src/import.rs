@@ -126,6 +126,11 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         altitude: exif.altitude,
         gps_direction: exif.gps_direction,
         exif_raw: exif.raw,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated,
     };
 

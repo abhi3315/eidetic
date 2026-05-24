@@ -116,6 +116,11 @@ async fn known_hash_returns_duplicate() {
             altitude: None,
             gps_direction: None,
             exif_raw: None,
+            country_code: None,
+            country_name: None,
+            admin1: None,
+            place: None,
+            place_distance_m: None,
             thumbnails_generated: false,
         })
         .await
@@ -211,6 +216,11 @@ async fn dir_counts_duplicates_separately() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     })
     .await
@@ -307,6 +317,11 @@ async fn duplicate_import_does_not_touch_library_dir() {
         altitude: None,
         gps_direction: None,
         exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
         thumbnails_generated: false,
     })
     .await
