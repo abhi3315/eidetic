@@ -38,7 +38,7 @@ Crates under `crates/`:
 
 | Crate | Role | Depends on |
 |---|---|---|
-| `eidetic-core` | Shared types: `AssetId`, `Sha256`, `Config`, `Paths`. Zero deps on tokio/sqlx/ort. Also hosts `dng::extract_largest_jpeg_preview` since DNG decoding is needed by both ingest and ml (pure-Rust via kamadak-exif). | (nothing internal) |
+| `eidetic-core` | Shared types: `AssetId`, `Sha256`, `Config`, `Paths`. Zero deps on tokio/sqlx/ort. Hosts `dng::extract_largest_jpeg_preview` (DNG decoding needed by both ingest and ml, pure-Rust via kamadak-exif) and `geocoder::Geocoder` (offline nearest-city lookup over a GeoNames cities500 dataset cached at `~/.cache/eidetic/geonames/`). | (nothing internal) |
 | `eidetic-db` | sqlx pool, migration runner. `PgAssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
 | `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation (JPEG/PNG/WEBP + HEIC via libheif hook + DNG via embedded preview extraction), comprehensive EXIF extraction (typed camera-settings columns + JSONB long tail). Calls `PgAssetsRepo` directly. Owns `ensure_heic_registered` — any new decode site in this crate must call it. | `eidetic-core`, `eidetic-db` |
 | `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. Decodes JPEG/PNG/WEBP/HEIC/DNG via the `image` crate (HEIC through the libheif hook; DNG via `eidetic_core::dng::extract_largest_jpeg_preview`). | `eidetic-core` |

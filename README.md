@@ -10,6 +10,7 @@ Written in Rust.
   - Filters non-media files by magic bytes (not extension)
   - Deduplicates by content hash
   - Extracts EXIF: date taken, GPS, camera make/model, lens, focal length, aperture, shutter, ISO, orientation, altitude, plus a JSONB tail with every other tag kamadak-exif can parse
+  - Reverse-geocodes GPS coordinates to country, state, and nearest-place name using an offline GeoNames cities500 dataset (~13 MB, auto-downloaded into `~/.cache/eidetic/geonames/` on first import; photo coordinates never leave the machine)
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
   - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif), and DNG/Apple ProRAW (via embedded JPEG preview)
 - `eidetic embed`: generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
@@ -128,6 +129,12 @@ cargo test --workspace
 - [`AGENTS.md`](AGENTS.md): context for AI agents working on this codebase
 - [`docs/adr/`](docs/adr/): architecture decisions
 - [`goals.md`](goals.md): what this project is and isn't
+
+## Acknowledgments
+
+Geographic data © [GeoNames](https://www.geonames.org/), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Used for the
+offline reverse geocoding that populates the place columns during import.
 
 ## License
 
