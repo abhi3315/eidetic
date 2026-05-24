@@ -2,6 +2,22 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.2.1 — 2026-05-24
+
+Patch release. One user-visible bugfix, one internal refactor.
+
+### Fixed
+
+- **JPEG / DNG portrait photos no longer render sideways.** iPhone JPEGs and DNGs ship raw landscape sensor pixels plus an EXIF `Orientation` tag (commonly value 6 = "rotate 90° clockwise"). The `image` crate doesn't auto-apply the tag, so portrait photos previously displayed on their side in the grid, detail page, and through SigLIP's preprocessor. The fix reads the EXIF orientation after decode and applies the matching transform on the `DynamicImage`. HEIC is unchanged — libheif's `irot` transform already runs during decode, so re-rotating would double-rotate. In the verified library this fixes 31 photos (20 JPEGs with orient=6/8, 11 DNGs with orient=6).
+
+### Changed
+
+- **`import_file` refactored to use `?`** — ten `match … return ImportOutcome::Failed(e)` arms collapse to `?` calls with `#[from]` on `Error::Db`. Same external behaviour, ~50 fewer lines.
+
+### Migration note
+
+If you imported your library under v0.2.0, the existing thumbnails are still oriented the old (sideways) way. To materialise the fix on already-imported rows, reset and reimport (`docker compose down -v && eidetic import …`). This is the established convention for decode-path changes at this stage.
+
 ## v0.2.0 — 2026-05-24
 
 The "self-hosted photo intelligence" release. v0.1 imported and embedded JPEGs/PNGs in a CLI; v0.2 adds a browseable web UI, full iPhone format support, and offline place tagging — all still single-user, localhost-only, and zero external API calls.
