@@ -187,6 +187,17 @@ async fn raw_streams_original_with_mime_and_disposition() {
         longitude: None,
         camera_make: None,
         camera_model: None,
+        lens_make: None,
+        lens_model: None,
+        focal_length: None,
+        focal_length_35mm: None,
+        aperture: None,
+        shutter: None,
+        iso: None,
+        orientation: None,
+        altitude: None,
+        gps_direction: None,
+        exif_raw: None,
         thumbnails_generated: false,
     };
     let id = match repo.insert_asset(asset).await.expect("insert") {

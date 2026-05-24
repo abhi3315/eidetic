@@ -115,6 +115,17 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         longitude: exif.longitude,
         camera_make: exif.camera_make,
         camera_model: exif.camera_model,
+        lens_make: exif.lens_make,
+        lens_model: exif.lens_model,
+        focal_length: exif.focal_length,
+        focal_length_35mm: exif.focal_length_35mm,
+        aperture: exif.aperture,
+        shutter: exif.shutter,
+        iso: exif.iso,
+        orientation: exif.orientation,
+        altitude: exif.altitude,
+        gps_direction: exif.gps_direction,
+        exif_raw: exif.raw,
         thumbnails_generated,
     };
 

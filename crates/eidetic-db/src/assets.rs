@@ -15,6 +15,17 @@ pub struct NewAsset {
     pub longitude: Option<f64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f32>,
+    pub focal_length_35mm: Option<f32>,
+    pub aperture: Option<f32>,
+    pub shutter: Option<String>,
+    pub iso: Option<i32>,
+    pub orientation: Option<i16>,
+    pub altitude: Option<f64>,
+    pub gps_direction: Option<f64>,
+    pub exif_raw: Option<serde_json::Value>,
     pub thumbnails_generated: bool,
 }
 
@@ -354,12 +365,22 @@ impl PgAssetsRepo {
 
     pub async fn insert_asset(&self, asset: NewAsset) -> crate::Result<InsertOutcome> {
         let new_id = AssetId::new();
+        // Backfill semantic: an asset that parsed-but-had-no-EXIF still gets
+        // an empty-object sentinel so `WHERE exif_raw IS NULL` distinguishes
+        // "never processed" from "processed, nothing there."
+        let exif_raw = asset
+            .exif_raw
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO assets \
              (id, hash, original_filename, storage_path, file_size, mime_type, \
               date_taken, latitude, longitude, camera_make, camera_model, \
+              lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
+              shutter, iso, orientation, altitude, gps_direction, exif_raw, \
               thumbnails_generated) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
@@ -374,6 +395,17 @@ impl PgAssetsRepo {
         .bind(asset.longitude)
         .bind(asset.camera_make.as_deref())
         .bind(asset.camera_model.as_deref())
+        .bind(asset.lens_make.as_deref())
+        .bind(asset.lens_model.as_deref())
+        .bind(asset.focal_length)
+        .bind(asset.focal_length_35mm)
+        .bind(asset.aperture)
+        .bind(asset.shutter.as_deref())
+        .bind(asset.iso)
+        .bind(asset.orientation)
+        .bind(asset.altitude)
+        .bind(asset.gps_direction)
+        .bind(exif_raw)
         .bind(asset.thumbnails_generated)
         .fetch_optional(&self.pool)
         .await
