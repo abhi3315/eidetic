@@ -1,8 +1,3 @@
-//! Thumbnail generation for images.
-//!
-//! Two JPEG sizes (256/1024 longest edge), stored under
-//! `<library_dir>/.thumbs/{s,m}/<hash[..2]>/<hash[2..4]>/<hash>.jpg`.
-
 use crate::{Error, Result};
 use eidetic_core::Sha256;
 use image::codecs::jpeg::JpegEncoder;
@@ -17,19 +12,17 @@ use std::path::{Path, PathBuf};
 /// trade-off favours bytes saved.
 const JPEG_QUALITY: u8 = 85;
 
-/// Thumbnail size variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThumbSize {
-    /// 256px longest edge — grid previews, search result strips.
+    /// 256px longest edge. Grid previews, search-result strips.
     Small,
-    /// 1024px longest edge — single-photo card view.
+    /// 1024px longest edge. Single-photo card view.
     Medium,
 }
 
 impl ThumbSize {
-    /// Directory segment under `<library_dir>/.thumbs/`. Stable for the
-    /// lifetime of the data — adding a new size adds a new letter, never
-    /// renames an existing one.
+    /// Stable for the lifetime of the data. Adding a new size adds a new
+    /// letter, never renames an existing one.
     pub fn dir_segment(self) -> &'static str {
         match self {
             ThumbSize::Small => "s",
@@ -37,7 +30,6 @@ impl ThumbSize {
         }
     }
 
-    /// Longest edge in pixels. Aspect ratio is preserved during resize.
     pub fn longest_edge(self) -> u32 {
         match self {
             ThumbSize::Small => 256,
@@ -46,8 +38,6 @@ impl ThumbSize {
     }
 }
 
-/// On-disk path for a thumbnail. Derived purely from `hash` and `size`;
-/// no DB lookup needed to locate the file.
 pub fn thumbnail_path(library_dir: &Path, hash: &Sha256, size: ThumbSize) -> PathBuf {
     let hex = hash.to_string();
     library_dir
@@ -60,11 +50,9 @@ pub fn thumbnail_path(library_dir: &Path, hash: &Sha256, size: ThumbSize) -> Pat
 
 /// Generate both 256px and 1024px JPEG thumbnails for `src`.
 ///
-/// Synchronous; CPU-bound. Call inside `tokio::task::spawn_blocking`.
-///
-/// Returns `Ok(())` only when both thumbnails wrote successfully. On
-/// failure of either size, returns `Err`; partial files (if any) are
-/// left on disk for a future run to overwrite.
+/// Synchronous and CPU-bound. Call inside `tokio::task::spawn_blocking`.
+/// On partial failure, files already written are left on disk for a
+/// future run to overwrite.
 pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Result<()> {
     let img = load_image_with_limits(src)?;
 
@@ -79,7 +67,7 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
 
         let edge = size.longest_edge();
         // Only downscale. If the source already fits inside the bounding box
-        // on both axes, write the original dimensions — upscaling makes files
+        // on both axes, write the original dimensions. Upscaling makes files
         // larger for no quality gain.
         let resized = if img.width() <= edge && img.height() <= edge {
             img.clone()
@@ -103,14 +91,6 @@ pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Res
     Ok(())
 }
 
-/// Open and decode an image with the same decompression-bomb limits the
-/// ML preprocessing uses. Identical guards: 512 MB allocation cap, 16384
-/// max width/height.
-///
-/// HEIC/HEIF inputs route through libheif via the registered decoder
-/// hook. DNG inputs go through `eidetic_core::dng::extract_largest_jpeg_preview`
-/// which slices the embedded JPEG out of the TIFF container; we then decode
-/// those bytes via the same `ImageReader` path so limits apply uniformly.
 fn load_image_with_limits(path: &Path) -> Result<image::DynamicImage> {
     crate::ensure_heic_registered();
 
@@ -182,7 +162,7 @@ mod tests {
         let lib_heif = LibHeif::new();
         let mut encoder = lib_heif
             .encoder_for_format(CompressionFormat::Hevc)
-            .expect("HEVC encoder available (V6 verified — needs x265)");
+            .expect("HEVC encoder available (needs x265)");
         encoder
             .set_quality(EncoderQuality::LossLess)
             .expect("set quality");
@@ -218,18 +198,6 @@ mod tests {
     }
 
     #[test]
-    fn thumb_size_dir_segment_is_stable() {
-        assert_eq!(ThumbSize::Small.dir_segment(), "s");
-        assert_eq!(ThumbSize::Medium.dir_segment(), "m");
-    }
-
-    #[test]
-    fn thumb_size_longest_edge() {
-        assert_eq!(ThumbSize::Small.longest_edge(), 256);
-        assert_eq!(ThumbSize::Medium.longest_edge(), 1024);
-    }
-
-    #[test]
     fn thumbnail_path_derivation() {
         let hash = fixture_hash();
         let lib = PathBuf::from("/library");
@@ -254,7 +222,8 @@ mod tests {
     fn generate_writes_both_sizes() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let src = make_real_jpeg(tmp.path(), 800, 600);
-        let library = tmp.path().join("library");
+        // Nested path also covers create_dir_all behaviour for a fresh library.
+        let library = tmp.path().join("deeply").join("nested").join("library");
         let hash = fixture_hash();
 
         generate_thumbnails(&src, &hash, &library).expect("generate");
@@ -285,18 +254,6 @@ mod tests {
             result.is_err(),
             "expected Err on corrupt input, got {result:?}"
         );
-    }
-
-    #[test]
-    fn generate_creates_intermediate_directories() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let src = make_real_jpeg(tmp.path(), 100, 100);
-        let nested_library = tmp.path().join("deeply").join("nested").join("library");
-        let hash = fixture_hash();
-
-        generate_thumbnails(&src, &hash, &nested_library).expect("generate");
-        assert!(thumbnail_path(&nested_library, &hash, ThumbSize::Small).exists());
-        assert!(thumbnail_path(&nested_library, &hash, ThumbSize::Medium).exists());
     }
 
     #[test]

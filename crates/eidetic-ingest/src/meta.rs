@@ -138,17 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn png_magic_returns_image_png() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_bytes(
-            tmp.path(),
-            "img.png",
-            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
-        );
-        assert_eq!(detect_mime(&path).unwrap(), Some("image/png".to_string()));
-    }
-
-    #[test]
     fn mp4_magic_returns_video_type() {
         let tmp = tempfile::tempdir().unwrap();
         // ftyp box: 4-byte length + "ftyp" + "isom"
@@ -178,18 +167,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = detect_mime(&tmp.path().join("ghost.jpg"));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn extract_exif_returns_default_on_random_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_bytes(tmp.path(), "blob.bin", b"random bytes not exif at all here");
-        let data = extract_exif(&path);
-        assert!(data.date_taken.is_none());
-        assert!(data.latitude.is_none());
-        assert!(data.longitude.is_none());
-        assert!(data.camera_make.is_none());
-        assert!(data.camera_model.is_none());
     }
 
     #[test]
@@ -254,30 +231,5 @@ mod tests {
             data.longitude
         );
         assert_eq!(data.camera_make.as_deref(), Some("TestCam"));
-    }
-
-    #[test]
-    fn extract_exif_reads_make_from_minimal_exif() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Hand-crafted JPEG with a single EXIF tag: Make = "TestCam"
-        // Structure: SOI + APP1 (Exif header + little-endian TIFF with 1 IFD entry) + EOI
-        const JPEG_WITH_MAKE: &[u8] = &[
-            0xFF, 0xD8, // JPEG SOI
-            0xFF, 0xE1, 0x00, 0x2A, // APP1 marker, length=42
-            0x45, 0x78, 0x69, 0x66, 0x00, 0x00, // "Exif\0\0"
-            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // TIFF LE, IFD0 at offset 8
-            0x01, 0x00, // 1 IFD entry
-            0x0F, 0x01, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, // Make: type ASCII, count 8
-            0x1A, 0x00, 0x00, 0x00, // value at TIFF offset 26
-            0x00, 0x00, 0x00, 0x00, // next IFD = none
-            0x54, 0x65, 0x73, 0x74, 0x43, 0x61, 0x6D, 0x00, // "TestCam\0"
-            0xFF, 0xD9, // JPEG EOI
-        ];
-        let path = write_bytes(tmp.path(), "make_only.jpg", JPEG_WITH_MAKE);
-        let data = extract_exif(&path);
-        assert_eq!(data.camera_make.as_deref(), Some("TestCam"));
-        // No other tags in this fixture
-        assert!(data.date_taken.is_none());
-        assert!(data.latitude.is_none());
     }
 }

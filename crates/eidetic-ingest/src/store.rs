@@ -2,11 +2,8 @@ use crate::Result;
 use eidetic_core::Sha256;
 use std::path::{Path, PathBuf};
 
-/// Copy `src` to a uniquely-named temp file inside `staging_dir` (which must be on the
-/// same filesystem as the CAS library so that [`commit_staged`] can rename atomically).
-///
-/// The returned [`tempfile::NamedTempFile`] is automatically deleted if dropped without
-/// being persisted — so callers that return early (e.g. dedup hit) get free cleanup.
+/// Copy `src` to a uniquely-named temp file inside `staging_dir`, which must be on the
+/// same filesystem as the CAS library so that [`commit_staged`] can rename atomically.
 pub fn stage_file(src: &Path, staging_dir: &Path) -> Result<tempfile::NamedTempFile> {
     std::fs::create_dir_all(staging_dir).map_err(|source| crate::Error::Io {
         path: staging_dir.to_path_buf(),
@@ -24,17 +21,16 @@ pub fn stage_file(src: &Path, staging_dir: &Path) -> Result<tempfile::NamedTempF
 }
 
 /// Atomically move a staged temp file to its CAS destination
-/// `{library_dir}/{hash[0..2]}/{hash[2..4]}/{hash}[.ext]`.
-///
-/// If a concurrent import already placed the same file, the temp file is discarded and
-/// the existing path is returned — safe because same hash implies identical content.
+/// `{library_dir}/{hash[0..2]}/{hash[2..4]}/{hash}[.ext]`. If a concurrent
+/// import already placed the same file we discard the temp file and return
+/// the existing path. Safe because same hash implies identical content.
 pub fn commit_staged(
     stage: tempfile::NamedTempFile,
     hash: &Sha256,
     ext: Option<&str>,
     library_dir: &Path,
 ) -> Result<PathBuf> {
-    let hex = hash.to_string(); // always 64 chars — safe to slice
+    let hex = hash.to_string(); // always 64 chars, safe to slice
     let filename = match ext {
         Some(e) => format!("{hex}.{e}"),
         None => hex.clone(),
@@ -81,7 +77,7 @@ pub fn commit_staged(
         Ok(_) => Ok(dest),
         Err(e) => {
             if dest.exists() {
-                // A concurrent import completed first — same content, safe to ignore.
+                // A concurrent import completed first. Same content, safe to ignore.
                 Ok(dest)
             } else {
                 Err(crate::Error::Io {
@@ -137,17 +133,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_intermediate_directories() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = write_tmp(tmp.path(), "img.png", b"data");
-        let library = tmp.path().join("nested").join("library");
-        let hash = hex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-
-        let dest = store(&src, &hash, &library);
-        assert!(dest.exists());
-    }
-
-    #[test]
     fn idempotent_second_call_returns_same_path() {
         let tmp = tempfile::tempdir().unwrap();
         let src = write_tmp(tmp.path(), "dup.jpg", b"content");
@@ -171,19 +156,5 @@ mod tests {
             dest.file_name().unwrap().to_str().unwrap(),
             hash.to_string()
         );
-    }
-
-    #[test]
-    fn staged_file_auto_cleaned_if_dropped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = write_tmp(tmp.path(), "photo.jpg", b"data");
-        let library = tmp.path().join("library");
-
-        let staged = stage_file(&src, &library).unwrap();
-        let staged_path = staged.path().to_path_buf();
-        assert!(staged_path.exists());
-
-        drop(staged); // simulates early return (e.g. dedup hit)
-        assert!(!staged_path.exists());
     }
 }

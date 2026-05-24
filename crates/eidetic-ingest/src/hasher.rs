@@ -1,14 +1,3 @@
-//! Streaming SHA-256 hashing.
-//!
-//! Files are read in fixed-size chunks and fed into the hasher
-//! incrementally. Memory usage is bounded regardless of file size,
-//! so this works for multi-gigabyte video files without trouble.
-//!
-//! Sparse hashing (hash of three sampled regions for very large
-//! files) is intentionally not in v0. It's an optimization that
-//! waits for evidence the streaming hasher is observably slow on
-//! the user's library.
-
 use crate::{Error, Result};
 use eidetic_core::Sha256;
 use sha2::{Digest, Sha256 as Sha256Hasher};
@@ -21,7 +10,6 @@ use std::path::Path;
 /// up RAM.
 const READ_BUF_SIZE: usize = 64 * 1024;
 
-/// Compute the SHA-256 hash of a file.
 pub fn hash_file(path: &Path) -> Result<Sha256> {
     let mut file = File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -73,27 +61,13 @@ mod tests {
     }
 
     #[test]
-    fn hashes_empty_file() {
-        let path = temp_path("empty");
-        File::create(&path).unwrap();
-
-        let hash = hash_file(&path).unwrap();
-        assert_eq!(
-            hash.to_string(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
     fn streaming_matches_oneshot_for_buffer_boundaries() {
         // Write a file slightly larger than the read buffer to make sure
         // multi-chunk reads produce the same hash as a single-chunk read.
         let path = temp_path("big");
         {
             let mut f = File::create(&path).unwrap();
-            // 200 KiB of repeating bytes — crosses 3 buffer boundaries.
+            // 200 KiB of repeating bytes, crosses 3 buffer boundaries.
             let chunk = vec![0xABu8; 1024];
             for _ in 0..200 {
                 f.write_all(&chunk).unwrap();

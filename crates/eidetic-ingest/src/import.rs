@@ -17,7 +17,7 @@ pub enum ImportOutcome {
 }
 
 pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> ImportOutcome {
-    // MIME detection reads only 512 bytes — acceptable before staging.
+    // MIME detection reads only 512 bytes, acceptable before staging.
     let mime_type = match crate::meta::detect_mime(path) {
         Ok(Some(m)) => m,
         Ok(None) => return ImportOutcome::Skipped,
