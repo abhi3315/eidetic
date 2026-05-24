@@ -1,8 +1,5 @@
-//! Shared types and configuration for Eidetic.
-//!
-//! This crate has zero dependencies on `tokio`, `sqlx`, or `ort` — it's the
-//! lightweight foundation that every other crate builds on. Adding heavy
-//! dependencies here pollutes the dependency graph for everyone.
+//! Zero dependencies on `tokio`, `sqlx`, or `ort`. Every other crate builds
+//! on top of this one, so heavy deps here pollute the graph for everyone.
 
 pub mod config;
 pub mod dng;

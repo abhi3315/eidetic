@@ -10,7 +10,7 @@
 //! ignore.
 //!
 //! Non-Apple DNGs may store raw data in the primary IFD with the preview in
-//! a SubIFD instead — that case isn't handled here yet. We'd add SubIFD
+//! a SubIFD instead. That case isn't handled here yet. We'd add SubIFD
 //! walking when such a file shows up.
 
 use exif::{In, Reader, Tag, Value};
@@ -124,7 +124,7 @@ pub fn extract_largest_jpeg_preview(path: &Path) -> Result<Vec<u8>, Error> {
         source,
     })?;
 
-    // JPEG SOI marker check — guards against the IFD pointing at garbage
+    // JPEG SOI marker check. Guards against the IFD pointing at garbage
     // (corrupt DNG, mistyped Compression tag, etc.).
     if bytes.len() < 3 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
         return Err(Error::CorruptPreview {
@@ -139,8 +139,6 @@ pub fn extract_largest_jpeg_preview(path: &Path) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
-/// Returns `true` if the path has a `.dng` extension (case-insensitive).
-/// Cheap check for callers that want to route DNG inputs through this module.
 pub fn is_dng_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())

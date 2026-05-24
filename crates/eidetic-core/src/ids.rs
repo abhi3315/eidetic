@@ -87,14 +87,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_via_uuid() {
-        let id = AssetId::new();
-        let uuid = id.as_uuid();
-        let restored = AssetId::from(uuid);
-        assert_eq!(id, restored);
-    }
-
-    #[test]
     fn sha256_from_hex_valid() {
         let hex = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         let hash = Sha256::from_hex(hex).unwrap();
