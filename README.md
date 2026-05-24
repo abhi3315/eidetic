@@ -9,9 +9,10 @@ Written in Rust.
 - `eidetic import <file|dir>`: import photos/videos into the library
   - Filters non-media files by magic bytes (not extension)
   - Deduplicates by content hash
-  - Extracts EXIF: date taken, GPS, camera make/model
+  - Extracts EXIF: date taken, GPS, camera make/model, lens, focal length, aperture, shutter, ISO, orientation, altitude, plus a JSONB tail with every other tag kamadak-exif can parse
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
   - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif), and DNG/Apple ProRAW (via embedded JPEG preview)
+- `eidetic backfill-exif [--dry-run]`: re-parse EXIF for image rows imported before comprehensive extraction landed (one-shot recovery; no-op once it has run)
 - `eidetic embed`: generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
 - `eidetic search "dog on beach"`: find photos by natural-language description
   - `--limit N`: number of results (default 10)
