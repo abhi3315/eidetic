@@ -56,7 +56,7 @@ async fn imported_image_has_thumbnails_generated_true() {
     let (repo, paths, tmp, _container) = fixture().await;
     let src = write_real_jpeg(tmp.path(), "photo.jpg", 800, 600);
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     let _id = match outcome {
         ImportOutcome::Imported(id) => id,
         other => panic!("expected Imported, got {other:?}"),
@@ -91,7 +91,7 @@ async fn imported_video_stays_thumbnails_generated_false() {
     )
     .expect("write stub mp4");
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     let _id = match outcome {
         ImportOutcome::Imported(id) => id,
         other => panic!("expected Imported (video should still ingest), got {other:?}"),
@@ -116,7 +116,7 @@ async fn corrupt_image_lands_but_thumbnails_stay_pending() {
     let src = tmp.path().join("corrupt.jpg");
     std::fs::write(&src, [0xFF, 0xD8, 0xFF, 0xE0]).expect("write stub");
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     let id = match outcome {
         ImportOutcome::Imported(id) => id,
         other => panic!("expected Imported even on corrupt image, got {other:?}"),

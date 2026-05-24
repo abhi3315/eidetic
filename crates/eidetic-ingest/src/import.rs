@@ -2,7 +2,7 @@ use crate::{
     Error, Result, hash_file,
     store::{commit_staged, stage_file},
 };
-use eidetic_core::{AssetId, Paths};
+use eidetic_core::{AssetId, Paths, geocoder::Geocoder};
 use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -16,7 +16,12 @@ pub enum ImportOutcome {
     Failed(Error),
 }
 
-pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> ImportOutcome {
+pub async fn import_file(
+    path: &Path,
+    repo: &PgAssetsRepo,
+    config: &Paths,
+    geocoder: Option<&Geocoder>,
+) -> ImportOutcome {
     // MIME detection reads only 512 bytes, acceptable before staging.
     let mime_type = match crate::meta::detect_mime(path) {
         Ok(Some(m)) => m,
@@ -104,6 +109,11 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         false
     };
 
+    let place = match (geocoder, exif.latitude, exif.longitude) {
+        (Some(g), Some(lat), Some(lon)) => g.lookup(lat, lon),
+        _ => None,
+    };
+
     let new_asset = NewAsset {
         hash: hash_hex.clone(),
         original_filename,
@@ -126,11 +136,11 @@ pub async fn import_file(path: &Path, repo: &PgAssetsRepo, config: &Paths) -> Im
         altitude: exif.altitude,
         gps_direction: exif.gps_direction,
         exif_raw: exif.raw,
-        country_code: None,
-        country_name: None,
-        admin1: None,
-        place: None,
-        place_distance_m: None,
+        country_code: place.as_ref().map(|p| p.country_code.clone()),
+        country_name: place.as_ref().map(|p| p.country_name.clone()),
+        admin1: place.as_ref().map(|p| p.admin1.clone()),
+        place: place.as_ref().map(|p| p.place.clone()),
+        place_distance_m: place.as_ref().map(|p| p.distance_m),
         thumbnails_generated,
     };
 
@@ -154,7 +164,12 @@ pub struct ImportSummary {
     pub failed: Vec<(PathBuf, Error)>,
 }
 
-pub async fn import_dir(dir: &Path, repo: &PgAssetsRepo, config: &Paths) -> Result<ImportSummary> {
+pub async fn import_dir(
+    dir: &Path,
+    repo: &PgAssetsRepo,
+    config: &Paths,
+    geocoder: Option<&Geocoder>,
+) -> Result<ImportSummary> {
     if !dir.is_dir() {
         return Err(Error::Io {
             path: dir.to_path_buf(),
@@ -197,7 +212,7 @@ pub async fn import_dir(dir: &Path, repo: &PgAssetsRepo, config: &Paths) -> Resu
             continue;
         }
 
-        match import_file(entry.path(), repo, config).await {
+        match import_file(entry.path(), repo, config, geocoder).await {
             ImportOutcome::Imported(_) => summary.imported += 1,
             ImportOutcome::Duplicate(_) => summary.duplicates += 1,
             ImportOutcome::Skipped => summary.skipped += 1,

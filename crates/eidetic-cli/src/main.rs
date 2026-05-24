@@ -93,6 +93,27 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+// Open the GeoNames-backed geocoder, downloading the dataset on first use.
+// Returns None on download or open failure so import never blocks on a
+// nice-to-have; the user sees a stderr note and place columns stay NULL.
+fn open_geocoder() -> Option<eidetic_core::geocoder::Geocoder> {
+    use eidetic_core::geocoder::Geocoder;
+    let dir = Geocoder::default_data_dir();
+    if let Err(e) = Geocoder::ensure_dataset(&dir) {
+        eprintln!("warning: GeoNames dataset unavailable ({e}); skipping reverse geocoding");
+        return None;
+    }
+    match Geocoder::open(&dir) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!(
+                "warning: GeoNames dataset present but failed to load ({e}); skipping reverse geocoding"
+            );
+            None
+        }
+    }
+}
+
 const VALID_FIELDS: &[&str] = &[
     "path", "score", "date", "make", "model", "lat", "lon", "mime",
 ];
@@ -152,8 +173,12 @@ async fn main() -> anyhow::Result<()> {
                 .context("failed to connect to database")?;
             let repo = eidetic_db::PgAssetsRepo::new(pool);
 
+            let geocoder = open_geocoder();
+
             if path.is_file() {
-                match eidetic_ingest::import_file(&path, &repo, &config.paths).await {
+                match eidetic_ingest::import_file(&path, &repo, &config.paths, geocoder.as_ref())
+                    .await
+                {
                     ImportOutcome::Imported(id) => {
                         println!("Imported  {} ({})", path.display(), id);
                     }
@@ -173,9 +198,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else if path.is_dir() {
-                let summary = eidetic_ingest::import_dir(&path, &repo, &config.paths)
-                    .await
-                    .with_context(|| format!("cannot import {}", path.display()))?;
+                let summary =
+                    eidetic_ingest::import_dir(&path, &repo, &config.paths, geocoder.as_ref())
+                        .await
+                        .with_context(|| format!("cannot import {}", path.display()))?;
 
                 println!("Imported   {:>6} files", summary.imported);
                 println!("Duplicates {:>6} files", summary.duplicates);

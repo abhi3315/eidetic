@@ -81,7 +81,7 @@ async fn new_file_is_imported() {
     let (repo, _pool, paths, tmp, _container) = fixture().await;
     let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     assert!(
         matches!(outcome, ImportOutcome::Imported(_)),
         "expected Imported, got {outcome:?}",
@@ -130,7 +130,7 @@ async fn known_hash_returns_duplicate() {
         InsertOutcome::Existing(_) => panic!("seed insert returned Existing"),
     };
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     match outcome {
         ImportOutcome::Duplicate(id) => assert_eq!(id, existing_id),
         other => panic!("expected Duplicate, got {other:?}"),
@@ -142,7 +142,7 @@ async fn missing_file_returns_failed() {
     let (repo, _pool, paths, tmp, _container) = fixture().await;
     let nonexistent = tmp.path().join("nope.jpg");
 
-    let outcome = import_file(&nonexistent, &repo, &paths).await;
+    let outcome = import_file(&nonexistent, &repo, &paths, None).await;
     assert!(matches!(outcome, ImportOutcome::Failed(_)));
 }
 
@@ -151,7 +151,7 @@ async fn non_media_file_returns_skipped() {
     let (repo, _pool, paths, tmp, _container) = fixture().await;
     let src = write_non_media(tmp.path(), "document.txt");
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     assert!(matches!(outcome, ImportOutcome::Skipped));
 }
 
@@ -160,7 +160,7 @@ async fn imported_file_has_jpeg_mime_type() {
     let (repo, pool, paths, tmp, _container) = fixture().await;
     let src = write_jpeg(tmp.path(), "photo.jpg", b"a");
 
-    let id = match import_file(&src, &repo, &paths).await {
+    let id = match import_file(&src, &repo, &paths, None).await {
         ImportOutcome::Imported(id) => id,
         other => panic!("expected Imported, got {other:?}"),
     };
@@ -181,7 +181,7 @@ async fn dir_imports_all_files() {
     write_jpeg(&src_dir, "b.jpg", b"b");
     write_jpeg(&src_dir, "c.jpg", b"c");
 
-    let summary = import_dir(&src_dir, &repo, &paths).await.unwrap();
+    let summary = import_dir(&src_dir, &repo, &paths, None).await.unwrap();
     assert_eq!(summary.imported, 3);
     assert_eq!(summary.duplicates, 0);
     assert_eq!(summary.skipped, 0);
@@ -226,7 +226,7 @@ async fn dir_counts_duplicates_separately() {
     .await
     .expect("seed");
 
-    let summary = import_dir(&src_dir, &repo, &paths).await.unwrap();
+    let summary = import_dir(&src_dir, &repo, &paths, None).await.unwrap();
     assert_eq!(summary.imported, 0);
     assert_eq!(summary.duplicates, 1);
     assert_eq!(summary.skipped, 0);
@@ -241,7 +241,7 @@ async fn dir_counts_non_media_as_skipped() {
     write_non_media(&src_dir, "notes.txt");
     write_non_media(&src_dir, "archive.zip");
 
-    let summary = import_dir(&src_dir, &repo, &paths).await.unwrap();
+    let summary = import_dir(&src_dir, &repo, &paths, None).await.unwrap();
     assert_eq!(summary.imported, 1);
     assert_eq!(summary.skipped, 2);
     assert!(summary.failed.is_empty());
@@ -252,7 +252,7 @@ async fn dir_not_found_returns_err() {
     let (repo, _pool, paths, tmp, _container) = fixture().await;
     let missing = tmp.path().join("does_not_exist");
 
-    let result = import_dir(&missing, &repo, &paths).await;
+    let result = import_dir(&missing, &repo, &paths, None).await;
     assert!(matches!(result, Err(eidetic_ingest::Error::Io { .. })));
 }
 
@@ -261,7 +261,7 @@ async fn non_ascii_filename_preserved_not_unknown() {
     let (repo, pool, paths, tmp, _container) = fixture().await;
     let src = write_jpeg(tmp.path(), "héllo.jpg", b"a");
 
-    let id = match import_file(&src, &repo, &paths).await {
+    let id = match import_file(&src, &repo, &paths, None).await {
         ImportOutcome::Imported(id) => id,
         other => panic!("expected Imported, got {other:?}"),
     };
@@ -284,7 +284,7 @@ async fn dir_recurses_into_subdirectories() {
     let subdir = src_dir.join("subdir");
     write_jpeg(&subdir, "nested.jpg", b"b");
 
-    let summary = import_dir(&src_dir, &repo, &paths).await.unwrap();
+    let summary = import_dir(&src_dir, &repo, &paths, None).await.unwrap();
     assert_eq!(summary.imported, 2);
     assert_eq!(summary.duplicates, 0);
     assert!(summary.failed.is_empty());
@@ -330,7 +330,7 @@ async fn duplicate_import_does_not_touch_library_dir() {
     assert!(!paths.library_dir.exists());
     let before = snapshot_dir(&paths.library_dir);
 
-    let outcome = import_file(&src, &repo, &paths).await;
+    let outcome = import_file(&src, &repo, &paths, None).await;
     assert!(
         matches!(outcome, ImportOutcome::Duplicate(_)),
         "expected Duplicate, got {outcome:?}",
