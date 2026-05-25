@@ -83,7 +83,7 @@ kamadak-exif = "0.6"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 # Zip decompression for the downloaded cities500.zip blob.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Directory walking
 walkdir = "2"
