@@ -22,7 +22,7 @@ jobs:
     if: ${{ github.event.sender.type != 'Bot' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: qodo-ai/pr-agent@0bd56c0508504c718cc03d504cd4ceb6725ba3c7  # main as of 2026-05-10
+      - uses: qodo-ai/pr-agent@ffe1f89a4dafc7d8e88b9cf010a3233e30b49f43  # main as of 2026-05-10
         env:
           CONFIG.AI_PROVIDER: litellm
           CONFIG.MODEL: deepseek/deepseek-chat
