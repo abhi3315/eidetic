@@ -1,7 +1,7 @@
-# ADR-0010: Face stack = YuNet + SFace by default, InsightFace opt-in
+# ADR-0010: Face stack = YuNet + AuraFace by default, InsightFace opt-in
 
 Date: 2026-07-30
-Status: accepted
+Status: accepted (amended same day — see "Amendment: AuraFace")
 
 ## Context
 
@@ -34,7 +34,7 @@ Ship **YuNet + SFace as the default**, and make the detector/embedder **pluggabl
 This is the same shape as ADR-0008's HEIC decision: the permissive, always-works option is the default; the better-but-encumbered option is available to a user who knowingly opts in. It keeps eidetic's own licence story clean without pretending the accuracy gap doesn't exist.
 
 - **Detection:** `opencv/face_detection_yunet`, file `face_detection_yunet_2023mar.onnx`. Stride decoding and NMS are ours to implement, since we are not going through OpenCV's `FaceDetectorYN` wrapper.
-- **Recognition:** `opencv/face_recognition_sface`, file `face_recognition_sface_2021dec.onnx`.
+- **Recognition:** `fal/AuraFace-v1`, file `glintr100.onnx` — see the amendment below. `opencv/face_recognition_sface` remains selectable as `sface`.
 
 **Measured ONNX signatures** (verified by loading both files through `ort`, rather than trusting the model cards — the YuNet README is inconsistent and mentions a `2026may` file that is not actually published on HuggingFace, and describes `2023mar` as 320×320 when the published file is 640×640):
 
@@ -108,7 +108,8 @@ A full re-cluster then runs as *constrained* clustering: user-pinned faces pre-s
 
 **Bad / accepted:**
 
-- **SFace is meaningfully weaker than ArcFace `w600k_r50`**, and 128-dim gives less separation headroom than 512-dim at large gallery sizes. YuNet is also weaker on very large close-up faces and >90° rotations (trained for ~10-300 px faces). Expect more merge/split corrections on the default stack than Immich users see. This is the price of the licence, stated plainly; the opt-in exists for anyone who'd rather pay a different price.
+- YuNet is weaker on very large close-up faces and >90° rotations (trained for ~10-300 px faces). It remains the best *permissive* detector with 5-point landmarks; two independent searches found nothing newer.
+- ~~SFace is meaningfully weaker than ArcFace~~ — largely resolved by the AuraFace amendment below, which recovers the 512-dim ArcFace accuracy class without the licence problem. The residual gap is in detection, not recognition.
 - Two model pairs to keep working, with different embedding dimensions. Mitigated by storing `dim` per row (same as the `embeddings` table) so a model change is detectable rather than silently mixing widths.
 - We own YuNet's stride decoding and NMS, because we bypass OpenCV's wrapper. More code than calling a library, and it needs testing against the real ONNX output.
 - Known-unfixable failure modes, consistent across every project surveyed: infants cluster across *different* children and drift as they age; siblings and twins often cannot be separated at all; the same adult across 15+ years usually splits. Face grouping will need user correction — which is why the constraint model above is load-bearing rather than a nice-to-have.
@@ -138,6 +139,53 @@ That single run closes both of the assumptions unit tests cannot reach:
 - **MediaPipe BlazeFace** (Apache-2.0, so licence-clean). Rejected: poor on small faces, which is most faces in a real photo library, and it emits 6 keypoints rather than the 5 the alignment template expects.
 - **A clustering crate.** Rejected — see above; no constraint support is the deciding factor.
 - **HDBSCAN.** Rejected: solves a variable-density problem we don't have, hardest to make incremental, and its `min_cluster_size` behaviour swallows the many-singleton case (background strangers) unpredictably. LibrePhotos uses it and cluster quality is a common complaint.
+
+## Amendment: AuraFace (same day)
+
+The original decision accepted SFace's 128-dim embedding as "the price of the
+licence". A follow-up search — prompted by asking whether this really was the
+best available option — surfaced **AuraFace** (`fal/AuraFace-v1`), which the
+first research pass missed. It makes that concession unnecessary:
+
+| | SFace | AuraFace |
+|---|---|---|
+| Licence | Apache-2.0 | Apache-2.0 |
+| Architecture | MobileFaceNet | ResNet100 + ArcFace loss |
+| Embedding | 128-dim | **512-dim** |
+| LFW | ~0.994 (unspecified set) | **0.9965** |
+| Training data | OpenCV Zoo | *deliberately* commercially-usable sources |
+
+The last row is the point: AuraFace exists specifically to solve the problem
+this ADR is built around — trained on commercially-available data so it does
+not inherit InsightFace's research-only restriction.
+
+**Measured, not assumed** (introspected the real 260 MB file):
+
+```
+IN   data   [-1, 3, 112, 112]     same input name and shape as SFace
+OUT  1333   [1, 512]
+```
+
+So it is a drop-in for the embedding half: identical aligned-crop contract, no
+pipeline change. Its output tensor is named `1333` rather than `fc1`, which the
+analyzer already tolerates because it takes the session's sole output instead of
+a hard-coded name. Verified end-to-end on the same portrait — 512-dim,
+unit-norm, unchanged detection.
+
+**Default becomes `auraface`** (YuNet detect + AuraFace embed). `sface` stays
+selectable (smaller and faster, 38 MB vs 260 MB), `buffalo_l` remains the
+encumbered opt-in.
+
+**Licence caveat, recorded rather than glossed:** the AuraFace repo is labelled
+Apache-2.0 but also ships files with *verbatim InsightFace names*
+(`scrfd_10g_bnkps.onnx`, `2d106det.onnx`, `genderage.onnx`), and its README
+never states which weights fal actually trained or addresses the detector's
+provenance. fal cannot grant Apache-2.0 over weights they did not train. We
+therefore use **only** `glintr100.onnx`, the recognition model that is their own
+stated work and product pitch, and keep detection on YuNet — whose MIT licence
+is unambiguous. A unit test asserts every non-`buffalo_l` pair detects with
+YuNet, so a future edit cannot quietly promote an encumbered detector into a
+default path.
 
 ## References
 

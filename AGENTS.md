@@ -22,7 +22,7 @@ This is one person's photo library on one person's hardware. Not a SaaS, not mul
 - **Database:** embedded SQLite, single file, no server (see ADR-0005; supersedes ADR-0002)
 - **ML inference:** ONNX Runtime via the `ort` crate (see ADR-0003; CUDA EP per ADR-0006)
 - **Image embedding:** SigLIP 2, 768-dim `base` today (see ADR-0004; ADR-0007 moves the default to so400m/1152-dim)
-- **Face detection / recognition:** YuNet (MIT) + SFace (Apache-2.0) via `ort`, with InsightFace SCRFD+ArcFace as an opt-in (see ADR-0010 — the original SCRFD+ArcFace default was dropped because those weights are non-commercial only)
+- **Face detection / recognition:** YuNet (MIT) detect + AuraFace (Apache-2.0, 512-dim) embed via `ort`; `sface` and InsightFace `buffalo_l` selectable via `EIDETIC_FACE_MODEL` (see ADR-0010 — SCRFD+ArcFace was dropped as the default because those weights are non-commercial only)
 - **Vector storage:** `embeddings` table (f32 blobs) + exact brute-force cosine behind the `VectorIndex` trait (see ADR-0005)
 - **CLI:** clap (derive)
 - **Errors:** `thiserror` in libraries, `anyhow` in binaries

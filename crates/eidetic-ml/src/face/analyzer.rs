@@ -35,6 +35,27 @@ const YUNET_SFACE: ModelPair = ModelPair {
     embed_dim: 128,
 };
 
+/// YuNet detection paired with AuraFace embedding: Apache-2.0, ResNet100 with
+/// ArcFace loss, 512-dim.
+///
+/// Same accuracy class as ArcFace (LFW 0.9965) without the non-commercial
+/// restriction — fal trained it specifically on commercially-usable data to
+/// avoid exactly the licensing problem that rules out `buffalo_l`. It takes
+/// the same `data` input name and 112x112 aligned crop as SFace, so it is a
+/// drop-in for the embedding half.
+///
+/// Caveat recorded in ADR-0010: the upstream repo is labelled Apache-2.0 but
+/// also ships files carrying verbatim InsightFace names, and its README does
+/// not state which weights fal trained. We use only the recognition model,
+/// which is the one they claim as their own.
+const YUNET_AURAFACE: ModelPair = ModelPair {
+    detector_repo: "opencv/face_detection_yunet",
+    detector_file: "face_detection_yunet_2023mar.onnx",
+    embedder_repo: "fal/AuraFace-v1",
+    embedder_file: "glintr100.onnx",
+    embed_dim: 512,
+};
+
 /// Opt-in: InsightFace SCRFD + ArcFace. Better accuracy, but the weights are
 /// licensed for non-commercial research only — the user chooses this knowingly.
 const BUFFALO_L: ModelPair = ModelPair {
@@ -47,10 +68,11 @@ const BUFFALO_L: ModelPair = ModelPair {
 
 fn pair_for(raw: Option<&str>) -> Result<&'static ModelPair> {
     match raw {
-        None | Some("yunet") => Ok(&YUNET_SFACE),
+        None | Some("auraface") => Ok(&YUNET_AURAFACE),
+        Some("sface") => Ok(&YUNET_SFACE),
         Some("buffalo_l") => Ok(&BUFFALO_L),
         Some(other) => Err(Error::ModelLoad(format!(
-            "Unknown EIDETIC_FACE_MODEL={other:?}; valid values: yunet, buffalo_l"
+            "Unknown EIDETIC_FACE_MODEL={other:?}; valid values: auraface, sface, buffalo_l"
         ))),
     }
 }
@@ -281,9 +303,25 @@ mod tests {
 
     #[test]
     fn pair_for_known_values() {
-        assert_eq!(pair_for(None).unwrap().embed_dim, 128);
-        assert_eq!(pair_for(Some("yunet")).unwrap().embed_dim, 128);
+        // Default is the 512-dim permissive pair.
+        assert_eq!(pair_for(None).unwrap().embed_dim, 512);
+        assert_eq!(pair_for(Some("auraface")).unwrap().embed_dim, 512);
+        assert_eq!(pair_for(Some("sface")).unwrap().embed_dim, 128);
         assert_eq!(pair_for(Some("buffalo_l")).unwrap().embed_dim, 512);
+    }
+
+    #[test]
+    fn every_pair_detects_with_a_permissive_model() {
+        // Only buffalo_l may use the non-commercial detector; the other two
+        // must stay on YuNet. Guards against a future edit quietly promoting
+        // an encumbered detector into a default path.
+        for name in [None, Some("auraface"), Some("sface")] {
+            let pair = pair_for(name).unwrap();
+            assert_eq!(
+                pair.detector_repo, "opencv/face_detection_yunet",
+                "{name:?} must detect with YuNet"
+            );
+        }
     }
 
     #[test]
