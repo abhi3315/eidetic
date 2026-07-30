@@ -11,12 +11,23 @@ description = "Eidetic command-line interface."
 name = "eidetic"
 path = "src/main.rs"
 
+[features]
+default = ["heic"]
+# HEIC via libheif (ADR-0008). Drop with --no-default-features for a build
+# with no C system dependency.
+heic = ["eidetic-ingest/heic", "eidetic-ml/heic", "eidetic-server/heic"]
+# NVIDIA GPU acceleration (ADR-0006). Needs an ONNX Runtime >= 1.27 CUDA
+# build at runtime via ORT_DYLIB_PATH.
+cuda = ["eidetic-ml/cuda", "eidetic-server/cuda"]
+
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
-eidetic-ingest = { path = "../eidetic-ingest" }
+# default-features = false on the crates that own optional native deps, so
+# --no-default-features on the binary propagates all the way down.
+eidetic-ingest = { path = "../eidetic-ingest", default-features = false }
 eidetic-db = { path = "../eidetic-db" }
-eidetic-ml = { path = "../eidetic-ml" }
-eidetic-server = { path = "../eidetic-server" }
+eidetic-ml = { path = "../eidetic-ml", default-features = false }
+eidetic-server = { path = "../eidetic-server", default-features = false }
 serde_json = { workspace = true }
 csv = { workspace = true }
 clap = { workspace = true }

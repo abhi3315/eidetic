@@ -8,7 +8,10 @@ authors.workspace = true
 description = "ML inference for Eidetic: image and face embeddings via ONNX."
 
 [features]
-default = []
+default = ["heic"]
+# HEIC/HEIF decoding via libheif — see eidetic-ingest for the rationale
+# (ADR-0008). --no-default-features drops the C dependency.
+heic = ["dep:libheif-rs"]
 # NVIDIA GPU acceleration via ONNX Runtime's CUDA execution provider (non-macOS).
 # Requires an ONNX Runtime >= 1.27 CUDA build supplied at runtime via
 # `ORT_DYLIB_PATH` (load-dynamic linking), plus CUDA 13 runtime + cuDNN 9 on the
@@ -23,7 +26,7 @@ tracing = { workspace = true }
 ort = { workspace = true }
 hf-hub = { workspace = true }
 image = { workspace = true }
-libheif-rs = { workspace = true }
+libheif-rs = { workspace = true, optional = true }
 ndarray = { workspace = true }
 tokenizers = { workspace = true }
 

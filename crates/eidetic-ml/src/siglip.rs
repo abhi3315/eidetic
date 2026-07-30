@@ -402,6 +402,7 @@ fn l2_normalize(v: &mut [f32]) {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "heic")]
     fn make_synthetic_heic(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
         use libheif_rs::{
             Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif,
@@ -547,6 +548,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "heic")]
     fn preprocess_image_accepts_heic_source() {
         crate::ensure_heic_registered();
         let tmp = tempfile::tempdir().expect("tmpdir");

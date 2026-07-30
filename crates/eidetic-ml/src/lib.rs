@@ -10,10 +10,15 @@ pub use siglip::SiglipEmbedder;
 /// the V2-verified idempotency note. Duplicated rather than centralised
 /// in eidetic-core so the lightweight-foundation crate stays free of
 /// heavy C-binding deps.
+/// Without the `heic` feature this is a no-op — see the note on the
+/// eidetic-ingest twin (ADR-0008).
 pub fn ensure_heic_registered() {
-    use std::sync::Once;
-    static HEIC_INIT: Once = Once::new();
-    HEIC_INIT.call_once(|| {
-        libheif_rs::integration::image::register_all_decoding_hooks();
-    });
+    #[cfg(feature = "heic")]
+    {
+        use std::sync::Once;
+        static HEIC_INIT: Once = Once::new();
+        HEIC_INIT.call_once(|| {
+            libheif_rs::integration::image::register_all_decoding_hooks();
+        });
+    }
 }

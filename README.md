@@ -12,7 +12,7 @@ Written in Rust.
   - Extracts EXIF: date taken, GPS, camera make/model, lens, focal length, aperture, shutter, ISO, orientation, altitude, plus a JSONB tail with every other tag kamadak-exif can parse
   - Reverse-geocodes GPS coordinates to country, state, and nearest-place name using an offline GeoNames cities500 dataset (~13 MB, auto-downloaded into `~/.cache/eidetic/geonames/` on first import; photo coordinates never leave the machine)
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
-  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif), and DNG/Apple ProRAW (via embedded JPEG preview)
+  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif, on by default — see [Build features](#build-features)), and DNG/Apple ProRAW (via embedded JPEG preview)
 - `eidetic embed`: generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
 - `eidetic search "dog on beach"`: find photos by natural-language description
   - `--limit N`: number of results (default 10)
@@ -121,6 +121,26 @@ cargo build --workspace
 # Test (no services required — tests create their own temp SQLite database)
 cargo test --workspace
 ```
+
+### Build features
+
+| Feature | Default | What it does |
+|---|---|---|
+| `heic` | **on** | HEIC/HEIF decoding via libheif. Needs the libheif C library installed at build time (`libheif-dev` / `libheif-devel`). |
+| `cuda` | off | NVIDIA GPU inference via the ONNX Runtime CUDA execution provider. Requires an ONNX Runtime ≥ 1.27 CUDA build supplied at runtime through `ORT_DYLIB_PATH`, plus CUDA 13 + cuDNN 9 on the host. See [ADR-0006](docs/adr/0006-gpu-execution-provider.md). |
+
+```bash
+# Default: HEIC support, CPU inference. Needs libheif installed.
+cargo build --release -p eidetic-cli
+
+# No system dependencies at all — pure-Rust decoders only (no HEIC).
+cargo build --release -p eidetic-cli --no-default-features
+
+# GPU build
+cargo build --release -p eidetic-cli --features cuda
+```
+
+HEIC is on by default because it is the primary format for iPhone photos and libheif is the mature, correct decoder for it (LGPL, so linking it from this MIT/Apache codebase is distribution-clean). The trade-off is a system dependency; `--no-default-features` drops it entirely at the cost of HEIC support. See [ADR-0008](docs/adr/0008-heic-decode.md).
 
 ## Documentation
 

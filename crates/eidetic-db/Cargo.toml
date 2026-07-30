@@ -19,7 +19,10 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-eidetic-ingest = { path = "../eidetic-ingest" }
+# default-features = false: these tests don't need HEIC, and leaving the
+# default on would re-enable eidetic-ingest/heic for the whole workspace
+# through feature unification, defeating --no-default-features builds.
+eidetic-ingest = { path = "../eidetic-ingest", default-features = false }
 image = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
