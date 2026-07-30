@@ -3,7 +3,7 @@ use crate::{
     store::{commit_staged, stage_file},
 };
 use eidetic_core::{AssetId, Paths, geocoder::Geocoder};
-use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
+use eidetic_db::{AssetsRepo, InsertOutcome, NewAsset};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 use walkdir::WalkDir;
@@ -18,7 +18,7 @@ pub enum ImportOutcome {
 
 pub async fn import_file(
     path: &Path,
-    repo: &PgAssetsRepo,
+    repo: &AssetsRepo,
     config: &Paths,
     geocoder: Option<&Geocoder>,
 ) -> ImportOutcome {
@@ -30,7 +30,7 @@ pub async fn import_file(
 
 async fn try_import_file(
     path: &Path,
-    repo: &PgAssetsRepo,
+    repo: &AssetsRepo,
     config: &Paths,
     geocoder: Option<&Geocoder>,
 ) -> Result<ImportOutcome> {
@@ -161,7 +161,7 @@ pub struct ImportSummary {
 
 pub async fn import_dir(
     dir: &Path,
-    repo: &PgAssetsRepo,
+    repo: &AssetsRepo,
     config: &Paths,
     geocoder: Option<&Geocoder>,
 ) -> Result<ImportSummary> {

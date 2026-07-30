@@ -28,23 +28,19 @@ Written in Rust.
 # 0. Install the CLI (or prefix every `eidetic` below with `cargo run --release -p eidetic-cli --`)
 cargo install --path crates/eidetic-cli
 
-# 1. Start Postgres (VectorChord variant required for vector search)
-docker compose up -d
-
-# 2. Set env vars (or copy .env.example to .env and source it)
-export EIDETIC_DATABASE_URL="postgres://eidetic:eidetic@localhost:5432/eidetic"
-
-# 3. Import your photos (migrations run automatically on first connect)
+# 1. Import your photos
+#    The SQLite database is created and migrated on first connect — there is
+#    no server to start and nothing to configure.
 eidetic import ~/Pictures/
 
-# 4. Generate embeddings (downloads SigLIP 2 model ~1.4 GiB on first run)
+# 2. Generate embeddings (downloads SigLIP 2 model ~1.4 GiB on first run)
 eidetic embed
 
-# 5. Search
+# 3. Search
 eidetic search "golden hour at the beach"
 eidetic search "birthday cake" --limit 5 --fields score,date,path
 
-# 6. See what's in the library
+# 4. See what's in the library
 eidetic stats
 ```
 
@@ -54,12 +50,12 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 
 | Variable | Default | Description |
 |---|---|---|
-| `EIDETIC_DATABASE_URL` | `postgres://eidetic:eidetic@localhost:5432/eidetic` | Postgres connection string |
+| `EIDETIC_DATABASE_PATH` | `~/.cache/eidetic/eidetic.db` | SQLite database file. Created on first run; no server process. |
 | `EIDETIC_LIBRARY_DIR` | `~/.cache/eidetic/library` | Content-addressable file store |
 | `EIDETIC_MODELS_CACHE` | `~/.cache/eidetic/models` | SigLIP 2 ONNX model cache |
 | `EIDETIC_LOG` | `info,ort=warn` | Log level (trace/debug/info/warn/error). `ort=warn` mutes the CoreML EP's verbose graph-partition output. |
 | `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download) or `large` (1024-dim, 3.6 GB, ~5x slower). |
-| `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider. `cpu` or `coreml`. CoreML is wired up and can be enabled, but **does not currently accelerate this workload**. See "Why CoreML is opt-in" below. |
+| `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider: `cpu`, `cuda`, or `coreml`. `cuda` needs a build with `--features cuda` plus an ONNX Runtime ≥ 1.27 CUDA build at runtime (see [ADR-0006](docs/adr/0006-gpu-execution-provider.md)). CoreML is macOS-only and **does not currently accelerate this workload** — see "Why CoreML is opt-in" below. |
 
 Copy `.env.example` to `.env` and adjust as needed. There is no config file; env vars are the only configuration layer for now.
 
@@ -84,20 +80,22 @@ Current behavior: `EIDETIC_ACCELERATOR=coreml` registers the CoreML EP and runs 
 
 ## Database
 
-Requires Postgres with the [VectorChord](https://github.com/tensorchord/VectorChord) extension (`pgvector` compatible, built-in ANN index). The `docker-compose.yml` uses the official image.
+Embedded SQLite — a single file at `~/.cache/eidetic/eidetic.db` (override with `EIDETIC_DATABASE_PATH`). No server, no Docker, no connection string. SQLite is compiled into the binary; the file is created on first run.
 
 ```bash
-# Start
-docker compose up -d
+# Inspect it with the standard CLI
+sqlite3 ~/.cache/eidetic/eidetic.db '.tables'
 
-# Stop (data persists in Docker volume)
-docker compose down
+# Back it up (safe while eidetic is running)
+sqlite3 ~/.cache/eidetic/eidetic.db ".backup '/tmp/eidetic-backup.db'"
 
 # Wipe everything and start fresh
-docker compose down -v
+rm ~/.cache/eidetic/eidetic.db*
 ```
 
-Migrations run automatically on every `eidetic` startup that connects to the database. They are idempotent and safe to run repeatedly.
+Migrations run automatically on every `eidetic` startup that opens the database. They are idempotent and safe to run repeatedly.
+
+Embeddings live in their own `embeddings` table as raw f32 blobs, and search is **exact** brute-force cosine computed in-process — 100% recall, no ANN index to tune. See [ADR-0005](docs/adr/0005-vector-storage-sqlite.md) for why, and for the escalation path if a library ever outgrows it.
 
 ## System dependencies
 
@@ -120,7 +118,7 @@ If `libheif` isn't installed, Eidetic builds fine but fails at runtime with a dy
 # Build
 cargo build --workspace
 
-# Test (integration tests require Docker)
+# Test (no services required — tests create their own temp SQLite database)
 cargo test --workspace
 ```
 

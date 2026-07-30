@@ -4,7 +4,7 @@
 use axum::Router;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use eidetic_db::PgAssetsRepo;
+use eidetic_db::AssetsRepo;
 use eidetic_ml::SiglipEmbedder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ mod handlers;
 mod views;
 
 pub struct ServerDeps {
-    pub repo: PgAssetsRepo,
+    pub repo: AssetsRepo,
     pub library_dir: PathBuf,
     pub models_cache: PathBuf,
 }
@@ -27,7 +27,7 @@ pub(crate) type EmbedJob = (String, oneshot::Sender<eidetic_ml::Result<Vec<f32>>
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) repo: Arc<PgAssetsRepo>,
+    pub(crate) repo: Arc<AssetsRepo>,
     pub(crate) library_dir: Arc<PathBuf>,
     #[allow(dead_code)]
     pub(crate) embed_tx: mpsc::Sender<EmbedJob>,
@@ -135,7 +135,7 @@ pub type TestRouter = Router;
 /// Build a router wired to `repo` and `library_dir`, with a dead-end embedder
 /// channel. For tests only; searches with a non-empty `q` will fail because no
 /// embedder worker reads the channel. The empty-redirect path still works.
-pub fn test_router(repo: PgAssetsRepo, library_dir: PathBuf) -> Router {
+pub fn test_router(repo: AssetsRepo, library_dir: PathBuf) -> Router {
     let (embed_tx, _embed_rx) = mpsc::channel::<EmbedJob>(1);
     // _embed_rx drops at end of scope; embed_tx.send() in tests will fail.
     // That's fine: handler tests for /search use the empty-q redirect path.

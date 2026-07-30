@@ -2,12 +2,14 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    // No `#[source]`: the sqlx parse error can echo the raw URL (with password)
-    // through Display chains, so we drop the inner cause on purpose.
-    #[error("invalid EIDETIC_DATABASE_URL")]
-    InvalidUrl,
+    #[error("cannot create database directory {path}: {source}")]
+    OpenFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 
-    #[error("failed to connect to database: {0}")]
+    #[error("failed to open database: {0}")]
     Connect(#[source] sqlx::Error),
 
     #[error("failed to run migrations: {0}")]
@@ -15,6 +17,13 @@ pub enum Error {
 
     #[error("database query failed: {0}")]
     Query(#[source] sqlx::Error),
+
+    #[error("corrupt row in {table}.{column}: {detail}")]
+    CorruptRow {
+        table: &'static str,
+        column: &'static str,
+        detail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

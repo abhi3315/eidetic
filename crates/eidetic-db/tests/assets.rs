@@ -1,33 +1,26 @@
 use eidetic_core::Config;
-use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
+use eidetic_db::{AssetsRepo, InsertOutcome, NewAsset};
 use std::path::PathBuf;
-use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 
-async fn start_db() -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    let container = GenericImage::new("tensorchord/vchord-postgres", "pg17-v0.4.3")
-        .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
-        .with_env_var("POSTGRES_USER", "eidetic")
-        .with_env_var("POSTGRES_PASSWORD", "eidetic")
-        .with_env_var("POSTGRES_DB", "eidetic")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://eidetic:eidetic@127.0.0.1:{port}/eidetic");
-    (container, url)
+/// A throwaway SQLite database in its own temp dir.
+///
+/// The returned `TempDir` guard must outlive the test body — dropping it
+/// deletes the directory and the database file along with it.
+fn temp_db() -> (tempfile::TempDir, Config) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = Config {
+        database_path: dir.path().join("eidetic.db"),
+        ..Default::default()
+    };
+    (dir, config)
 }
 
 #[tokio::test]
 async fn insert_asset_then_find_by_hash() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
 
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let hash = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222";
     let asset = NewAsset {
@@ -71,14 +64,10 @@ async fn insert_asset_then_find_by_hash() {
 
 #[tokio::test]
 async fn find_by_hash_returns_none_for_unknown() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
 
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let found = repo
         .find_by_hash("0000000000000000000000000000000000000000000000000000000000000000")
@@ -89,13 +78,9 @@ async fn find_by_hash_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn insert_duplicate_returns_existing() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let hash = "cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222cccc3333dddd4444";
     let make_asset = || NewAsset {
@@ -146,13 +131,9 @@ async fn insert_duplicate_returns_existing() {
 
 #[tokio::test]
 async fn fetch_unembedded_returns_only_null_embedding_images() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool.clone());
+    let repo = AssetsRepo::new(pool.clone());
 
     // Insert two image assets
     let asset_a = NewAsset {
@@ -234,13 +215,9 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
 
 #[tokio::test]
 async fn search_similar_orders_by_cosine_similarity() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool.clone());
+    let repo = AssetsRepo::new(pool.clone());
 
     // Asset A: embedding aligned with e1 = [1, 0, 0, ..., 0]
     let mut emb_a = vec![0.0f32; 768];
@@ -341,13 +318,9 @@ async fn search_similar_orders_by_cosine_similarity() {
 
 #[tokio::test]
 async fn fetch_unthumbnailed_returns_images_with_flag_false() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let image_pending = NewAsset {
         hash: "11110000111100001111000011110000111100001111000011110000ffffffff".to_string(),
@@ -459,13 +432,9 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
 
 #[tokio::test]
 async fn mark_thumbnailed_flips_flag_to_true() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let asset = NewAsset {
         hash: "44440000444400004444000044440000444400004444000044440000ffffffff".to_string(),
@@ -513,17 +482,13 @@ async fn mark_thumbnailed_flips_flag_to_true() {
 
 #[tokio::test]
 async fn fetch_recent_orders_by_imported_at_desc() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
-    // Insert 3 image assets. Postgres' DEFAULT NOW() will give them
-    // ascending imported_at, so the most-recent comes last by insertion
-    // order. fetch_recent should reverse that.
+    // Insert 3 image assets. The `imported_at` DEFAULT is millisecond-
+    // precision strftime('now'), so they get ascending timestamps and the
+    // most-recent comes last by insertion order. fetch_recent reverses that.
     for (i, hash) in [
         "aaaa000000000000000000000000000000000000000000000000000000000001",
         "aaaa000000000000000000000000000000000000000000000000000000000002",
@@ -576,13 +541,9 @@ async fn fetch_recent_orders_by_imported_at_desc() {
 
 #[tokio::test]
 async fn fetch_by_id_returns_full_row_or_none() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let asset = NewAsset {
         hash: "bbbb000000000000000000000000000000000000000000000000000000000001".to_string(),

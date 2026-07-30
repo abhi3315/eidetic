@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool);
 
             let geocoder = open_geocoder();
 
@@ -221,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool);
             let s = repo.fetch_stats().await.context("failed to fetch stats")?;
 
             println!("Assets     {:>8}", s.total);
@@ -257,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool);
 
             let unembedded = repo
                 .fetch_unembedded()
@@ -351,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool);
 
             let pending = repo
                 .fetch_unthumbnailed()
@@ -437,7 +437,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool);
 
             let deps = eidetic_server::ServerDeps {
                 repo,
@@ -482,7 +482,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::PgAssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool);
 
             let results = repo
                 .search_similar(query_emb.as_slice(), limit)
