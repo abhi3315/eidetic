@@ -304,8 +304,13 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
                         model = %model_path.display(),
                         "registering CUDA EP (device 0)"
                     );
+                    // error_on_failure: the user explicitly asked for CUDA, so
+                    // a registration failure (missing cuDNN, wrong ORT build,
+                    // no kernels for this GPU) must be an error, not ort's
+                    // default silent fall-back to CPU. Same fail-loudly rule
+                    // as parse_accelerator and EIDETIC_MODEL.
                     builder = builder
-                        .with_execution_providers([CUDA::default().build()])
+                        .with_execution_providers([CUDA::default().build().error_on_failure()])
                         .map_err(|e| Error::ModelLoad(e.to_string()))?;
                 }
                 #[cfg(not(feature = "cuda"))]
