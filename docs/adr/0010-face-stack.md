@@ -33,8 +33,31 @@ Ship **YuNet + SFace as the default**, and make the detector/embedder **pluggabl
 
 This is the same shape as ADR-0008's HEIC decision: the permissive, always-works option is the default; the better-but-encumbered option is available to a user who knowingly opts in. It keeps eidetic's own licence story clean without pretending the accuracy gap doesn't exist.
 
-- **Detection:** `opencv/face_detection_yunet`. Raw ONNX exposes 12 outputs (`cls_/obj_/bbox_/kps_` at strides 8/16/32) — stride decoding and NMS are ours to implement, since we are not going through OpenCV's `FaceDetectorYN` wrapper.
-- **Recognition:** `opencv/face_recognition_sface`, `[1,3,112,112]` → 128-dim, L2-normalised.
+- **Detection:** `opencv/face_detection_yunet`, file `face_detection_yunet_2023mar.onnx`. Stride decoding and NMS are ours to implement, since we are not going through OpenCV's `FaceDetectorYN` wrapper.
+- **Recognition:** `opencv/face_recognition_sface`, file `face_recognition_sface_2021dec.onnx`.
+
+**Measured ONNX signatures** (verified by loading both files through `ort`, rather than trusting the model cards — the YuNet README is inconsistent and mentions a `2026may` file that is not actually published on HuggingFace, and describes `2023mar` as 320×320 when the published file is 640×640):
+
+```
+YuNet   in : input [1,3,640,640] f32   (fixed, not dynamic)
+        out: cls_{8,16,32}  [1,{6400,1600,400},1]
+             obj_{8,16,32}  [1,{6400,1600,400},1]
+             bbox_{8,16,32} [1,{6400,1600,400},4]
+             kps_{8,16,32}  [1,{6400,1600,400},10]
+SFace   in : data  [1,3,112,112] f32
+        out: fc1   [1,128] f32
+```
+
+One anchor per cell, priors at cell centres: 640/8=80 → 80²=6400, 640/16=40 → 1600, 640/32=20 → 400. `kps_*` is 10 values = 5 points × (x,y).
+
+Decode per cell (row-major, `idx = r*cols + c`), matching OpenCV's `FaceDetectorYNImpl::postProcess`:
+
+```
+cx = (c + bbox[0]) * stride      w = exp(bbox[2]) * stride
+cy = (r + bbox[1]) * stride      h = exp(bbox[3]) * stride
+score = sqrt(clamp(cls) * clamp(obj))
+kp_i  = ((c + kps[2i]) * stride, (r + kps[2i+1]) * stride)
+```
 - **Opt-in:** `EIDETIC_FACE_MODEL=buffalo_l` selects `immich-app/buffalo_l` (SCRFD 10G + ArcFace `w600k_r50`, 512-dim). Unknown values are rejected, matching `EIDETIC_MODEL`/`EIDETIC_ACCELERATOR`.
 - Both paths run through `ort`, so the CUDA EP from ADR-0006 applies unchanged.
 
@@ -92,7 +115,8 @@ A full re-cluster then runs as *constrained* clustering: user-pinned faces pre-s
 
 **To verify before relying on it:**
 
-- YuNet `2026may`'s actual output tensor names/layout and keypoint order (the README lists two conflicting accuracy sets; the raw-head keypoint order is documented only for the OpenCV wrapper). Test the real file before trusting the decoder.
+- ~~YuNet's actual output tensor names/layout~~ — **done**, measured above.
+- **Keypoint order is still unconfirmed.** OpenCV's `FaceDetectorYN` documents *right* eye first (`right eye, left eye, nose, right mouth, left mouth`), which means indices 0↔1 and 3↔4 must be swapped to match the ArcFace template. That order is documented for the wrapper, not the raw heads, so it needs confirming on a real face — a silently mirrored alignment would degrade embeddings without any visible error.
 - Whether 128-dim SFace clusters acceptably on a real library. If not, the opt-in stops being optional in practice.
 
 ## Alternatives considered

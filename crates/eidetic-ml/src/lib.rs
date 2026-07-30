@@ -1,7 +1,9 @@
 mod error;
+pub mod face;
 mod siglip;
 
 pub use error::{Error, Result};
+pub use face::{AnalyzedFace, BoundingBox, Detection, FaceAnalyzer, Landmarks};
 pub use siglip::SiglipEmbedder;
 
 /// Register libheif as a decoder hook on the `image` crate.

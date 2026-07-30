@@ -221,7 +221,15 @@ impl SiglipEmbedder {
     }
 }
 
-fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::PathBuf> {
+/// Fetch one file from a HuggingFace repo into the local model cache.
+///
+/// Shared with the face stack (ADR-0010) so both pipelines use one download
+/// and caching path.
+pub(crate) fn download(
+    models_dir: &Path,
+    repo: &str,
+    filename: &str,
+) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
 
     tracing::info!("Loading {filename} from {repo}…");
@@ -237,6 +245,19 @@ fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::
         .map_err(|e| Error::ModelDownload(format!("{filename}: {e}")))?;
 
     Ok(path)
+}
+
+/// Build a session using whichever accelerator `EIDETIC_ACCELERATOR` selects.
+///
+/// The face models (ADR-0010) go through here so they inherit the same CPU /
+/// CUDA / CoreML handling as SigLIP, including the fail-loudly behaviour when
+/// an explicitly requested provider cannot be registered.
+pub(crate) fn session_for_current_accelerator(
+    model_path: &Path,
+    models_dir: &Path,
+) -> Result<Session> {
+    let mode = parse_accelerator(std::env::var("EIDETIC_ACCELERATOR").ok().as_deref())?;
+    build_session(model_path, mode, &models_dir.join("coreml-cache"))
 }
 
 /// Build an ort `Session` from a model file, registering the execution
