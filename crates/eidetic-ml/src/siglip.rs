@@ -49,6 +49,7 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const SEQ_LEN: usize = 64;
 const PAD_TOKEN_ID: i64 = 1;
 
+#[derive(Debug)]
 struct ModelVariant {
     repo: &'static str,
     vision_model: &'static str,
@@ -80,15 +81,43 @@ const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
     embed_dim: 1024,
 };
 
-fn current_variant() -> &'static ModelVariant {
-    match std::env::var("EIDETIC_MODEL").as_deref() {
-        Ok("large") => &SIGLIP2_LARGE_384,
-        _ => &SIGLIP2_BASE_256,
+/// The quality option (ADR-0007). Same shape as `large` — the text model
+/// keeps its weights in an external `.onnx_data` companion — but 400M
+/// params and a 1152-dim embedding. Immich ships this variant for the same
+/// text-to-image job. Not yet the default: ADR-0007 requires the switch be
+/// justified by measured recall from `eidetic eval`, not assumed.
+const SIGLIP2_SO400M_384: ModelVariant = ModelVariant {
+    repo: "onnx-community/siglip2-so400m-patch14-384-ONNX",
+    vision_model: "onnx/vision_model.onnx",
+    text_model: "onnx/text_model.onnx",
+    text_model_data: Some("onnx/text_model.onnx_data"),
+    image_size: 384,
+    embed_dim: 1152,
+};
+
+/// Resolve the `EIDETIC_MODEL` value to a variant.
+///
+/// Unknown values are rejected rather than silently falling back to `base`:
+/// a typo would otherwise produce a whole library of embeddings at the wrong
+/// dimension, which only surfaces much later as empty search results.
+fn variant_for(raw: Option<&str>) -> Result<&'static ModelVariant> {
+    match raw {
+        None | Some("base") => Ok(&SIGLIP2_BASE_256),
+        Some("large") => Ok(&SIGLIP2_LARGE_384),
+        Some("so400m") => Ok(&SIGLIP2_SO400M_384),
+        Some(other) => Err(Error::ModelLoad(format!(
+            "Unknown EIDETIC_MODEL={other:?}; valid values: base, large, so400m"
+        ))),
     }
 }
 
+fn current_variant() -> Result<&'static ModelVariant> {
+    variant_for(std::env::var("EIDETIC_MODEL").ok().as_deref())
+}
+
 /// Produces L2-normalised embeddings for images and text. Variant selected
-/// via `EIDETIC_MODEL` (`base` by default, `large` for the 384-patch model).
+/// via `EIDETIC_MODEL`: `base` (default, 768-dim), `large` (1024-dim), or
+/// `so400m` (1152-dim, best quality).
 pub struct SiglipEmbedder {
     vision_session: Session,
     text_session: Session,
@@ -106,7 +135,7 @@ impl SiglipEmbedder {
         std::fs::create_dir_all(models_dir)
             .map_err(|e| Error::ModelLoad(format!("cannot create models dir: {e}")))?;
 
-        let variant = current_variant();
+        let variant = current_variant()?;
         let vision_path = download(models_dir, variant.repo, variant.vision_model)?;
         // Pre-download the external-data companion (if any) so it sits
         // beside text_model.onnx in the snapshot dir before ort opens it.
@@ -538,6 +567,32 @@ mod tests {
             msg.contains("cpu"),
             "expected error to list valid values, got: {msg}"
         );
+    }
+
+    #[test]
+    fn variant_for_known_values() {
+        assert_eq!(variant_for(None).unwrap().embed_dim, 768);
+        assert_eq!(variant_for(Some("base")).unwrap().embed_dim, 768);
+        assert_eq!(variant_for(Some("large")).unwrap().embed_dim, 1024);
+        assert_eq!(variant_for(Some("so400m")).unwrap().embed_dim, 1152);
+    }
+
+    #[test]
+    fn variant_for_so400m_pulls_external_text_weights() {
+        // The text model ships its weights in a companion file; forgetting to
+        // download it makes ort fail at session load.
+        let v = variant_for(Some("so400m")).unwrap();
+        assert_eq!(v.text_model_data, Some("onnx/text_model.onnx_data"));
+        assert_eq!(v.image_size, 384);
+    }
+
+    #[test]
+    fn variant_for_unknown_value_errors() {
+        // A silent fallback would embed the whole library at the wrong
+        // dimension before anyone noticed.
+        let err = variant_for(Some("so400")).unwrap_err().to_string();
+        assert!(err.contains("so400"), "should echo the bad value: {err}");
+        assert!(err.contains("so400m"), "should list valid values: {err}");
     }
 
     #[test]

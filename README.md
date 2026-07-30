@@ -54,7 +54,7 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_LIBRARY_DIR` | `~/.cache/eidetic/library` | Content-addressable file store |
 | `EIDETIC_MODELS_CACHE` | `~/.cache/eidetic/models` | SigLIP 2 ONNX model cache |
 | `EIDETIC_LOG` | `info,ort=warn` | Log level (trace/debug/info/warn/error). `ort=warn` mutes the CoreML EP's verbose graph-partition output. |
-| `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download) or `large` (1024-dim, 3.6 GB, ~5x slower). |
+| `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download), `large` (1024-dim, 3.6 GB), or `so400m` (1152-dim, best retrieval quality — practical on a GPU). Unknown values are rejected rather than silently falling back. Changing this requires re-embedding the library. |
 | `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider: `cpu`, `cuda`, or `coreml`. `cuda` needs a build with `--features cuda` plus an ONNX Runtime ≥ 1.27 CUDA build at runtime (see [ADR-0006](docs/adr/0006-gpu-execution-provider.md)). CoreML is macOS-only and **does not currently accelerate this workload** — see "Why CoreML is opt-in" below. |
 
 Copy `.env.example` to `.env` and adjust as needed. There is no config file; env vars are the only configuration layer for now.
