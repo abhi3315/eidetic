@@ -8,6 +8,9 @@ use tokenizers::Tokenizer;
 #[cfg(target_os = "macos")]
 use ort::ep::{CoreML, coreml::ComputeUnits};
 
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+use ort::ep::CUDA;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// User did not set `EIDETIC_ACCELERATOR`. Platform default is CPU
@@ -19,20 +22,25 @@ enum Mode {
     Default,
     /// Explicitly requested CoreML. Errors on non-macOS.
     CoreML,
+    /// Explicitly requested CUDA (NVIDIA GPU). Errors on macOS and when the
+    /// binary was built without the `cuda` feature. Requires an ONNX Runtime
+    /// >= 1.27 CUDA build at runtime — see ADR-0006.
+    Cuda,
     /// Explicitly requested CPU. Always valid.
     Cpu,
 }
 
 /// Parse the `EIDETIC_ACCELERATOR` env var. Unknown non-empty values are
-/// rejected so a typo (`metal`, `cuda`, etc.) fails loudly rather than
+/// rejected so a typo (`metal`, `gpu`, etc.) fails loudly rather than
 /// quietly selecting CPU.
 fn parse_accelerator(raw: Option<&str>) -> Result<Mode> {
     match raw {
         None => Ok(Mode::Default),
         Some("coreml") => Ok(Mode::CoreML),
+        Some("cuda") => Ok(Mode::Cuda),
         Some("cpu") => Ok(Mode::Cpu),
         Some(other) => Err(Error::ModelLoad(format!(
-            "Unknown EIDETIC_ACCELERATOR={other:?}; valid values: coreml, cpu"
+            "Unknown EIDETIC_ACCELERATOR={other:?}; valid values: coreml, cuda, cpu"
         ))),
     }
 }
@@ -213,49 +221,82 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
 
     #[cfg(target_os = "macos")]
     {
-        if matches!(mode, Mode::CoreML) {
-            std::fs::create_dir_all(coreml_cache_dir).map_err(|e| {
-                Error::ModelLoad(format!(
-                    "cannot create CoreML cache dir {}: {e}",
-                    coreml_cache_dir.display()
-                ))
-            })?;
-            tracing::info!(
-                accelerator = "coreml",
-                model = %model_path.display(),
-                cache = %coreml_cache_dir.display(),
-                "registering CoreML EP (NeuralNetwork, ComputeUnits::All)"
-            );
-            builder = builder
-                .with_execution_providers([CoreML::default()
-                    .with_compute_units(ComputeUnits::All)
-                    .with_model_cache_dir(coreml_cache_dir.display().to_string())
-                    .build()])
-                .map_err(|e| Error::ModelLoad(e.to_string()))?;
-        } else {
-            tracing::info!(
-                accelerator = "cpu",
-                model = %model_path.display(),
-                "using CPU EP"
-            );
+        match mode {
+            Mode::Cuda => {
+                return Err(Error::ModelLoad(
+                    "EIDETIC_ACCELERATOR=cuda requested on macOS host (CUDA is non-macOS only)"
+                        .into(),
+                ));
+            }
+            Mode::CoreML => {
+                std::fs::create_dir_all(coreml_cache_dir).map_err(|e| {
+                    Error::ModelLoad(format!(
+                        "cannot create CoreML cache dir {}: {e}",
+                        coreml_cache_dir.display()
+                    ))
+                })?;
+                tracing::info!(
+                    accelerator = "coreml",
+                    model = %model_path.display(),
+                    cache = %coreml_cache_dir.display(),
+                    "registering CoreML EP (NeuralNetwork, ComputeUnits::All)"
+                );
+                builder = builder
+                    .with_execution_providers([CoreML::default()
+                        .with_compute_units(ComputeUnits::All)
+                        .with_model_cache_dir(coreml_cache_dir.display().to_string())
+                        .build()])
+                    .map_err(|e| Error::ModelLoad(e.to_string()))?;
+            }
+            Mode::Default | Mode::Cpu => {
+                tracing::info!(
+                    accelerator = "cpu",
+                    model = %model_path.display(),
+                    "using CPU EP"
+                );
+            }
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        if matches!(mode, Mode::CoreML) {
-            return Err(Error::ModelLoad(
-                "EIDETIC_ACCELERATOR=coreml requested on non-macOS host".into(),
-            ));
+        let _ = coreml_cache_dir;
+        match mode {
+            Mode::CoreML => {
+                return Err(Error::ModelLoad(
+                    "EIDETIC_ACCELERATOR=coreml requested on non-macOS host".into(),
+                ));
+            }
+            Mode::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    tracing::info!(
+                        accelerator = "cuda",
+                        model = %model_path.display(),
+                        "registering CUDA EP (device 0)"
+                    );
+                    builder = builder
+                        .with_execution_providers([CUDA::default().build()])
+                        .map_err(|e| Error::ModelLoad(e.to_string()))?;
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(Error::ModelLoad(
+                        "EIDETIC_ACCELERATOR=cuda requested but this binary was built without \
+                         the `cuda` feature (rebuild with --features cuda)"
+                            .into(),
+                    ));
+                }
+            }
+            Mode::Default | Mode::Cpu => {
+                // ort always builds in the CPU EP; nothing to register.
+                tracing::info!(
+                    accelerator = "cpu",
+                    model = %model_path.display(),
+                    "using CPU EP"
+                );
+            }
         }
-        // Default and Cpu both mean CPU EP on non-macOS; no registration needed
-        // because ort always builds in the CPU EP.
-        let _ = (mode, coreml_cache_dir);
-        tracing::info!(
-            accelerator = "cpu",
-            model = %model_path.display(),
-            "using CPU EP"
-        );
     }
 
     builder
@@ -472,6 +513,7 @@ mod tests {
     fn parse_accelerator_happy_paths() {
         assert_eq!(parse_accelerator(None).unwrap(), Mode::Default);
         assert_eq!(parse_accelerator(Some("coreml")).unwrap(), Mode::CoreML);
+        assert_eq!(parse_accelerator(Some("cuda")).unwrap(), Mode::Cuda);
         assert_eq!(parse_accelerator(Some("cpu")).unwrap(), Mode::Cpu);
     }
 
@@ -485,6 +527,10 @@ mod tests {
         );
         assert!(
             msg.contains("coreml"),
+            "expected error to list valid values, got: {msg}"
+        );
+        assert!(
+            msg.contains("cuda"),
             "expected error to list valid values, got: {msg}"
         );
         assert!(

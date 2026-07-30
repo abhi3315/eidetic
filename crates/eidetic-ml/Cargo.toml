@@ -7,6 +7,15 @@ license.workspace = true
 authors.workspace = true
 description = "ML inference for Eidetic: image and face embeddings via ONNX."
 
+[features]
+default = []
+# NVIDIA GPU acceleration via ONNX Runtime's CUDA execution provider (non-macOS).
+# Requires an ONNX Runtime >= 1.27 CUDA build supplied at runtime via
+# `ORT_DYLIB_PATH` (load-dynamic linking), plus CUDA 13 runtime + cuDNN 9 on the
+# host. The bundled ORT (download-binaries) is 1.23.x and lacks Blackwell/sm_120
+# kernels. See docs/adr/0006-gpu-execution-provider.md.
+cuda = ["ort/cuda", "ort/load-dynamic"]
+
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
 thiserror = { workspace = true }
