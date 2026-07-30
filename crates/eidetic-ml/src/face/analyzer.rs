@@ -338,4 +338,97 @@ mod tests {
         l2_normalize(&mut v);
         assert!(v.iter().all(|&x| x == 0.0));
     }
+
+    /// End-to-end check against a real photograph.
+    ///
+    /// This is the test that validates the two assumptions unit tests cannot:
+    /// the BGR / raw-0-255 input convention, and the landmark ordering. Both
+    /// fail *silently* — a mirrored alignment or swapped channels still produce
+    /// a well-formed embedding, just a worse one — so the only way to catch
+    /// them is to require plausible geometry on a known face.
+    #[test]
+    #[ignore = "requires face models + a photo; set EIDETIC_MODELS_CACHE and EIDETIC_FACE_TEST_IMAGE"]
+    fn detects_and_embeds_a_real_face() {
+        let models_dir = std::env::var("EIDETIC_MODELS_CACHE")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_MODELS_CACHE");
+        let image_path = std::env::var("EIDETIC_FACE_TEST_IMAGE")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_FACE_TEST_IMAGE=/path/to/portrait.jpg");
+
+        let image = image::ImageReader::open(&image_path)
+            .expect("open test image")
+            .with_guessed_format()
+            .expect("guess format")
+            .decode()
+            .expect("decode test image");
+
+        let mut analyzer = FaceAnalyzer::load(&models_dir).expect("load face models");
+        let faces = analyzer.analyze(&image).expect("analyze");
+
+        assert!(
+            !faces.is_empty(),
+            "no face found in {} — suggests the input convention (BGR vs RGB, \
+             0-255 vs normalised) or the stride decode is wrong",
+            image_path.display()
+        );
+
+        let face = &faces[0];
+        println!(
+            "detected {} face(s); best score {:.3} bbox {:?}",
+            faces.len(),
+            face.detection.score,
+            face.detection.bbox
+        );
+
+        // Embedding shape and normalisation.
+        assert_eq!(face.embedding.len(), analyzer.embed_dim());
+        let norm: f32 = face.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "embedding not unit-norm: {norm}");
+
+        // Geometry sanity: the box must sit inside the frame and be a plausible
+        // size, which catches a decode that forgot to undo the letterbox scale.
+        let b = face.detection.bbox;
+        assert!(
+            b.x > -b.width && b.y > -b.height,
+            "bbox starts far outside the frame: {b:?}"
+        );
+        assert!(
+            b.width < image.width() as f32 * 1.5 && b.height < image.height() as f32 * 1.5,
+            "bbox larger than the image, letterbox scale likely not undone: {b:?}"
+        );
+        assert!(b.max_side() >= MIN_FACE_PIXELS);
+
+        // Landmark ordering: for any roughly upright portrait the subject's
+        // right eye appears on the LEFT of the frame, so `right_eye.x` must be
+        // the smaller value. This is the assertion that catches a mirrored
+        // alignment, which is otherwise invisible.
+        let lm = face.detection.landmarks;
+        println!(
+            "landmarks: right_eye {:?} left_eye {:?} nose {:?}",
+            lm.right_eye, lm.left_eye, lm.nose
+        );
+        assert!(
+            lm.right_eye.0 < lm.left_eye.0,
+            "subject's right eye should sit at a smaller x than the left eye; \
+             got right={:?} left={:?} — keypoint order is probably swapped",
+            lm.right_eye,
+            lm.left_eye
+        );
+        // Eyes above nose, nose above mouth, in image coordinates.
+        assert!(
+            lm.right_eye.1 < lm.nose.1 && lm.left_eye.1 < lm.nose.1,
+            "eyes should be above the nose: eyes {:?}/{:?} nose {:?}",
+            lm.right_eye,
+            lm.left_eye,
+            lm.nose
+        );
+        assert!(
+            lm.nose.1 < lm.left_mouth.1 && lm.nose.1 < lm.right_mouth.1,
+            "nose should be above the mouth: nose {:?} mouth {:?}/{:?}",
+            lm.nose,
+            lm.left_mouth,
+            lm.right_mouth
+        );
+    }
 }

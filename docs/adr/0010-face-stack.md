@@ -113,11 +113,23 @@ A full re-cluster then runs as *constrained* clustering: user-pinned faces pre-s
 - We own YuNet's stride decoding and NMS, because we bypass OpenCV's wrapper. More code than calling a library, and it needs testing against the real ONNX output.
 - Known-unfixable failure modes, consistent across every project surveyed: infants cluster across *different* children and drift as they age; siblings and twins often cannot be separated at all; the same adult across 15+ years usually splits. Face grouping will need user correction — which is why the constraint model above is load-bearing rather than a nice-to-have.
 
-**To verify before relying on it:**
+**Verified end-to-end (2026-07-30)** against a real portrait, via the
+`detects_and_embeds_a_real_face` ignored test:
 
-- ~~YuNet's actual output tensor names/layout~~ — **done**, measured above.
-- **Keypoint order is still unconfirmed.** OpenCV's `FaceDetectorYN` documents *right* eye first (`right eye, left eye, nose, right mouth, left mouth`), which means indices 0↔1 and 3↔4 must be swapped to match the ArcFace template. That order is documented for the wrapper, not the raw heads, so it needs confirming on a real face — a silently mirrored alignment would degrade embeddings without any visible error.
-- Whether 128-dim SFace clusters acceptably on a real library. If not, the opt-in stops being optional in practice.
+```
+1 face, score 0.946, bbox x=982 y=229 w=657 h=914
+right_eye (1163, 568)  left_eye (1493, 561)  nose (1328, 738)
+```
+
+That single run closes both of the assumptions unit tests cannot reach:
+
+- **Input convention** — BGR with raw 0-255 values and no mean/std normalisation, matching OpenCV. A wrong channel order or missing normalisation would not detect at 0.946.
+- **Keypoint order** — the subject's right eye lands at a smaller x than the left, and the nose sits horizontally between them, so YuNet really is right-eye-first and the reorder in `Landmarks::from_yunet_order` is correct. This mattered because a mirrored alignment produces a perfectly well-formed *worse* embedding, with no error to notice.
+- Also confirms the stride decode and the letterbox scale inverse, since the box comes back in original-image coordinates at a plausible size.
+
+**Still to verify:**
+
+- Whether 128-dim SFace clusters acceptably on a real library. If not, the opt-in stops being optional in practice. This can only be answered by running the clustering over a real photo collection.
 
 ## Alternatives considered
 
