@@ -19,7 +19,9 @@ Add a CUDA execution provider, but **pin the ONNX Runtime version explicitly and
 - **Require ONNX Runtime ≥ 1.27 built for CUDA 13**, provided at build/run time, with CUDA 13 runtime + cuDNN 9 present.
 - TensorRT EP is available in the same build as an alternative; DirectML is the vendor-agnostic option on Windows.
 
-**Verification (2026-07-23, on the actual card):** ONNX Runtime 1.27.0 (CUDA-13 build) runs on the 5070 Ti — a chained-MatMul microbenchmark measured **8.2× faster than CPU** (11.2 ms → 1.4 ms), `CUDAExecutionProvider` active, `TensorrtExecutionProvider` also available. So sm_120 works; the constraint was purely the ORT version `ort` bundles. This was proven via Python `onnxruntime-gpu`; **still open (V-gate before flipping the default to CUDA):** the Rust `ort` crate linking 1.27, and the real SigLIP end-to-end number via `eidetic eval`.
+**Verification (2026-07-23, on the actual card):** ONNX Runtime 1.27.0 (CUDA-13 build) runs on the 5070 Ti — a chained-MatMul microbenchmark measured **8.2× faster than CPU** (11.2 ms → 1.4 ms), `CUDAExecutionProvider` active, `TensorrtExecutionProvider` also available. So sm_120 works; the constraint was purely the ORT version `ort` bundles. This was proven via Python `onnxruntime-gpu`.
+
+**Rust V-gate closed (2026-07-30, on the actual card):** the Rust path works end-to-end. Built `eidetic-ml --features cuda`, pointed `ORT_DYLIB_PATH` at ONNX Runtime 1.27.0 **gpu_cuda12** (this host's runtime is CUDA 12) with cuDNN 9 on `LD_LIBRARY_PATH`, and ran the real SigLIP embed test with the CUDA EP registered via `.error_on_failure()` — pass therefore proves genuine CUDA registration, not a silent CPU fallback. Negative test: removing cuDNN from the loader path makes the same request fail loudly with `libcudnn.so.9: cannot open shared object file`. Note both ORT GPU flavours work on this card (cuda12 build under Rust, cuda13 build under Python — the driver supports both). **Still open before flipping any default:** the throughput number via `eidetic eval` (single-image latency is startup-dominated and meaningless as a benchmark).
 
 ## Consequences
 
