@@ -1,0 +1,115 @@
+# ADR-0010: Face stack = YuNet + SFace by default, InsightFace opt-in
+
+Date: 2026-07-30
+Status: accepted
+
+## Context
+
+`goals.md` lists face grouping as the next phase, and `AGENTS.md` has recorded the intended stack as **SCRFD + ArcFace via `ort`** since the beginning. Before writing code, that plan was checked against two questions: is it still the right choice in 2026, and may this project actually use it?
+
+The accuracy answer is yes — SCRFD + ArcFace is still the leader, and it is what every comparable self-hosted photo app ships (Immich `buffalo_l`, PhotoPrism SCRFD 0.5g, LibrePhotos `buffalo_sc`).
+
+The licensing answer is **no**, and it changes the decision. InsightFace states plainly that while its *code* is MIT, "the training data containing the annotation (and the models trained with these data) are available for **non-commercial research purposes only**." That covers SCRFD, ArcFace, every `buffalo_*` pack, and `antelopev2`. Immich's own ML README records that Jia Guo granted them permission by email on 2023-03-18 and adds that "this permission does not extend to the redistribution or commercial use of their models by third parties" — so it is not transferable to eidetic. Every project surveyed ships this stack; every one of them ignores the licence.
+
+The obvious alternatives are worse, not better:
+
+| Candidate | Licence problem |
+|---|---|
+| YOLOv8 / YOLOv11-face | **AGPL-3.0**, and Ultralytics asserts trained weights are AGPL derivatives |
+| YOLO5Face (what Ente ships) | GPL-3.0 |
+| EdgeFace | CC-BY-NC-SA-4.0 (non-commercial *and* share-alike) |
+| AdaFace, LVFace | MIT code, but research-only data lineage; no first-party ONNX export |
+
+There is exactly one clean permissive pair, both from OpenCV Zoo and both already on HuggingFace under the `opencv` org:
+
+- **YuNet** — MIT. Detection, bbox + 5 landmarks.
+- **SFace** — Apache-2.0. Recognition, 128-dim embedding.
+
+No permissively-licensed detector newer or better than YuNet surfaced for 2026.
+
+## Decision
+
+Ship **YuNet + SFace as the default**, and make the detector/embedder **pluggable** so InsightFace `buffalo_l` is an opt-in the user chooses and downloads themselves, with a licence notice at download time.
+
+This is the same shape as ADR-0008's HEIC decision: the permissive, always-works option is the default; the better-but-encumbered option is available to a user who knowingly opts in. It keeps eidetic's own licence story clean without pretending the accuracy gap doesn't exist.
+
+- **Detection:** `opencv/face_detection_yunet`. Raw ONNX exposes 12 outputs (`cls_/obj_/bbox_/kps_` at strides 8/16/32) — stride decoding and NMS are ours to implement, since we are not going through OpenCV's `FaceDetectorYN` wrapper.
+- **Recognition:** `opencv/face_recognition_sface`, `[1,3,112,112]` → 128-dim, L2-normalised.
+- **Opt-in:** `EIDETIC_FACE_MODEL=buffalo_l` selects `immich-app/buffalo_l` (SCRFD 10G + ArcFace `w600k_r50`, 512-dim). Unknown values are rejected, matching `EIDETIC_MODEL`/`EIDETIC_ACCELERATOR`.
+- Both paths run through `ort`, so the CUDA EP from ADR-0006 applies unchanged.
+
+### Alignment (mandatory)
+
+Every recognition model here expects a **similarity-transformed** 112×112 crop, not a raw bbox crop; skipping alignment costs several points of verification accuracy. The step is:
+
+1. Take the detector's 5 landmarks. Order them **left eye, right eye, nose, left mouth, right mouth** — YuNet emits right-eye-first and must be reordered.
+2. Solve the least-squares similarity transform (rotation + uniform scale + translation, 4 DoF — the Umeyama estimate) onto the standard ArcFace template:
+   `[[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]]`
+3. Warp to 112×112 with bilinear sampling.
+4. Normalise `(px - 127.5) / 128.0`, NCHW.
+
+The `image` crate has no affine warp. Use `imageproc::geometric_transformations::warp` with `Projection::from_matrix` built from our own 3×3 — **not** `from_control_points`, which fits a 4-point projective homography (wrong transform class; it shears faces).
+
+### Clustering
+
+Hand-rolled, ~200-300 lines, no new dependencies:
+
+- **Incremental assignment** on import: compare each new face against stored **exemplars of confirmed people** (2-5 medoids per person, *not* a single centroid — a centroid drifts badly as someone ages). Attach at cosine distance ≤ **0.5**.
+- **Periodic full pass** over the unassigned pool only, using Chinese Whispers on a kNN graph at ≤ **0.4**, minting a person when a component has ≥ **3** members.
+- Thresholds are configurable. 0.5 / 0.4 / 3 are Immich's shipped `maxDistance` / tuned-library value / `minFaces`; PhotoPrism independently caps cluster radius at 0.42, which corroborates the range. There is no authoritative upstream threshold, so these are starting points to tune, not constants.
+- **Filter by face quality before clustering** (detector score, pixel size, blur) and never let a low-quality face seed a cluster. Both PhotoPrism and Ente do this; it is the main defence against false bridges.
+
+`petal-clustering` and `linfa-clustering` were considered and rejected. Both are maintained and could take a cosine metric, but they drag `ndarray`/`rayon`/`petal-neighbors` (with an `ndarray` version-conflict risk against the ML path) and — decisively — **neither supports the must-link / must-not-link constraints below**, which are the most valuable part of the design.
+
+### User corrections are durable facts, not cluster state
+
+The whole point: a re-cluster must always be safe to run. Immich's documented full reset "deletes all previously assigned names" — that is the failure to avoid. So:
+
+- naming → a `persons` row, survives trivially
+- "this face is Alice" → face pinned `assignment_source = 'user'`, frozen as an exemplar and a seed; **never re-assigned**
+- "not Alice" → a negative constraint row the assigner must consult and re-clustering must honour
+- merge → a merge/alias edge, so a later re-split gets re-merged
+- split → a must-not-link constraint between the seed faces
+
+A full re-cluster then runs as *constrained* clustering: user-pinned faces pre-seeded, must-link/must-not-link applied to the graph before propagation.
+
+## Consequences
+
+**Good:**
+
+- eidetic's licence story stays clean and self-consistent; no reliance on a permission granted to somebody else.
+- Same pluggable-default pattern as ADR-0008, so the codebase has one way of handling "permissive default, encumbered opt-in".
+- Alignment and clustering code is identical for both model pairs, so the opt-in is a model swap rather than a second pipeline.
+- Reuses what ADR-0005 and ADR-0006 already built: the separate-embeddings-table shape, the `VectorIndex` trait, and the verified CUDA EP.
+- At personal scale the incremental path compares one face against ~100-500 exemplars — microseconds of exact brute force. No ANN index needed, and none of this changes the storage decision.
+
+**Bad / accepted:**
+
+- **SFace is meaningfully weaker than ArcFace `w600k_r50`**, and 128-dim gives less separation headroom than 512-dim at large gallery sizes. YuNet is also weaker on very large close-up faces and >90° rotations (trained for ~10-300 px faces). Expect more merge/split corrections on the default stack than Immich users see. This is the price of the licence, stated plainly; the opt-in exists for anyone who'd rather pay a different price.
+- Two model pairs to keep working, with different embedding dimensions. Mitigated by storing `dim` per row (same as the `embeddings` table) so a model change is detectable rather than silently mixing widths.
+- We own YuNet's stride decoding and NMS, because we bypass OpenCV's wrapper. More code than calling a library, and it needs testing against the real ONNX output.
+- Known-unfixable failure modes, consistent across every project surveyed: infants cluster across *different* children and drift as they age; siblings and twins often cannot be separated at all; the same adult across 15+ years usually splits. Face grouping will need user correction — which is why the constraint model above is load-bearing rather than a nice-to-have.
+
+**To verify before relying on it:**
+
+- YuNet `2026may`'s actual output tensor names/layout and keypoint order (the README lists two conflicting accuracy sets; the raw-head keypoint order is documented only for the OpenCV wrapper). Test the real file before trusting the decoder.
+- Whether 128-dim SFace clusters acceptably on a real library. If not, the opt-in stops being optional in practice.
+
+## Alternatives considered
+
+- **SCRFD + ArcFace as the default** (the original `AGENTS.md` plan). Rejected on licence: non-commercial research only, and Immich's permission is explicitly non-transferable. Retained as the opt-in.
+- **YOLO-family detectors.** Rejected: AGPL-3.0/GPL-3.0 weights are worse for a permissive project than non-commercial ones.
+- **MediaPipe BlazeFace** (Apache-2.0, so licence-clean). Rejected: poor on small faces, which is most faces in a real photo library, and it emits 6 keypoints rather than the 5 the alignment template expects.
+- **A clustering crate.** Rejected — see above; no constraint support is the deciding factor.
+- **HDBSCAN.** Rejected: solves a variable-density problem we don't have, hardest to make incremental, and its `min_cluster_size` behaviour swallows the many-singleton case (background strangers) unpredictably. LibrePhotos uses it and cluster quality is a common complaint.
+
+## References
+
+- InsightFace licence: https://github.com/deepinsight/insightface
+- Immich ML README (the non-transferable permission): https://github.com/immich-app/immich/blob/main/machine-learning/README.md
+- YuNet (MIT): https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/README.md · https://huggingface.co/opencv/face_detection_yunet
+- SFace (Apache-2.0): https://huggingface.co/opencv/face_recognition_sface
+- ArcFace alignment template: https://github.com/deepinsight/insightface/issues/1154
+- Immich thresholds: https://docs.immich.app/features/facial-recognition/ · https://docs.immich.app/guides/better-facial-clusters/
+- PhotoPrism face pipeline: https://github.com/photoprism/photoprism/blob/develop/internal/ai/face/README.md
+- Ultralytics licence (AGPL on trained weights): https://www.ultralytics.com/license
