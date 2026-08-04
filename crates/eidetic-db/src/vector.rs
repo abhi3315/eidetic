@@ -68,7 +68,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Encode an embedding for storage as a little-endian f32 blob.
-pub(crate) fn encode(vector: &[f32]) -> Vec<u8> {
+pub fn encode(vector: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vector.len() * 4);
     for value in vector {
         out.extend_from_slice(&value.to_le_bytes());
@@ -80,7 +80,7 @@ pub(crate) fn encode(vector: &[f32]) -> Vec<u8> {
 ///
 /// Returns `None` if the blob length isn't a whole number of f32s, which can
 /// only happen if something outside this crate wrote the column.
-pub(crate) fn decode(blob: &[u8]) -> Option<Vec<f32>> {
+pub fn decode(blob: &[u8]) -> Option<Vec<f32>> {
     if !blob.len().is_multiple_of(4) {
         return None;
     }

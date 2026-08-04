@@ -8,4 +8,4 @@ pub mod geocoder;
 pub mod ids;
 
 pub use config::{Config, Paths};
-pub use ids::{AssetId, Sha256};
+pub use ids::{AssetId, FaceId, PersonId, Sha256};

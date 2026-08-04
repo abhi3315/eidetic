@@ -1,40 +1,62 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Strongly-typed identifier for an asset (photo or video).
+/// Define a UUID newtype.
 ///
-/// Wrapping `Uuid` in a newtype makes it impossible to mix up an `AssetId`
-/// with (eventually) a `PersonId` or `FaceId` at the type level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AssetId(Uuid);
+/// The three entity ids are byte-identical in behaviour and differ only in
+/// which table they point at, so they share one definition rather than three
+/// copies. The point of the newtypes is the type-level distinction: passing a
+/// `PersonId` where a `FaceId` belongs must not compile.
+macro_rules! uuid_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(Uuid);
 
-impl AssetId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
 
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
+            pub fn as_uuid(&self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(id: Uuid) -> Self {
+                Self(id)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
 }
 
-impl Default for AssetId {
-    fn default() -> Self {
-        Self::new()
-    }
+uuid_newtype! {
+    /// Strongly-typed identifier for an asset (photo or video).
+    AssetId
 }
 
-impl From<Uuid> for AssetId {
-    fn from(id: Uuid) -> Self {
-        Self(id)
-    }
+uuid_newtype! {
+    /// One detected face in one asset (ADR-0010).
+    FaceId
 }
 
-impl std::fmt::Display for AssetId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+uuid_newtype! {
+    /// A person: a named cluster of faces (ADR-0010).
+    PersonId
 }
 
 /// A verified SHA-256 digest.
@@ -84,6 +106,16 @@ mod tests {
         let a = AssetId::new();
         let b = AssetId::new();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn face_and_person_ids_are_unique_and_round_trip() {
+        assert_ne!(FaceId::new(), FaceId::new());
+        assert_ne!(PersonId::new(), PersonId::new());
+
+        let f = FaceId::new();
+        assert_eq!(FaceId::from(f.as_uuid()), f);
+        assert_eq!(f.to_string(), f.as_uuid().to_string());
     }
 
     #[test]

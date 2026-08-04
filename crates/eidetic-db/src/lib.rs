@@ -17,6 +17,9 @@ pub use assets::{
     AssetDetail, AssetsRepo, InsertOutcome, LibraryStats, NewAsset, RecentAsset, SearchResult,
 };
 
+pub mod faces;
+pub use faces::{FaceEmbedding, FacesRepo, NewFace, Person};
+
 pub mod vector;
 pub use vector::{BruteForce, VectorIndex};
 
