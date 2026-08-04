@@ -17,6 +17,9 @@ pub use assets::{
     AssetDetail, AssetsRepo, InsertOutcome, LibraryStats, NewAsset, RecentAsset, SearchResult,
 };
 
+pub mod cluster;
+pub use cluster::{ClusterParams, Constraints, Face, PersonExemplars, ProposedPerson};
+
 pub mod faces;
 pub use faces::{FaceEmbedding, FacesRepo, NewFace, Person};
 
