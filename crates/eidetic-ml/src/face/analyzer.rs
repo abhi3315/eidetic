@@ -136,6 +136,16 @@ impl FaceAnalyzer {
         self.pair.embed_dim
     }
 
+    /// Decode the file at `path` and analyze it.
+    ///
+    /// Uses the same loader as [`crate::SiglipEmbedder::embed`], so HEIC, DNG
+    /// and EXIF rotation behave identically for face detection and for
+    /// semantic search.
+    pub fn analyze_path(&mut self, path: &Path) -> Result<Vec<AnalyzedFace>> {
+        let image = crate::image_io::load_oriented_image(path)?;
+        self.analyze(&image)
+    }
+
     /// Detect every face in `image`, align it, and embed it.
     ///
     /// Faces below the size floor are dropped: a 20px face produces an

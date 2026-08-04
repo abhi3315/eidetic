@@ -18,6 +18,14 @@ Written in Rust.
   - `--limit N`: number of results (default 10)
   - `--fields score,date,path`: tab-separated column output
   - `--json`: full JSON array
+- `eidetic faces`: detect faces in imported images, then group them into people
+  - Detection is YuNet, embedding is AuraFace (512-dim) by default — both permissively licensed, see [ADR-0010](docs/adr/0010-face-stack.md)
+  - `EIDETIC_FACE_MODEL`: `auraface` (default), `sface` (smaller/faster, 128-dim), or `buffalo_l` (InsightFace; better accuracy but **non-commercial weights** you download yourself)
+  - `--cluster-only`: re-run grouping over already-detected faces without scanning again
+  - A face joins an existing person when it's close enough; leftovers are grouped into new candidates once at least 3 agree
+  - Your corrections are durable: naming, merges and splits are stored as constraints, so re-running clustering never discards them
+- `eidetic persons`: list grouped people with face counts
+- `eidetic name-person <id> <name>`: name a person
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>`: SHA-256 a file, no setup needed
 - `eidetic eval --coco-csv <path> --coco-images <dir> [--limit N]`: text-to-image retrieval eval on the COCO 5K Karpathy split. Reports R@1/5/10 + MRR; bypasses the database.
@@ -53,7 +61,7 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_DATABASE_PATH` | `~/.cache/eidetic/eidetic.db` | SQLite database file. Created on first run; no server process. |
 | `EIDETIC_LIBRARY_DIR` | `~/.cache/eidetic/library` | Content-addressable file store |
 | `EIDETIC_MODELS_CACHE` | `~/.cache/eidetic/models` | SigLIP 2 ONNX model cache |
-| `EIDETIC_LOG` | `info,ort=warn` | Log level (trace/debug/info/warn/error). `ort=warn` mutes the CoreML EP's verbose graph-partition output. |
+| `EIDETIC_LOG` | `info,ort=error` | Log level (trace/debug/info/warn/error). `ort=error` mutes ONNX Runtime's non-actionable noise — CoreML graph partitioning, and the per-initializer warnings some model exports emit. Real ort failures still surface. |
 | `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download), `large` (1024-dim, 3.6 GB), or `so400m` (1152-dim, best retrieval quality — practical on a GPU). Unknown values are rejected rather than silently falling back. Changing this requires re-embedding the library. |
 | `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider: `cpu`, `cuda`, or `coreml`. `cuda` needs a build with `--features cuda` plus an ONNX Runtime ≥ 1.27 CUDA build at runtime (see [ADR-0006](docs/adr/0006-gpu-execution-provider.md)). CoreML is macOS-only and **does not currently accelerate this workload** — see "Why CoreML is opt-in" below. |
 

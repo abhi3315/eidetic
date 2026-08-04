@@ -1,5 +1,6 @@
 mod error;
 pub mod face;
+pub mod image_io;
 mod siglip;
 
 pub use error::{Error, Result};

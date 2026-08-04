@@ -37,6 +37,25 @@ enum Command {
     Embed,
     /// Generate missing thumbnails for previously-imported images.
     Thumbnail,
+    /// Detect and group faces in imported images.
+    ///
+    /// Runs detection over images not yet scanned, then clusters: each new face
+    /// joins an existing person if it is close enough, and the remaining
+    /// unassigned faces are grouped into new candidate people.
+    Faces {
+        /// Skip detection and only re-run clustering over stored faces.
+        #[arg(long)]
+        cluster_only: bool,
+    },
+    /// List grouped people and their face counts.
+    Persons,
+    /// Give a person a name, so their faces stop being an unnamed candidate.
+    NamePerson {
+        /// Person UUID, as shown by `eidetic persons`.
+        id: String,
+        /// The name to assign.
+        name: String,
+    },
     /// Start the HTTP server (localhost-bound).
     Serve {
         /// Address to bind. Defaults to 127.0.0.1:8080.
@@ -149,7 +168,11 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .and_then(|s| EnvFilter::try_new(&s).ok())
-        .unwrap_or_else(|| EnvFilter::new("info,ort=warn"));
+        // `ort=error` rather than `ort=warn`: ONNX Runtime emits a warning per
+        // graph initializer for some exports (SFace produces eight on every
+        // load) and CoreML logs its graph partitioning. Neither is actionable
+        // by the user. Real ort failures are logged at error and still show.
+        .unwrap_or_else(|| EnvFilter::new("info,ort=error"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
@@ -423,6 +446,161 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Command::Faces { cluster_only } => {
+            let config = Config::from_env();
+            let models_dir = config.paths.models_cache.clone();
+
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let faces_repo = eidetic_db::FacesRepo::new(pool);
+
+            if !cluster_only {
+                let pending = faces_repo
+                    .fetch_undetected()
+                    .await
+                    .context("failed to fetch undetected assets")?;
+
+                if pending.is_empty() {
+                    println!("No new images to scan.");
+                } else {
+                    println!("Loading face models (downloads on first run)…");
+
+                    // Same worker shape as `embed`: the blocking thread owns the
+                    // models, the async loop feeds it paths one at a time.
+                    // Capacity 1 keeps the worker in lockstep with the DB
+                    // writes, so no queue builds up if storage stalls.
+                    type FaceJob = (
+                        PathBuf,
+                        oneshot::Sender<eidetic_ml::Result<Vec<eidetic_ml::AnalyzedFace>>>,
+                    );
+                    let (job_tx, mut job_rx) = mpsc::channel::<FaceJob>(1);
+
+                    let worker = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<()> {
+                        let mut analyzer = eidetic_ml::FaceAnalyzer::load(&models_dir)?;
+                        while let Some((path, reply)) = job_rx.blocking_recv() {
+                            let _ = reply.send(analyzer.analyze_path(&path));
+                        }
+                        Ok(())
+                    });
+
+                    let total = pending.len();
+                    println!("Scanning {total} images for faces");
+
+                    let (mut scanned, mut found, mut failed) = (0u32, 0u32, 0u32);
+                    for (i, (asset_id, path)) in pending.into_iter().enumerate() {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        if job_tx.send((path.clone(), reply_tx)).await.is_err() {
+                            break;
+                        }
+                        let result = reply_rx
+                            .await
+                            .context("face worker panicked or died mid-job")?;
+
+                        match result {
+                            Ok(analyzed) => {
+                                let new_faces: Vec<_> = analyzed
+                                    .iter()
+                                    .map(|f| eidetic_db::NewFace {
+                                        asset_id,
+                                        bbox: (
+                                            f.detection.bbox.x,
+                                            f.detection.bbox.y,
+                                            f.detection.bbox.width,
+                                            f.detection.bbox.height,
+                                        ),
+                                        landmarks: f.detection.landmarks.as_template_order(),
+                                        score: f.detection.score,
+                                        embedding: f.embedding.clone(),
+                                    })
+                                    .collect();
+
+                                match faces_repo.record_detection(asset_id, &new_faces).await {
+                                    Ok(_) => {
+                                        println!(
+                                            "[{}/{}] {} — {} face(s)",
+                                            i + 1,
+                                            total,
+                                            path.display(),
+                                            new_faces.len()
+                                        );
+                                        scanned += 1;
+                                        found += new_faces.len() as u32;
+                                    }
+                                    Err(e) => {
+                                        // No detection run recorded, so this
+                                        // asset is retried on the next pass.
+                                        eprintln!("  failed to store {}: {e}", path.display());
+                                        failed += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  skipped {}: {e}", path.display());
+                                failed += 1;
+                            }
+                        }
+                    }
+
+                    drop(job_tx);
+                    worker
+                        .await
+                        .context("face worker thread panicked")?
+                        .context("failed to load face models; check your connection and that the model cache is intact")?;
+
+                    println!("Scanned {scanned} images, found {found} faces, failed {failed}.");
+                }
+            }
+
+            let summary = cluster_faces(&faces_repo).await?;
+            println!(
+                "Clustering: {} face(s) joined an existing person, {} new person(s) proposed, \
+                 {} face(s) still unassigned.",
+                summary.attached, summary.new_people, summary.unassigned
+            );
+            if summary.new_people > 0 {
+                println!(
+                    "Run `eidetic persons` to see them, then `eidetic name-person <id> <name>`."
+                );
+            }
+        }
+
+        Command::Persons => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::FacesRepo::new(pool);
+
+            let people = repo
+                .list_persons()
+                .await
+                .context("failed to list persons")?;
+            if people.is_empty() {
+                println!("No people yet. Run `eidetic faces` first.");
+                return Ok(());
+            }
+            for p in people {
+                let name = p.name.unwrap_or_else(|| "(unnamed)".to_string());
+                println!("{}\t{}\t{} face(s)", p.id, name, p.face_count);
+            }
+        }
+
+        Command::NamePerson { id, name } => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::FacesRepo::new(pool);
+
+            let uuid = uuid::Uuid::parse_str(&id)
+                .with_context(|| format!("{id:?} is not a valid person UUID"))?;
+            repo.name_person(eidetic_core::PersonId::from(uuid), &name)
+                .await
+                .context("failed to name person")?;
+            println!("Named {id} → {name}");
+        }
+
         Command::Serve { bind } => {
             use std::net::SocketAddr;
 
@@ -524,4 +702,104 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// What one clustering pass did.
+struct ClusterSummary {
+    attached: usize,
+    new_people: usize,
+    unassigned: usize,
+}
+
+/// Assign stored faces to people (ADR-0010).
+///
+/// Two phases, in order:
+///   1. every unassigned face is offered to the people that already exist;
+///   2. whatever is left goes through Chinese Whispers to propose new people.
+///
+/// Phase 1 first is deliberate: extending a known person is cheaper and more
+/// reliable than inventing one, and it stops a new candidate being created for
+/// someone who is already named.
+///
+/// Faces the user has pinned are never touched — the repo enforces that in SQL,
+/// and they are also skipped here so they cannot be counted as work.
+async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSummary> {
+    use anyhow::Context;
+    use eidetic_db::cluster;
+
+    let params = cluster::ClusterParams::default();
+
+    let (must_link, must_not_link) = repo.fetch_links().await.context("failed to load links")?;
+    let rejections = repo
+        .fetch_rejections()
+        .await
+        .context("failed to load rejections")?;
+    let constraints = cluster::Constraints::new(rejections, must_link, must_not_link);
+
+    // Build each existing person's exemplars from the faces already attributed
+    // to them. Recomputed per run rather than cached: it is cheap at this scale
+    // and a stale exemplar set silently degrades every future assignment.
+    let all = repo
+        .fetch_embeddings(false)
+        .await
+        .context("failed to load face embeddings")?;
+
+    let mut by_person: std::collections::HashMap<eidetic_core::PersonId, Vec<&_>> =
+        std::collections::HashMap::new();
+    for face in &all {
+        if let Some(p) = face.person_id {
+            by_person.entry(p).or_default().push(face);
+        }
+    }
+
+    let people: Vec<cluster::PersonExemplars> = by_person
+        .iter()
+        .map(|(&person, faces)| {
+            let picked = cluster::select_exemplars(faces.as_slice(), params.max_exemplars);
+            cluster::PersonExemplars {
+                person,
+                exemplars: picked
+                    .into_iter()
+                    .map(|i| faces[i].embedding.clone())
+                    .collect(),
+            }
+        })
+        .collect();
+
+    // Phase 1: offer unassigned faces to existing people.
+    let mut attached = 0usize;
+    let mut still_unassigned = Vec::new();
+    for face in all.iter().filter(|f| f.person_id.is_none()) {
+        match cluster::assign_to_existing(face, &people, &constraints, &params) {
+            Some(person) => {
+                repo.assign_face(face.id, person, false)
+                    .await
+                    .context("failed to assign face")?;
+                attached += 1;
+            }
+            None => still_unassigned.push(face.clone()),
+        }
+    }
+
+    // Phase 2: propose new people from what is left.
+    let proposed = cluster::propose_people(&still_unassigned, &constraints, &params);
+    let mut grouped = 0usize;
+    for group in &proposed {
+        let person = repo
+            .create_person()
+            .await
+            .context("failed to create person")?;
+        for &face in &group.faces {
+            repo.assign_face(face, person, false)
+                .await
+                .context("failed to assign face to new person")?;
+            grouped += 1;
+        }
+    }
+
+    Ok(ClusterSummary {
+        attached,
+        new_people: proposed.len(),
+        unassigned: still_unassigned.len() - grouped,
+    })
 }

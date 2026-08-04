@@ -117,6 +117,20 @@ impl Face for crate::FaceEmbedding {
     }
 }
 
+/// So a `&[&Face]` works too — callers that group faces by person end up with
+/// slices of references and should not have to clone to cluster them.
+impl<T: Face> Face for &T {
+    fn face_id(&self) -> FaceId {
+        (*self).face_id()
+    }
+    fn embedding(&self) -> &[f32] {
+        (*self).embedding()
+    }
+    fn score(&self) -> f32 {
+        (*self).score()
+    }
+}
+
 /// Cosine distance for L2-normalised vectors: `1 - dot`.
 ///
 /// Returns `f32::INFINITY` for mismatched widths so a dimension change between
