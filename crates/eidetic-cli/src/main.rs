@@ -325,7 +325,11 @@ async fn main() -> anyhow::Result<()> {
                     videos_unembedded.len()
                 );
             }
-            let videos_unembedded = if ffmpeg_ok { videos_unembedded } else { Vec::new() };
+            let videos_unembedded = if ffmpeg_ok {
+                videos_unembedded
+            } else {
+                Vec::new()
+            };
 
             if unembedded.is_empty() && videos_unembedded.is_empty() {
                 println!("Nothing to do.");

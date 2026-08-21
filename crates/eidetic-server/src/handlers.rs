@@ -526,6 +526,10 @@ mod tests {
                 place: None,
                 place_distance_m: None,
                 thumbnails_generated: false,
+                duration_secs: None,
+                video_codec: None,
+                pixel_width: None,
+                pixel_height: None,
             })
             .await
             .expect("insert")

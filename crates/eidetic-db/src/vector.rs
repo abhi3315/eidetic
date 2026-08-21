@@ -104,9 +104,9 @@ mod tests {
         // A unit vector at 45 degrees: equidistant from both axes.
         let diag = std::f32::consts::FRAC_1_SQRT_2;
         let stored = vec![
-            vec![0.0, 1.0],     // far
-            vec![1.0, 0.0],     // exact
-            vec![diag, diag],   // middle
+            vec![0.0, 1.0],   // far
+            vec![1.0, 0.0],   // exact
+            vec![diag, diag], // middle
         ];
 
         let hits = BruteForce.top_k(&[1.0, 0.0], &stored, 2);

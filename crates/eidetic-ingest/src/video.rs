@@ -75,7 +75,14 @@ pub fn probe(path: &Path) -> Result<Option<VideoProbe>> {
         return Ok(None);
     };
     let output = Command::new(ffprobe)
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
         .arg(path)
         .output()
         .map_err(|source| Error::Io {
@@ -247,15 +254,25 @@ mod tests {
             parse_iso6709("+28.6139+077.2090+216.000/"),
             Some((28.6139, 77.2090))
         );
-        assert_eq!(parse_iso6709("-33.8688+151.2093/"), Some((-33.8688, 151.2093)));
-        assert_eq!(parse_iso6709("+28.6139-077.2090/"), Some((28.6139, -77.2090)));
+        assert_eq!(
+            parse_iso6709("-33.8688+151.2093/"),
+            Some((-33.8688, 151.2093))
+        );
+        assert_eq!(
+            parse_iso6709("+28.6139-077.2090/"),
+            Some((28.6139, -77.2090))
+        );
     }
 
     #[test]
     fn iso6709_rejects_garbage() {
         assert_eq!(parse_iso6709(""), None);
         assert_eq!(parse_iso6709("28.6"), None);
-        assert_eq!(parse_iso6709("+99.0+200.0/"), None, "out-of-range coordinates");
+        assert_eq!(
+            parse_iso6709("+99.0+200.0/"),
+            None,
+            "out-of-range coordinates"
+        );
     }
 
     #[test]
@@ -271,7 +288,10 @@ mod tests {
         assert_eq!(p.video_codec.as_deref(), Some("h264"));
         assert_eq!((p.width, p.height), (Some(1920), Some(1080)));
         assert_eq!(p.duration_secs, Some(12.5));
-        assert_eq!(p.date_taken.unwrap().to_rfc3339(), "2026-01-02T03:04:05+00:00");
+        assert_eq!(
+            p.date_taken.unwrap().to_rfc3339(),
+            "2026-01-02T03:04:05+00:00"
+        );
     }
 
     #[test]
@@ -285,7 +305,11 @@ mod tests {
             "format": {"duration": "3.0"}
         });
         let p = parse_probe(&json);
-        assert_eq!((p.width, p.height), (Some(1080), Some(1920)), "portrait after rotation");
+        assert_eq!(
+            (p.width, p.height),
+            (Some(1080), Some(1920)),
+            "portrait after rotation"
+        );
     }
 
     #[test]
@@ -303,7 +327,11 @@ mod tests {
     #[test]
     fn thumbnail_ts_skips_the_opening_but_stays_in_bounds() {
         assert_eq!(thumbnail_ts(Some(100.0)), 10.0);
-        assert_eq!(thumbnail_ts(Some(1.0)), 0.5, "0.5s floor still inside a 1s clip");
+        assert_eq!(
+            thumbnail_ts(Some(1.0)),
+            0.5,
+            "0.5s floor still inside a 1s clip"
+        );
         assert_eq!(thumbnail_ts(Some(10.0)), 1.0);
         assert_eq!(thumbnail_ts(None), 0.0);
     }
@@ -315,7 +343,10 @@ mod tests {
         assert_eq!(sample_timestamps(Some(60.0)).len(), 5);
         let ts = sample_timestamps(Some(10.0));
         assert_eq!(ts.len(), 5);
-        assert!((ts[0] - 1.0).abs() < 1e-9 && (ts[4] - 9.0).abs() < 1e-9, "middle 80%: {ts:?}");
+        assert!(
+            (ts[0] - 1.0).abs() < 1e-9 && (ts[4] - 9.0).abs() < 1e-9,
+            "middle 80%: {ts:?}"
+        );
         assert_eq!(sample_timestamps(None), vec![0.0]);
     }
 
@@ -331,7 +362,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let clip = dir.path().join("test.mp4");
         let status = Command::new(ffmpeg_bin)
-            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=64x48:rate=10"])
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=64x48:rate=10",
+            ])
             .args(["-pix_fmt", "yuv420p"])
             .arg(&clip)
             .status()
@@ -344,7 +382,9 @@ mod tests {
         let d = p.duration_secs.expect("duration");
         assert!((d - 2.0).abs() < 0.2, "duration ~2s, got {d}");
 
-        let frame = extract_frame(&clip, 1.0).expect("extract").expect("ffmpeg present");
+        let frame = extract_frame(&clip, 1.0)
+            .expect("extract")
+            .expect("ffmpeg present");
         assert_eq!((frame.width(), frame.height()), (64, 48));
 
         // A corrupt file must error, not panic or hang.

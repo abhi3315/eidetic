@@ -77,6 +77,10 @@ async fn seed_asset(
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     match repo.insert_asset(asset).await.expect("insert") {
         eidetic_db::InsertOutcome::Inserted(id) | eidetic_db::InsertOutcome::Existing(id) => id,

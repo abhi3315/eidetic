@@ -472,7 +472,10 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         .iter()
         .find(|a| a.mime_type.starts_with("video/"))
         .unwrap();
-    assert_eq!(video.duration_secs, None, "stub row carries its NULL duration");
+    assert_eq!(
+        video.duration_secs, None,
+        "stub row carries its NULL duration"
+    );
 }
 
 #[tokio::test]
