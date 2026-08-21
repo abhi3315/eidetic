@@ -1,6 +1,31 @@
 use chrono::{DateTime, Utc};
-use eidetic_core::{AssetId, Sha256};
+use eidetic_core::{AssetId, FaceId, PersonId, Sha256};
 use maud::{DOCTYPE, Markup, html};
+
+/// One tile on the /persons grid.
+pub(crate) struct PersonTile {
+    pub(crate) id: PersonId,
+    pub(crate) cover_face: FaceId,
+    pub(crate) name: Option<String>,
+    pub(crate) face_count: i64,
+}
+
+/// One face crop on a person's page, linking back to the photo it's from.
+pub(crate) struct FaceCrop {
+    pub(crate) face_id: FaceId,
+    pub(crate) asset_id: AssetId,
+}
+
+/// One person chip in the asset detail page's "People" section.
+pub(crate) struct PersonChip {
+    pub(crate) face_id: FaceId,
+    pub(crate) person_id: PersonId,
+    pub(crate) name: Option<String>,
+}
+
+fn person_label(name: Option<&str>) -> &str {
+    name.unwrap_or("(unnamed)")
+}
 
 pub(crate) struct GridTile {
     pub(crate) id: AssetId,
@@ -93,7 +118,21 @@ h2 { margin: 1.5rem 0 1rem; font-weight: 600; font-size: 1.1rem; color: #555; }
 .detail dt { font-size: 0.8rem; color: #777; margin-top: 0.8rem; }
 .detail dd { margin: 0.2rem 0 0 0; }
 .detail a.download { display: inline-block; margin-top: 1rem; padding: 0.6rem 1rem; background: #111; color: white; text-decoration: none; border-radius: 4px; }
+.detail video.preview { width: 100%; border-radius: 4px; background: #000; }
 .empty { color: #777; font-style: italic; }
+header a.nav { font-weight: 400; color: #555; margin-left: 1rem; }
+.tile .play-badge { position: absolute; top: 0.3rem; left: 0.3rem; background: rgba(0,0,0,0.7); color: white; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.75rem; pointer-events: none; }
+.person-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.6rem; }
+.person-tile { display: flex; flex-direction: column; align-items: center; gap: 0.3rem; padding: 0.8rem; background: white; border: 1px solid #e5e5e5; border-radius: 4px; text-decoration: none; color: #111; }
+.person-tile img { width: 112px; height: 112px; object-fit: cover; border-radius: 50%; background: #eee; }
+.person-tile .person-name { font-weight: 600; font-size: 0.9rem; text-align: center; }
+.person-tile .person-count { font-size: 0.75rem; color: #777; }
+.face-grid { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.face-grid a { display: block; }
+.face-grid img.face-crop { width: 112px; height: 112px; object-fit: cover; border-radius: 4px; background: #eee; display: block; }
+.people-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.5rem; }
+.person-chip { display: flex; flex-direction: column; align-items: center; gap: 0.2rem; text-decoration: none; color: #111; font-size: 0.75rem; }
+.person-chip img { width: 56px; height: 56px; object-fit: cover; border-radius: 50%; background: #eee; display: block; }
 "#;
 
 pub(crate) fn layout(title: &str, body: Markup) -> Markup {
@@ -107,7 +146,10 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                 style { (INLINE_CSS) }
             }
             body {
-                header { a href="/" { "Eidetic" } }
+                header {
+                    a href="/" { "Eidetic" }
+                    a class="nav" href="/persons" { "People" }
+                }
                 main { (body) }
             }
         }
@@ -146,6 +188,9 @@ pub(crate) fn asset_grid(tiles: &[GridTile]) -> Markup {
                             span class="filename" { (tile.alt) }
                         }
                     }
+                    @if tile.mime_type.starts_with("video/") {
+                        span class="play-badge" { "▶" }
+                    }
                     @if let Some(score) = tile.score {
                         span class="score" { (format!("{:.0}%", score * 100.0)) }
                     }
@@ -155,15 +200,72 @@ pub(crate) fn asset_grid(tiles: &[GridTile]) -> Markup {
     }
 }
 
-pub(crate) fn detail_page(view: &DetailView) -> Markup {
+pub(crate) fn persons_page(tiles: &[PersonTile]) -> Markup {
+    html! {
+        h2 { "People" }
+        @if tiles.is_empty() {
+            p class="empty" { "No people yet. Run `eidetic faces` to detect and group them." }
+        } @else {
+            div class="person-grid" {
+                @for tile in tiles {
+                    a href=(format!("/persons/{}", tile.id)) class="person-tile" {
+                        img src=(format!("/faces/{}/crop", tile.cover_face))
+                            loading="lazy"
+                            alt=(person_label(tile.name.as_deref()));
+                        span class="person-name" { (person_label(tile.name.as_deref())) }
+                        span class="person-count" {
+                            (tile.face_count)
+                            @if tile.face_count == 1 { " face" } @else { " faces" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn person_page(person: &eidetic_db::Person, crops: &[FaceCrop]) -> Markup {
+    html! {
+        h2 {
+            (person_label(person.name.as_deref()))
+            " · " (person.face_count)
+            @if person.face_count == 1 { " face" } @else { " faces" }
+        }
+        @if crops.is_empty() {
+            p class="empty" { "No faces attributed to this person." }
+        } @else {
+            div class="face-grid" {
+                @for crop in crops {
+                    a href=(format!("/assets/{}", crop.asset_id)) {
+                        img class="face-crop"
+                            src=(format!("/faces/{}/crop", crop.face_id))
+                            loading="lazy"
+                            alt="face crop";
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn detail_page(view: &DetailView, people: &[PersonChip]) -> Markup {
     let render_original_inline = view
         .mime_type
         .as_deref()
         .is_some_and(|m| should_render_inline(m, view.file_size));
+    let is_video = view
+        .mime_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("video/"));
     html! {
         div class="detail" {
             div {
-                @if view.thumbnails_generated {
+                @if is_video {
+                    // Range support on /raw makes seeking work; Safari won't
+                    // play at all without it.
+                    video class="preview" controls preload="metadata"
+                        src=(format!("/assets/{}/raw", view.id)) {}
+                } @else if view.thumbnails_generated {
                     img class="preview"
                         src=(format!("/thumbs/m/{}", view.hash))
                         alt=(view.original_filename);
@@ -180,6 +282,19 @@ pub(crate) fn detail_page(view: &DetailView) -> Markup {
                 }
                 a class="download" href=(format!("/assets/{}/raw", view.id)) {
                     "Download original"
+                }
+                @if !people.is_empty() {
+                    h2 { "People" }
+                    div class="people-row" {
+                        @for chip in people {
+                            a class="person-chip" href=(format!("/persons/{}", chip.person_id)) {
+                                img src=(format!("/faces/{}/crop", chip.face_id))
+                                    loading="lazy"
+                                    alt=(person_label(chip.name.as_deref()));
+                                span { (person_label(chip.name.as_deref())) }
+                            }
+                        }
+                    }
                 }
             }
             div {
@@ -390,7 +505,7 @@ mod tests {
             place_distance_m: None,
             thumbnails_generated: true,
         };
-        let s = detail_page(&view).into_string();
+        let s = detail_page(&view, &[]).into_string();
         assert!(s.contains("class=\"preview\""));
         assert!(s.contains("Download original"));
         assert!(s.contains("2 KB"));
@@ -428,21 +543,150 @@ mod tests {
     #[test]
     fn detail_page_serves_original_for_renderable_unthumbnailed_image() {
         let view = detail_view(Some("image/jpeg"), false, 3 * 1024 * 1024);
-        let s = detail_page(&view).into_string();
+        let s = detail_page(&view, &[]).into_string();
         assert!(s.contains("class=\"preview\""));
         assert!(s.contains("/raw"));
         assert!(!s.contains("No preview available"));
     }
 
     #[test]
-    fn detail_page_shows_no_preview_message_for_video() {
+    fn detail_page_renders_video_element_for_video() {
         let view = detail_view(Some("video/quicktime"), false, 100 * 1024 * 1024);
-        let s = detail_page(&view).into_string();
-        assert!(s.contains("No preview available"));
-        assert!(s.contains("video/quicktime"));
-        assert!(!s.contains("class=\"preview\""));
+        let s = detail_page(&view, &[]).into_string();
+        assert!(s.contains("<video"));
+        assert!(s.contains("controls"));
+        assert!(s.contains("preload=\"metadata\""));
+        assert!(s.contains(&format!("/assets/{}/raw", view.id)));
+        assert!(!s.contains("No preview available"));
         // Download link is always present as the escape hatch.
         assert!(s.contains("Download original"));
+    }
+
+    #[test]
+    fn detail_page_prefers_video_element_over_thumbnail() {
+        // A video with a generated thumbnail must still get the player, not
+        // the static thumb.
+        let view = detail_view(Some("video/mp4"), true, 100 * 1024 * 1024);
+        let s = detail_page(&view, &[]).into_string();
+        assert!(s.contains("<video"));
+        assert!(!s.contains("/thumbs/m/"));
+    }
+
+    #[test]
+    fn detail_page_lists_people_when_present() {
+        let view = detail_view(Some("image/jpeg"), true, 1024);
+        let chips = vec![
+            PersonChip {
+                face_id: FaceId::new(),
+                person_id: PersonId::new(),
+                name: Some("Asha".into()),
+            },
+            PersonChip {
+                face_id: FaceId::new(),
+                person_id: PersonId::new(),
+                name: None,
+            },
+        ];
+        let s = detail_page(&view, &chips).into_string();
+        assert!(s.contains(">People<"));
+        assert!(s.contains("Asha"));
+        assert!(s.contains("(unnamed)"));
+        assert!(s.contains(&format!("/faces/{}/crop", chips[0].face_id)));
+        assert!(s.contains(&format!("/persons/{}", chips[0].person_id)));
+    }
+
+    #[test]
+    fn detail_page_omits_people_section_when_empty() {
+        let view = detail_view(Some("image/jpeg"), true, 1024);
+        let s = detail_page(&view, &[]).into_string();
+        assert!(!s.contains("people-row"));
+        assert!(!s.contains(">People<"));
+    }
+
+    #[test]
+    fn persons_page_renders_tiles_with_cover_crops() {
+        let tiles = vec![
+            PersonTile {
+                id: PersonId::new(),
+                cover_face: FaceId::new(),
+                name: Some("Asha".into()),
+                face_count: 12,
+            },
+            PersonTile {
+                id: PersonId::new(),
+                cover_face: FaceId::new(),
+                name: None,
+                face_count: 1,
+            },
+        ];
+        let s = persons_page(&tiles).into_string();
+        assert!(s.contains("Asha"));
+        assert!(s.contains("(unnamed)"));
+        assert!(s.contains("12 faces"));
+        assert!(s.contains("1 face<"), "singular for one face: {s}");
+        assert!(s.contains(&format!("/persons/{}", tiles[0].id)));
+        assert!(s.contains(&format!("/faces/{}/crop", tiles[0].cover_face)));
+    }
+
+    #[test]
+    fn persons_page_empty_state() {
+        let s = persons_page(&[]).into_string();
+        assert!(s.contains("No people yet"));
+        assert!(!s.contains("person-tile"));
+    }
+
+    #[test]
+    fn person_page_links_crops_to_their_assets() {
+        let person = eidetic_db::Person {
+            id: PersonId::new(),
+            name: Some("Asha".into()),
+            face_count: 2,
+            cover_face: Some(FaceId::new()),
+        };
+        let crops = vec![
+            FaceCrop {
+                face_id: FaceId::new(),
+                asset_id: AssetId::new(),
+            },
+            FaceCrop {
+                face_id: FaceId::new(),
+                asset_id: AssetId::new(),
+            },
+        ];
+        let s = person_page(&person, &crops).into_string();
+        assert!(s.contains("Asha"));
+        assert!(s.contains("2 faces"));
+        assert!(s.contains(&format!("/faces/{}/crop", crops[0].face_id)));
+        assert!(s.contains(&format!("/assets/{}", crops[1].asset_id)));
+    }
+
+    #[test]
+    fn person_page_unnamed_person_gets_placeholder() {
+        let person = eidetic_db::Person {
+            id: PersonId::new(),
+            name: None,
+            face_count: 0,
+            cover_face: None,
+        };
+        let s = person_page(&person, &[]).into_string();
+        assert!(s.contains("(unnamed)"));
+        assert!(s.contains("No faces attributed"));
+    }
+
+    #[test]
+    fn layout_header_links_to_persons() {
+        let s = layout("Test", html! { p { "x" } }).into_string();
+        assert!(s.contains("href=\"/persons\""));
+    }
+
+    #[test]
+    fn asset_grid_adds_play_badge_for_videos() {
+        let tiles = vec![
+            tile("beach.MOV", "video/quicktime", true, 1024, None),
+            tile("pic.jpg", "image/jpeg", true, 1024, None),
+        ];
+        let s = asset_grid(&tiles).into_string();
+        assert_eq!(s.matches("play-badge").count(), 1, "only the video tile");
     }
 
     #[test]
@@ -454,7 +698,7 @@ mod tests {
         view.place_distance_m = Some(2794.0);
         view.latitude = Some(32.539);
         view.longitude = Some(75.972);
-        let s = detail_page(&view).into_string();
+        let s = detail_page(&view, &[]).into_string();
         let place_idx = s.find("Place").expect("Place label missing");
         let gps_idx = s.find("GPS").expect("GPS label missing");
         assert!(place_idx < gps_idx, "Place must render above GPS");
@@ -465,7 +709,7 @@ mod tests {
     #[test]
     fn detail_page_omits_place_row_when_no_place_data() {
         let view = detail_view(Some("image/jpeg"), true, 1024);
-        let s = detail_page(&view).into_string();
+        let s = detail_page(&view, &[]).into_string();
         assert!(!s.contains(">Place<"));
     }
 }

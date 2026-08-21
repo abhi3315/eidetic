@@ -1,4 +1,5 @@
 mod eval;
+mod reel;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -95,6 +96,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Cut a short reel from the library for a prompt (needs ffmpeg).
+    Reel {
+        /// What the reel is about, e.g. "sunset at the beach".
+        prompt: String,
+
+        /// Target length in seconds.
+        #[arg(long, default_value = "30")]
+        duration: f64,
+
+        /// Output file. Refuses to overwrite an existing file.
+        #[arg(long, short, default_value = "reel.mp4")]
+        output: PathBuf,
+
+        /// Output frame size, WIDTHxHEIGHT.
+        #[arg(long, default_value = "1920x1080")]
+        size: String,
+
+        /// Print the cut list without rendering.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -133,7 +155,7 @@ fn open_geocoder() -> Option<eidetic_core::geocoder::Geocoder> {
 }
 
 const VALID_FIELDS: &[&str] = &[
-    "path", "score", "date", "make", "model", "lat", "lon", "mime",
+    "path", "score", "date", "make", "model", "lat", "lon", "mime", "ts",
 ];
 
 fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> String {
@@ -151,6 +173,8 @@ fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> String {
             "lat" => r.latitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
             "lon" => r.longitude.map(|l| format!("{l:.6}")).unwrap_or_default(),
             "mime" => r.mime_type.clone().unwrap_or_default(),
+            // For videos: the second offset of the best-matching moment.
+            "ts" => r.frame_ts.map(|ts| format!("{ts:.1}")).unwrap_or_default(),
             other => unreachable!(
                 "unknown field {other:?} should have been rejected by VALID_FIELDS check"
             ),
@@ -286,8 +310,31 @@ async fn main() -> anyhow::Result<()> {
                 .fetch_unembedded()
                 .await
                 .context("failed to fetch unembedded assets")?;
+            let videos_unembedded = repo
+                .fetch_videos_unembedded()
+                .await
+                .context("failed to fetch unembedded videos")?;
 
-            if unembedded.is_empty() {
+            // Videos need ffmpeg for frame extraction AND ffprobe for
+            // durations (ADR-0011) — sampling without a duration would store
+            // a lone t=0 frame and never revisit. Without either binary they
+            // are skipped loudly, not failed.
+            let ffmpeg_ok = eidetic_ingest::video::ffmpeg().is_some()
+                && eidetic_ingest::video::ffprobe().is_some();
+            if !videos_unembedded.is_empty() && !ffmpeg_ok {
+                eprintln!(
+                    "Skipping {} video(s): ffmpeg/ffprobe not found. Install ffmpeg (or set \
+                     EIDETIC_FFMPEG_PATH / EIDETIC_FFPROBE_PATH) and re-run `eidetic embed`.",
+                    videos_unembedded.len()
+                );
+            }
+            let videos_unembedded = if ffmpeg_ok {
+                videos_unembedded
+            } else {
+                Vec::new()
+            };
+
+            if unembedded.is_empty() && videos_unembedded.is_empty() {
                 println!("Nothing to do.");
                 return Ok(());
             }
@@ -299,22 +346,65 @@ async fn main() -> anyhow::Result<()> {
             // results via per-job oneshot replies. Channel capacity 1 keeps
             // the worker tightly coupled to the async loop, so no large queue
             // of pending embeds builds up if the DB write side stalls.
-            type EmbedJob = (PathBuf, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>);
+            /// (ts, embedding) pairs for a video's sampled frames, or a
+            /// display-ready reason the whole video was skipped.
+            type FrameReply = oneshot::Sender<Result<Vec<(f64, Vec<f32>)>, String>>;
+            enum EmbedJob {
+                Image(PathBuf, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>),
+                // Sampled timestamps in, (ts, embedding) pairs out. Frame
+                // extraction runs on the worker too — it is subprocess-bound,
+                // and interleaving it with inference keeps one job in flight.
+                Video(PathBuf, Vec<f64>, FrameReply),
+            }
             let (job_tx, mut job_rx) = mpsc::channel::<EmbedJob>(1);
 
             let worker = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<()> {
                 let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-                while let Some((path, reply)) = job_rx.blocking_recv() {
-                    let result = embedder.embed(&path);
-                    // If the receiver was dropped (e.g. caller gave up), keep
+                while let Some(job) = job_rx.blocking_recv() {
+                    // If a receiver was dropped (e.g. caller gave up), keep
                     // serving the next job rather than aborting the worker.
-                    let _ = reply.send(result);
+                    match job {
+                        EmbedJob::Image(path, reply) => {
+                            let _ = reply.send(embedder.embed(&path));
+                        }
+                        EmbedJob::Video(path, timestamps, reply) => {
+                            // Frames that embedded stay embedded: a container
+                            // whose tail is unreadable (truncated file, audio
+                            // outlasting video) still contributes its good
+                            // frames. Only a video with NO usable frame is
+                            // reported as an error, and retried next run.
+                            let mut frames = Vec::with_capacity(timestamps.len());
+                            let mut first_err = None;
+                            for ts in timestamps {
+                                let result = eidetic_ingest::video::extract_frame(&path, ts)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|f| {
+                                        f.ok_or_else(|| "ffmpeg disappeared mid-run".to_string())
+                                    })
+                                    .and_then(|frame| {
+                                        embedder.embed_image(&frame).map_err(|e| e.to_string())
+                                    });
+                                match result {
+                                    Ok(v) => frames.push((ts, v)),
+                                    Err(e) => first_err = first_err.or(Some(e)),
+                                }
+                            }
+                            let _ = reply.send(match (frames.is_empty(), first_err) {
+                                (true, Some(e)) => Err(e),
+                                (_, _) => Ok(frames),
+                            });
+                        }
+                    }
                 }
                 Ok(())
             });
 
-            let total = unembedded.len();
-            println!("Found {total} images to embed");
+            let total = unembedded.len() + videos_unembedded.len();
+            println!(
+                "Found {} image(s) and {} video(s) to embed",
+                unembedded.len(),
+                videos_unembedded.len()
+            );
 
             let mut embedded = 0u32;
             let mut skipped = 0u32;
@@ -323,7 +413,11 @@ async fn main() -> anyhow::Result<()> {
             for (i, (id, path)) in unembedded.into_iter().enumerate() {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 // If `send` fails, the worker died. Surface its error below.
-                if job_tx.send((path.clone(), reply_tx)).await.is_err() {
+                if job_tx
+                    .send(EmbedJob::Image(path.clone(), reply_tx))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 let result = reply_rx.await.context(
@@ -338,6 +432,79 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             // Keep going. Rows with NULL embedding are retried on the next run.
+                            eprintln!("  failed to store {}: {e}", path.display());
+                            failed += 1;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  skipped {}: {e}", path.display());
+                        skipped += 1;
+                    }
+                }
+            }
+
+            let images_attempted = total - videos_unembedded.len();
+            for (i, (id, path, duration)) in videos_unembedded.into_iter().enumerate() {
+                // A video imported without ffprobe has no stored duration;
+                // re-probe now and backfill the metadata while we are here.
+                let duration = match duration {
+                    Some(d) => Some(d),
+                    None => {
+                        let probe_path = path.clone();
+                        let probed = tokio::task::spawn_blocking(move || {
+                            eidetic_ingest::video::probe(&probe_path)
+                        })
+                        .await
+                        .context("probe thread panicked")?;
+                        match probed {
+                            Ok(Some(p)) => {
+                                repo.update_video_probe(
+                                    id,
+                                    p.duration_secs,
+                                    p.video_codec.as_deref(),
+                                    p.width,
+                                    p.height,
+                                )
+                                .await
+                                .context("failed to store probe metadata")?;
+                                p.duration_secs
+                            }
+                            Ok(None) => None,
+                            Err(e) => {
+                                eprintln!("  skipped {}: {e}", path.display());
+                                skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                let timestamps = eidetic_ingest::video::sample_timestamps(duration);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if job_tx
+                    .send(EmbedJob::Video(path.clone(), timestamps, reply_tx))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let result = reply_rx.await.context(
+                    "embed worker panicked or died mid-job; check for OOM or ONNX error above",
+                )?;
+
+                match result {
+                    Ok(frames) => match repo.store_frame_embeddings(id, &frames).await {
+                        Ok(()) => {
+                            println!(
+                                "[{}/{}] {} ({} frame(s))",
+                                images_attempted + i + 1,
+                                total,
+                                path.display(),
+                                frames.len()
+                            );
+                            embedded += 1;
+                        }
+                        Err(e) => {
                             eprintln!("  failed to store {}: {e}", path.display());
                             failed += 1;
                         }
@@ -386,23 +553,78 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            // Without ffmpeg, videos cannot thumbnail — leave them pending
+            // (with one warning) rather than counting them as failures.
+            let ffmpeg_ok = eidetic_ingest::video::ffmpeg().is_some();
+            let (pending, held_back): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|a| ffmpeg_ok || !a.mime_type.starts_with("video/"));
+            if !held_back.is_empty() {
+                eprintln!(
+                    "Skipping {} video(s): ffmpeg not found. Install ffmpeg (or set \
+                     EIDETIC_FFMPEG_PATH) and re-run `eidetic thumbnail`.",
+                    held_back.len()
+                );
+            }
+            if pending.is_empty() {
+                println!("Nothing to do.");
+                return Ok(());
+            }
+
             let total = pending.len();
-            println!("Generating thumbnails for {total} images…");
+            println!("Generating thumbnails for {total} asset(s)…");
 
             let mut generated = 0u32;
             let mut failed = 0u32;
 
-            for (i, (id, hash, storage_path)) in pending.into_iter().enumerate() {
+            for (i, asset) in pending.into_iter().enumerate() {
                 let lib = config.paths.library_dir.clone();
-                let storage_clone = storage_path.clone();
-                let hash_clone = hash.clone();
+                let storage_path = asset.storage_path.clone();
+                let storage_clone = asset.storage_path.clone();
+                let hash_clone = asset.hash.clone();
+                let id = asset.id;
+                let is_video = asset.mime_type.starts_with("video/");
+
+                // A video imported while ffprobe was absent has no stored
+                // duration; re-probe and backfill so the representative frame
+                // lands at 10% instead of an opening black frame.
+                let mut duration = asset.duration_secs;
+                if is_video && duration.is_none() {
+                    let probe_path = storage_path.clone();
+                    if let Ok(Some(p)) = tokio::task::spawn_blocking(move || {
+                        eidetic_ingest::video::probe(&probe_path)
+                    })
+                    .await
+                    .context("probe thread panicked")?
+                    {
+                        repo.update_video_probe(
+                            id,
+                            p.duration_secs,
+                            p.video_codec.as_deref(),
+                            p.width,
+                            p.height,
+                        )
+                        .await
+                        .context("failed to store probe metadata")?;
+                        duration = p.duration_secs;
+                    }
+                }
 
                 let result = tokio::task::spawn_blocking(move || {
-                    eidetic_ingest::thumbnail::generate_thumbnails(
-                        &storage_clone,
-                        &hash_clone,
-                        &lib,
-                    )
+                    if is_video {
+                        eidetic_ingest::thumbnail::generate_video_thumbnails(
+                            &storage_clone,
+                            &hash_clone,
+                            &lib,
+                            duration,
+                        )
+                    } else {
+                        eidetic_ingest::thumbnail::generate_thumbnails(
+                            &storage_clone,
+                            &hash_clone,
+                            &lib,
+                        )
+                    }
                 })
                 .await
                 .context("thumbnail thread panicked")?;
@@ -615,16 +837,88 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::AssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool.clone());
+            let faces = eidetic_db::FacesRepo::new(pool);
 
             let deps = eidetic_server::ServerDeps {
                 repo,
+                faces,
                 library_dir: config.paths.library_dir.clone(),
                 models_cache: config.paths.models_cache.clone(),
             };
 
             println!("Loading model (downloads ~1.4 GiB on first run)…");
             eidetic_server::serve(addr, deps).await?;
+        }
+
+        Command::Reel {
+            prompt,
+            duration,
+            output,
+            size,
+            dry_run,
+        } => {
+            let (w, h) = size
+                .split_once('x')
+                .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
+            if !dry_run && output.exists() {
+                anyhow::bail!(
+                    "{} already exists; pass a different --output",
+                    output.display()
+                );
+            }
+
+            let config = Config::from_env();
+            let models_dir = config.paths.models_cache.clone();
+            let prompt_clone = prompt.clone();
+            let query_emb = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
+                let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                embedder.embed_text(&prompt_clone)
+            })
+            .await
+            .context("embedder thread panicked")?
+            .context("text embedding failed")?;
+
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::AssetsRepo::new(pool);
+
+            // Over-fetch: the plan trims to the target duration and drops the
+            // weak tail, so more candidates only ever improve the cut.
+            let candidates = (duration / 2.0).ceil() as u32 + 10;
+            let results = repo
+                .search_similar(query_emb.as_slice(), candidates)
+                .await
+                .context("search failed")?;
+
+            let plan = reel::plan(&results, duration, &config.paths.library_dir);
+            if plan.segments.is_empty() {
+                anyhow::bail!(
+                    "nothing in the library matches {prompt:?} confidently enough for a reel"
+                );
+            }
+
+            println!(
+                "Cut list for {prompt:?} ({:.1}s from {} segment(s)):",
+                plan.total_secs,
+                plan.segments.len()
+            );
+            for (i, seg) in plan.segments.iter().enumerate() {
+                println!("  {:>2}. {}", i + 1, seg.describe());
+            }
+            if dry_run {
+                return Ok(());
+            }
+
+            println!("Rendering {w}x{h} @ 30fps…");
+            let render_output = output.clone();
+            tokio::task::spawn_blocking(move || reel::render(&plan, &render_output, w, h))
+                .await
+                .context("render thread panicked")??;
+            println!("Wrote {}", output.display());
         }
 
         Command::Search {
@@ -685,6 +979,7 @@ async fn main() -> anyhow::Result<()> {
                             "lat": r.latitude,
                             "lon": r.longitude,
                             "mime": r.mime_type,
+                            "ts": r.frame_ts,
                         })
                     })
                     .collect();
@@ -695,7 +990,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 for r in &results {
-                    println!("{}", r.storage_path.display());
+                    match r.frame_ts {
+                        Some(ts) => println!("{}\t@{ts:.1}s", r.storage_path.display()),
+                        None => println!("{}", r.storage_path.display()),
+                    }
                 }
             }
         }

@@ -57,7 +57,7 @@ async fn imported_image_has_thumbnails_generated_true() {
 }
 
 #[tokio::test]
-async fn imported_video_stays_thumbnails_generated_false() {
+async fn corrupt_video_lands_and_stays_thumbnail_pending() {
     let (repo, paths, tmp) = fixture().await;
 
     // Stub video: 12 bytes of an MP4-ish header that `infer` accepts.
@@ -78,13 +78,16 @@ async fn imported_video_stays_thumbnails_generated_false() {
         other => panic!("expected Imported (video should still ingest), got {other:?}"),
     };
 
-    // Video should NOT appear in the unthumbnailed list (filter is
-    // `mime_type LIKE 'image/%'`).
+    // Since ADR-0011 videos ARE thumbnail candidates: the stub is corrupt,
+    // so generation fails at import, and the row stays pending for the
+    // `eidetic thumbnail` backfill to retry.
     let pending = repo.fetch_unthumbnailed().await.expect("fetch");
-    assert!(
-        pending.is_empty(),
-        "video should not appear in unthumbnailed list; got {pending:?}"
+    assert_eq!(
+        pending.len(),
+        1,
+        "video should be retry-pending in the unthumbnailed list; got {pending:?}"
     );
+    assert!(pending[0].mime_type.starts_with("video/"));
 }
 
 #[tokio::test]
@@ -105,9 +108,8 @@ async fn corrupt_image_lands_but_thumbnails_stay_pending() {
 
     let pending = repo.fetch_unthumbnailed().await.expect("fetch");
     assert_eq!(pending.len(), 1, "corrupt image should be retry-pending");
-    let (pending_id, _hash, _path) = &pending[0];
     assert_eq!(
-        *pending_id, id,
+        pending[0].id, id,
         "the pending row should be the one we imported"
     );
 }
@@ -149,6 +151,10 @@ async fn backfill_flow_generates_and_marks_pending_image() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let id = match repo.insert_asset(asset).await.expect("insert") {
         InsertOutcome::Inserted(id) => id,
@@ -158,11 +164,11 @@ async fn backfill_flow_generates_and_marks_pending_image() {
     // Simulate the backfill: fetch, generate, mark.
     let pending = repo.fetch_unthumbnailed().await.expect("fetch before");
     assert_eq!(pending.len(), 1);
-    let (pending_id, pending_hash, pending_path) = pending.into_iter().next().unwrap();
-    assert_eq!(pending_id, id);
-    assert_eq!(pending_hash.to_string(), hash_hex);
+    let pending = pending.into_iter().next().unwrap();
+    assert_eq!(pending.id, id);
+    assert_eq!(pending.hash.to_string(), hash_hex);
 
-    thumbnail::generate_thumbnails(&pending_path, &pending_hash, &paths.library_dir)
+    thumbnail::generate_thumbnails(&pending.storage_path, &pending.hash, &paths.library_dir)
         .expect("generate");
     repo.mark_thumbnailed(id).await.expect("mark");
 
@@ -172,12 +178,12 @@ async fn backfill_flow_generates_and_marks_pending_image() {
 
     let small = thumbnail::thumbnail_path(
         &paths.library_dir,
-        &pending_hash,
+        &pending.hash,
         thumbnail::ThumbSize::Small,
     );
     let medium = thumbnail::thumbnail_path(
         &paths.library_dir,
-        &pending_hash,
+        &pending.hash,
         thumbnail::ThumbSize::Medium,
     );
     assert!(small.exists());

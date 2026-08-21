@@ -171,20 +171,33 @@ pub(crate) async fn asset_detail(
         thumbnails_generated: detail.thumbnails_generated,
     };
 
+    let people: Vec<crate::views::PersonChip> = state
+        .faces
+        .fetch_faces_for_asset(asset_id)
+        .await
+        .map_err(ServerError::DbFailed)?
+        .into_iter()
+        .map(|f| crate::views::PersonChip {
+            face_id: f.face_id,
+            person_id: f.person_id,
+            name: f.person_name,
+        })
+        .collect();
+
     let title = detail.original_filename;
-    let body = html! { (detail_page(&view)) };
+    let body = html! { (detail_page(&view, &people)) };
     Ok(Html(layout(&title, body).into_string()))
 }
 
 pub(crate) async fn asset_raw(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    req: axum::extract::Request,
 ) -> Result<axum::response::Response, ServerError> {
-    use axum::body::Body;
-    use axum::http::{StatusCode, header};
-    use axum::response::Response;
+    use axum::http::header;
     use eidetic_core::AssetId;
-    use tokio_util::io::ReaderStream;
+    use tower::ServiceExt;
+    use tower_http::services::ServeFile;
 
     let asset_id = AssetId::from(id);
     let detail = state
@@ -194,30 +207,193 @@ pub(crate) async fn asset_raw(
         .map_err(ServerError::DbFailed)?
         .ok_or_else(|| ServerError::NotFound(format!("asset {id}")))?;
 
-    let file = tokio::fs::File::open(&detail.storage_path)
-        .await
-        .map_err(ServerError::Io)?;
-
-    let mime = detail
+    // ServeFile handles Range requests (206/416, Content-Range,
+    // Accept-Ranges) — required for <video> seeking; Safari refuses to play
+    // without it. The stored mime beats extension guessing, so pass it
+    // explicitly.
+    let mime: mime::Mime = detail
         .mime_type
         .as_deref()
-        .unwrap_or("application/octet-stream");
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(mime::APPLICATION_OCTET_STREAM);
 
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let response = match ServeFile::new_with_mime(&detail.storage_path, &mime)
+        .oneshot(req)
+        .await
+    {
+        Ok(response) => response,
+        // ServeFile's error type is Infallible: I/O problems come back as
+        // error *responses* (404 for a missing file), not as Err.
+        Err(infallible) => match infallible {},
+    };
+    let mut response = response.map(axum::body::Body::new);
 
     // Backslash-escape any quotes in the filename for the legacy
     // Content-Disposition form. Personal use; the cleaner RFC 6266
     // filename* with UTF-8 encoding can come later.
     let safe_filename = detail.original_filename.replace('"', "\\\"");
     let disposition = format!("inline; filename=\"{safe_filename}\"");
+    if let Ok(value) = disposition.parse() {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
 
-    Ok(Response::builder()
+    Ok(response)
+}
+
+pub(crate) async fn persons_index(
+    State(state): State<AppState>,
+) -> Result<Html<String>, ServerError> {
+    use crate::views::{PersonTile, layout, persons_page};
+
+    let persons = state
+        .faces
+        .list_persons()
+        .await
+        .map_err(ServerError::DbFailed)?;
+
+    let tiles: Vec<PersonTile> = persons
+        .into_iter()
+        // list_persons only returns people with faces, so cover_face is
+        // always present; a raced-away person is simply skipped.
+        .filter_map(|p| {
+            p.cover_face.map(|cover| PersonTile {
+                id: p.id,
+                cover_face: cover,
+                name: p.name,
+                face_count: p.face_count,
+            })
+        })
+        .collect();
+
+    Ok(Html(layout("People", persons_page(&tiles)).into_string()))
+}
+
+pub(crate) async fn person_detail(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Html<String>, ServerError> {
+    use crate::views::{FaceCrop, layout, person_page};
+    use eidetic_core::PersonId;
+
+    let person_id = PersonId::from(id);
+    let person = state
+        .faces
+        .fetch_person(person_id)
+        .await
+        .map_err(ServerError::DbFailed)?
+        .ok_or_else(|| ServerError::NotFound(format!("person {id}")))?;
+
+    let crops: Vec<FaceCrop> = state
+        .faces
+        .fetch_faces_for_person(person_id)
+        .await
+        .map_err(ServerError::DbFailed)?
+        .into_iter()
+        .map(|f| FaceCrop {
+            face_id: f.face_id,
+            asset_id: f.asset_id,
+        })
+        .collect();
+
+    let title = person.name.clone().unwrap_or_else(|| "(unnamed)".into());
+    Ok(Html(
+        layout(&title, person_page(&person, &crops)).into_string(),
+    ))
+}
+
+pub(crate) async fn face_crop(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<axum::response::Response, ServerError> {
+    use eidetic_core::FaceId;
+
+    let face_id = FaceId::from(id);
+    let cache_dir = state.library_dir.join(".faces");
+    let cache_path = cache_dir.join(format!("{face_id}.jpg"));
+
+    // Serve the cached crop if a previous request already rendered it.
+    // Crops are 112x112 JPEGs, small enough to read whole.
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        return Ok(jpeg_crop_response(bytes));
+    }
+
+    let face = state
+        .faces
+        .fetch_face(face_id)
+        .await
+        .map_err(ServerError::DbFailed)?
+        .ok_or_else(|| ServerError::NotFound(format!("face {id}")))?;
+
+    // Decode + align is CPU-bound (the original can be a 50 MP photo), so it
+    // must not run on the async worker threads.
+    let bytes = tokio::task::spawn_blocking(move || render_face_crop(&face))
+        .await
+        .map_err(|e| ServerError::CropFailed(format!("crop thread panicked: {e}")))??;
+
+    // Cache on disk: write to a temp name, then rename, so a concurrent
+    // request can never read a half-written file.
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(ServerError::Io)?;
+    let tmp_path = cache_dir.join(format!("{face_id}.jpg.tmp-{}", std::process::id()));
+    if tokio::fs::write(&tmp_path, &bytes).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp_path, &cache_path).await;
+    }
+
+    Ok(jpeg_crop_response(bytes))
+}
+
+fn jpeg_crop_response(bytes: Vec<u8>) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+
+    axum::response::Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CONTENT_DISPOSITION, disposition)
-        .body(body)
-        .expect("disposition is ASCII-safe by construction"))
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(axum::body::Body::from(bytes))
+        .expect("static headers should build")
+}
+
+/// Decode the original image, align the face to 112x112, JPEG-encode it.
+///
+/// Runs on a blocking thread. When the stored landmarks are degenerate
+/// (`align_face` returns `None`), falls back to a plain bbox crop resized to
+/// the same 112x112 so the tile still shows *something*.
+fn render_face_crop(face: &eidetic_db::PersonFace) -> Result<Vec<u8>, ServerError> {
+    let img = eidetic_ml::image_io::load_oriented_image(&face.storage_path)
+        .map_err(|e| ServerError::CropFailed(format!("{}: {e}", face.storage_path.display())))?;
+
+    let landmarks = eidetic_ml::Landmarks::from_template_order(face.landmarks);
+    let crop = eidetic_ml::face::align_face(&img, &landmarks)
+        .unwrap_or_else(|| bbox_fallback_crop(&img, face.bbox));
+
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut bytes), 85)
+        .encode_image(&crop)
+        .map_err(|e| ServerError::CropFailed(format!("jpeg encode: {e}")))?;
+    Ok(bytes)
+}
+
+/// Crop the detector's bbox (clamped to image bounds) and resize to 112x112.
+/// Only used when the landmarks can't drive a similarity transform.
+fn bbox_fallback_crop(
+    img: &image::DynamicImage,
+    (x, y, w, h): (f32, f32, f32, f32),
+) -> image::RgbImage {
+    let (iw, ih) = (img.width(), img.height());
+    let x0 = (x.max(0.0) as u32).min(iw.saturating_sub(1));
+    let y0 = (y.max(0.0) as u32).min(ih.saturating_sub(1));
+    let cw = (w.max(1.0) as u32).min(iw - x0).max(1);
+    let ch = (h.max(1.0) as u32).min(ih - y0).max(1);
+    let cropped = img.crop_imm(x0, y0, cw, ch).to_rgb8();
+    image::imageops::resize(
+        &cropped,
+        eidetic_ml::face::ALIGNED_SIZE,
+        eidetic_ml::face::ALIGNED_SIZE,
+        image::imageops::FilterType::Triangle,
+    )
 }
 
 pub(crate) async fn thumb(
@@ -268,4 +444,129 @@ pub(crate) async fn thumb(
         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
         .body(body)
         .expect("static headers should build"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bbox_fallback_crop;
+    use eidetic_ml::Landmarks;
+
+    #[test]
+    fn landmarks_reconstruction_inverts_template_order() {
+        let original = Landmarks {
+            right_eye: (1.0, 2.0),
+            left_eye: (3.0, 4.0),
+            nose: (5.0, 6.0),
+            right_mouth: (7.0, 8.0),
+            left_mouth: (9.0, 10.0),
+        };
+        let rebuilt = Landmarks::from_template_order(original.as_template_order());
+        assert_eq!(rebuilt, original);
+    }
+
+    /// The full write path: `as_template_order()` goes into the DB columns,
+    /// `fetch_face` reads them back, and the reconstruction must land on the
+    /// original anatomical fields. Guards against a silent eye/mouth swap,
+    /// which a similarity transform cannot represent — crops would come out
+    /// scale-collapsed with no error anywhere.
+    #[tokio::test]
+    async fn landmarks_round_trip_through_the_database() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let config = eidetic_core::Config {
+            database_path: tmp.path().join("eidetic.db"),
+            ..Default::default()
+        };
+        let pool = eidetic_db::connect(&config).await.expect("connect");
+        let assets = eidetic_db::AssetsRepo::new(pool.clone());
+        let faces = eidetic_db::FacesRepo::new(pool);
+
+        let asset_id = match assets
+            .insert_asset(eidetic_db::NewAsset {
+                hash: "ab".repeat(32),
+                original_filename: "img.jpg".into(),
+                storage_path: std::path::PathBuf::from("/lib/img.jpg"),
+                file_size: 4096,
+                mime_type: Some("image/jpeg".into()),
+                date_taken: None,
+                latitude: None,
+                longitude: None,
+                camera_make: None,
+                camera_model: None,
+                lens_make: None,
+                lens_model: None,
+                focal_length: None,
+                focal_length_35mm: None,
+                aperture: None,
+                shutter: None,
+                iso: None,
+                orientation: None,
+                altitude: None,
+                gps_direction: None,
+                exif_raw: None,
+                country_code: None,
+                country_name: None,
+                admin1: None,
+                place: None,
+                place_distance_m: None,
+                thumbnails_generated: false,
+                duration_secs: None,
+                video_codec: None,
+                pixel_width: None,
+                pixel_height: None,
+            })
+            .await
+            .expect("insert")
+        {
+            eidetic_db::InsertOutcome::Inserted(id) | eidetic_db::InsertOutcome::Existing(id) => id,
+        };
+
+        // Asymmetric values so any slot swap is caught.
+        let original = Landmarks {
+            right_eye: (101.0, 51.0),
+            left_eye: (149.5, 52.5),
+            nose: (125.0, 80.25),
+            right_mouth: (106.75, 110.0),
+            left_mouth: (144.0, 111.5),
+        };
+
+        let ids = faces
+            .record_detection(
+                asset_id,
+                &[eidetic_db::NewFace {
+                    asset_id,
+                    bbox: (90.0, 30.0, 80.0, 100.0),
+                    // Exactly what the CLI face-scan write site stores.
+                    landmarks: original.as_template_order(),
+                    score: 0.9,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("record");
+
+        let stored = faces
+            .fetch_face(ids[0])
+            .await
+            .expect("fetch")
+            .expect("exists");
+        let rebuilt = Landmarks::from_template_order(stored.landmarks);
+        assert_eq!(
+            rebuilt, original,
+            "Landmarks -> DB -> Landmarks must be the identity"
+        );
+    }
+
+    #[test]
+    fn bbox_fallback_clamps_out_of_bounds_boxes() {
+        let img = image::DynamicImage::new_rgb8(100, 80);
+        // Box hangs off every edge; must still produce a 112x112 crop.
+        let crop = bbox_fallback_crop(&img, (-20.0, -10.0, 500.0, 400.0));
+        assert_eq!(crop.width(), 112);
+        assert_eq!(crop.height(), 112);
+
+        // Degenerate box collapses to at least one pixel.
+        let crop = bbox_fallback_crop(&img, (99.5, 79.5, 0.0, 0.0));
+        assert_eq!(crop.width(), 112);
+        assert_eq!(crop.height(), 112);
+    }
 }

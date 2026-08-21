@@ -1,6 +1,6 @@
 [package]
 name = "eidetic-server"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,7 +21,9 @@ eidetic-ml = { path = "../eidetic-ml", default-features = false }
 anyhow = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
+image = { workspace = true }
 maud = { workspace = true }
+mime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

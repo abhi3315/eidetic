@@ -51,6 +51,10 @@ async fn insert_asset_then_find_by_hash() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
 
     let outcome = repo.insert_asset(asset).await.expect("insert");
@@ -111,6 +115,10 @@ async fn insert_duplicate_returns_existing() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
 
     let first = repo.insert_asset(make_asset()).await.expect("first insert");
@@ -164,6 +172,10 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let asset_b = NewAsset {
         hash: "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000".to_string(),
@@ -193,6 +205,10 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let outcome_a = repo.insert_asset(asset_a).await.expect("insert a");
     repo.insert_asset(asset_b).await.expect("insert b");
@@ -255,6 +271,10 @@ async fn search_similar_orders_by_cosine_similarity() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let asset_b = NewAsset {
         hash: "eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000".to_string(),
@@ -284,6 +304,10 @@ async fn search_similar_orders_by_cosine_similarity() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
 
     let id_a = match repo.insert_asset(asset_a).await.expect("insert a") {
@@ -350,6 +374,10 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let image_done = NewAsset {
         hash: "22220000222200002222000022220000222200002222000022220000ffffffff".to_string(),
@@ -379,6 +407,10 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: true,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let video_pending = NewAsset {
         hash: "33330000333300003333000033330000333300003333000033330000ffffffff".to_string(),
@@ -408,6 +440,10 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
 
     repo.insert_asset(image_pending)
@@ -423,11 +459,23 @@ async fn fetch_unthumbnailed_returns_images_with_flag_false() {
     let pending = repo.fetch_unthumbnailed().await.expect("fetch");
     assert_eq!(
         pending.len(),
-        1,
-        "only the unthumbnailed image should come back; got {pending:?}"
+        2,
+        "the unthumbnailed image AND the video should come back (ADR-0011); got {pending:?}"
     );
-    let (_, _, path) = &pending[0];
-    assert!(path.to_str().unwrap().contains("pending.jpg"));
+    let paths: Vec<&str> = pending
+        .iter()
+        .map(|a| a.storage_path.to_str().unwrap())
+        .collect();
+    assert!(paths.iter().any(|p| p.contains("pending.jpg")));
+    assert!(paths.iter().any(|p| p.contains("video.mp4")));
+    let video = pending
+        .iter()
+        .find(|a| a.mime_type.starts_with("video/"))
+        .unwrap();
+    assert_eq!(
+        video.duration_secs, None,
+        "stub row carries its NULL duration"
+    );
 }
 
 #[tokio::test]
@@ -464,6 +512,10 @@ async fn mark_thumbnailed_flips_flag_to_true() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let outcome = repo.insert_asset(asset).await.expect("insert");
     let id = match outcome {
@@ -525,6 +577,10 @@ async fn fetch_recent_orders_by_imported_at_desc() {
             place: None,
             place_distance_m: None,
             thumbnails_generated: false,
+            duration_secs: None,
+            video_codec: None,
+            pixel_width: None,
+            pixel_height: None,
         })
         .await
         .expect("insert");
@@ -575,6 +631,10 @@ async fn fetch_by_id_returns_full_row_or_none() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: true,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let id = match repo.insert_asset(asset).await.expect("insert") {
         InsertOutcome::Inserted(id) => id,

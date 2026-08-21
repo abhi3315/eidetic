@@ -178,8 +178,15 @@ impl SiglipEmbedder {
     /// Tokio runtime should invoke this on a blocking thread (see the
     /// `embed` command in `eidetic-cli` for the mpsc-worker pattern).
     pub fn embed(&mut self, path: &Path) -> Result<Vec<f32>> {
+        let img = crate::image_io::load_oriented_image(path)?;
+        self.embed_image(&img)
+    }
+
+    /// Embed an already-decoded image — the entry point for video frames,
+    /// which arrive from ffmpeg as pixels rather than files (ADR-0011).
+    pub fn embed_image(&mut self, img: &image::DynamicImage) -> Result<Vec<f32>> {
         let image_size = self.variant.image_size;
-        let pixels = preprocess_image(path, image_size)?;
+        let pixels = preprocess_decoded(img, image_size);
         let shape = [1usize, 3, image_size as usize, image_size as usize];
         let tensor = Tensor::<f32>::from_array((shape, pixels))
             .map_err(|e| Error::Inference(format!("create tensor: {e}")))?;
@@ -358,9 +365,7 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
         .map_err(|e| Error::ModelLoad(format!("{}: {e}", model_path.display())))
 }
 
-fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
-    let img = crate::image_io::load_oriented_image(path)?;
-
+fn preprocess_decoded(img: &image::DynamicImage, image_size: u32) -> Vec<f32> {
     let rgb = img
         .resize_exact(
             image_size,
@@ -384,7 +389,7 @@ fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
         chw[plane + i] = (g / 255.0 - 0.5) / 0.5;
         chw[2 * plane + i] = (b / 255.0 - 0.5) / 0.5;
     }
-    Ok(chw)
+    chw
 }
 
 fn tokenize(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
@@ -591,7 +596,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let src = make_synthetic_heic(tmp.path(), 64, 64);
 
-        let pixels = preprocess_image(&src, 224).expect("preprocess HEIC");
+        let img = crate::image_io::load_oriented_image(&src).expect("decode HEIC");
+        let pixels = preprocess_decoded(&img, 224);
         assert_eq!(pixels.len(), 3 * 224 * 224);
     }
 

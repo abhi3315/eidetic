@@ -71,6 +71,19 @@ impl Landmarks {
         }
     }
 
+    /// Rebuild landmarks from template order — the exact inverse of
+    /// [`Self::as_template_order`], for callers reading the `lm_*` columns
+    /// back out of the database (they are stored in template order).
+    pub fn from_template_order(points: [(f32, f32); 5]) -> Self {
+        Self {
+            right_eye: points[0],
+            left_eye: points[1],
+            nose: points[2],
+            right_mouth: points[3],
+            left_mouth: points[4],
+        }
+    }
+
     /// In the order the ArcFace/SFace alignment template expects.
     ///
     /// The template is named in **image space**: its first point sits at
@@ -115,6 +128,13 @@ mod tests {
         assert_eq!(t[2], (3.0, 3.0));
         assert_eq!(t[3], (4.0, 4.0), "image-left mouth corner before right");
         assert_eq!(t[4], (5.0, 5.0));
+    }
+
+    #[test]
+    fn template_order_round_trips() {
+        let raw = [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0), (5.0, 5.0)];
+        let lm = Landmarks::from_yunet_order(raw);
+        assert_eq!(Landmarks::from_template_order(lm.as_template_order()), lm);
     }
 
     #[test]

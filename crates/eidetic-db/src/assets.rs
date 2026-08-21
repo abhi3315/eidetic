@@ -33,6 +33,11 @@ pub struct NewAsset {
     pub place: Option<String>,
     pub place_distance_m: Option<f32>,
     pub thumbnails_generated: bool,
+    /// Video-only (ffprobe, ADR-0011); all None for images.
+    pub duration_secs: Option<f64>,
+    pub video_codec: Option<String>,
+    pub pixel_width: Option<i64>,
+    pub pixel_height: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -66,6 +71,12 @@ pub struct SearchResult {
     pub id: AssetId,
     pub storage_path: PathBuf,
     pub score: f32,
+    /// For videos: the timestamp (seconds) of the best-matching sampled
+    /// frame — the moment to jump to, and the reel generator's cut point.
+    /// None for images.
+    pub frame_ts: Option<f64>,
+    /// Video duration in seconds (probe metadata); None for images.
+    pub duration_secs: Option<f64>,
     pub mime_type: Option<String>,
     pub file_size: i64,
     pub thumbnails_generated: bool,
@@ -74,6 +85,15 @@ pub struct SearchResult {
     pub camera_model: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+}
+
+#[derive(Debug)]
+pub struct UnthumbnailedAsset {
+    pub id: AssetId,
+    pub hash: eidetic_core::Sha256,
+    pub storage_path: PathBuf,
+    pub mime_type: String,
+    pub duration_secs: Option<f64>,
 }
 
 pub struct RecentAsset {
@@ -116,6 +136,10 @@ pub struct AssetDetail {
     pub place: Option<String>,
     pub place_distance_m: Option<f32>,
     pub thumbnails_generated: bool,
+    pub duration_secs: Option<f64>,
+    pub video_codec: Option<String>,
+    pub pixel_width: Option<i64>,
+    pub pixel_height: Option<i64>,
 }
 
 /// UUIDs are stored as lowercase hyphenated TEXT so the database stays
@@ -168,16 +192,22 @@ impl AssetsRepo {
                COUNT(*)                                                     AS total, \
                COUNT(*) FILTER (WHERE a.mime_type LIKE 'image/%')           AS images, \
                COUNT(*) FILTER (WHERE a.mime_type LIKE 'video/%')           AS videos, \
-               COUNT(*) FILTER (WHERE e.asset_id IS NOT NULL)               AS embedded, \
+               COUNT(*) FILTER (WHERE e.asset_id IS NOT NULL \
+                                   OR fe.asset_id IS NOT NULL)              AS embedded, \
                COUNT(*) FILTER (WHERE e.asset_id IS NULL \
-                                  AND a.mime_type LIKE 'image/%')           AS needs_embed, \
+                                  AND a.mime_type LIKE 'image/%' \
+                                   OR fe.asset_id IS NULL \
+                                  AND a.mime_type LIKE 'video/%')           AS needs_embed, \
                COUNT(*) FILTER (WHERE a.thumbnails_generated = 0 \
-                                  AND a.mime_type LIKE 'image/%')           AS thumbnails_pending, \
+                                  AND (a.mime_type LIKE 'image/%' \
+                                       OR a.mime_type LIKE 'video/%'))      AS thumbnails_pending, \
                COALESCE(SUM(a.file_size), 0)                                AS total_bytes, \
                MIN(a.date_taken)                                            AS earliest, \
                MAX(a.date_taken)                                            AS latest \
              FROM assets a \
-             LEFT JOIN embeddings e ON e.asset_id = a.id",
+             LEFT JOIN embeddings e ON e.asset_id = a.id \
+             LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings) fe \
+                    ON fe.asset_id = a.id",
         )
         .fetch_one(&self.pool)
         .await
@@ -213,14 +243,35 @@ impl AssetsRepo {
             .collect())
     }
 
-    /// Ordered by `id` for stable resumption across runs.
-    pub async fn fetch_unthumbnailed(
+    /// Videos with no sampled-frame embeddings yet (ADR-0011). Duration
+    /// rides along so the caller can pick sample timestamps without
+    /// re-probing; None means the import ran without ffprobe.
+    pub async fn fetch_videos_unembedded(
         &self,
-    ) -> crate::Result<Vec<(AssetId, eidetic_core::Sha256, PathBuf)>> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT id, hash, storage_path FROM assets \
+    ) -> crate::Result<Vec<(AssetId, PathBuf, Option<f64>)>> {
+        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
+            "SELECT a.id, a.storage_path, a.duration_secs FROM assets a \
+             LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings) fe \
+                    ON fe.asset_id = a.id \
+             WHERE fe.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
+             ORDER BY a.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, path, dur)| (parse_id(&id), PathBuf::from(path), dur))
+            .collect())
+    }
+
+    /// Ordered by `id` for stable resumption across runs.
+    pub async fn fetch_unthumbnailed(&self) -> crate::Result<Vec<UnthumbnailedAsset>> {
+        let rows: Vec<(String, String, String, String, Option<f64>)> = sqlx::query_as(
+            "SELECT id, hash, storage_path, mime_type, duration_secs FROM assets \
              WHERE thumbnails_generated = 0 \
-               AND mime_type LIKE 'image/%' \
+               AND (mime_type LIKE 'image/%' OR mime_type LIKE 'video/%') \
              ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -229,7 +280,15 @@ impl AssetsRepo {
 
         Ok(rows
             .into_iter()
-            .map(|(id, hash_hex, path)| (parse_id(&id), parse_hash(&hash_hex), PathBuf::from(path)))
+            .map(
+                |(id, hash_hex, path, mime_type, duration_secs)| UnthumbnailedAsset {
+                    id: parse_id(&id),
+                    hash: parse_hash(&hash_hex),
+                    storage_path: PathBuf::from(path),
+                    mime_type,
+                    duration_secs,
+                },
+            )
             .collect())
     }
 
@@ -335,6 +394,62 @@ impl AssetsRepo {
         Ok(())
     }
 
+    /// Replace a video's sampled-frame embeddings in one transaction
+    /// (delete + insert), so re-embedding is idempotent like
+    /// [`Self::store_embedding`].
+    pub async fn store_frame_embeddings(
+        &self,
+        id: AssetId,
+        frames: &[(f64, Vec<f32>)],
+    ) -> crate::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
+        sqlx::query("DELETE FROM frame_embeddings WHERE asset_id = ?")
+            .bind(id_text(id))
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::Error::Query)?;
+        for (ts, vector) in frames {
+            sqlx::query(
+                "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(id_text(id))
+            .bind(ts)
+            .bind(vector.len() as i64)
+            .bind(vector::encode(vector))
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::Error::Query)?;
+        }
+        tx.commit().await.map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
+    /// Backfill probe metadata onto a video imported while ffprobe was
+    /// absent (the thumbnail/embed passes re-probe and call this).
+    pub async fn update_video_probe(
+        &self,
+        id: AssetId,
+        duration_secs: Option<f64>,
+        video_codec: Option<&str>,
+        pixel_width: Option<i64>,
+        pixel_height: Option<i64>,
+    ) -> crate::Result<()> {
+        sqlx::query(
+            "UPDATE assets SET duration_secs = ?, video_codec = ?, \
+             pixel_width = ?, pixel_height = ? WHERE id = ?",
+        )
+        .bind(duration_secs)
+        .bind(video_codec)
+        .bind(pixel_width)
+        .bind(pixel_height)
+        .bind(id_text(id))
+        .execute(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.
@@ -344,23 +459,65 @@ impl AssetsRepo {
         query_vec: &[f32],
         limit: u32,
     ) -> crate::Result<Vec<SearchResult>> {
+        // Image embeddings and video frame embeddings rank in one pool; a
+        // frame row carries its timestamp so the winning moment survives.
         let rows: Vec<(String, Vec<u8>)> =
             sqlx::query_as("SELECT asset_id, vector FROM embeddings")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(crate::Error::Query)?;
+        let frame_rows: Vec<(String, f64, Vec<u8>)> =
+            sqlx::query_as("SELECT asset_id, ts_secs, vector FROM frame_embeddings")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
 
-        let mut stored = Vec::with_capacity(rows.len());
+        let mut keys: Vec<(AssetId, Option<f64>)> =
+            Vec::with_capacity(rows.len() + frame_rows.len());
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(keys.capacity());
+        let corrupt = |table: &'static str, id: &str, blob: &[u8]| crate::Error::CorruptRow {
+            table,
+            column: "vector",
+            detail: format!("asset {id}: blob of {} bytes is not whole f32s", blob.len()),
+        };
         for (id, blob) in rows {
-            let decoded = vector::decode(&blob).ok_or_else(|| crate::Error::CorruptRow {
-                table: "embeddings",
-                column: "vector",
-                detail: format!("asset {id}: blob of {} bytes is not whole f32s", blob.len()),
-            })?;
-            stored.push((parse_id(&id), decoded));
+            let decoded = vector::decode(&blob).ok_or_else(|| corrupt("embeddings", &id, &blob))?;
+            keys.push((parse_id(&id), None));
+            vectors.push(decoded);
+        }
+        for (id, ts, blob) in frame_rows {
+            let decoded =
+                vector::decode(&blob).ok_or_else(|| corrupt("frame_embeddings", &id, &blob))?;
+            keys.push((parse_id(&id), Some(ts)));
+            vectors.push(decoded);
         }
 
-        let ranked = self.index.top_k(query_vec, &stored, limit as usize);
+        // A video contributes several frame rows, so over-fetch and collapse
+        // to the best row per asset. The start guess assumes few frames per
+        // asset; if heavy per-asset duplication starves the result, escalate
+        // by doubling rather than hard-coding the sampler's frame cap here.
+        let mut over_fetch = (limit as usize).saturating_mul(6);
+        let mut ranked: Vec<(AssetId, f32, Option<f64>)>;
+        loop {
+            let ranked_rows = self.index.top_k(query_vec, &vectors, over_fetch);
+            let exhausted = ranked_rows.len() < over_fetch;
+
+            let mut seen = std::collections::HashSet::new();
+            ranked = Vec::new();
+            for (row_idx, score) in ranked_rows {
+                let (asset_id, ts) = keys[row_idx];
+                if seen.insert(asset_id) {
+                    ranked.push((asset_id, score, ts));
+                    if ranked.len() == limit as usize {
+                        break;
+                    }
+                }
+            }
+            if ranked.len() == limit as usize || exhausted {
+                break;
+            }
+            over_fetch = over_fetch.saturating_mul(2);
+        }
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -372,7 +529,7 @@ impl AssetsRepo {
             .join(",");
         let sql = format!(
             "SELECT id, storage_path, mime_type, file_size, thumbnails_generated, date_taken, \
-                    camera_make, camera_model, latitude, longitude \
+                    camera_make, camera_model, latitude, longitude, duration_secs \
              FROM assets WHERE id IN ({placeholders})"
         );
 
@@ -388,10 +545,11 @@ impl AssetsRepo {
             camera_model: Option<String>,
             latitude: Option<f64>,
             longitude: Option<f64>,
+            duration_secs: Option<f64>,
         }
 
         let mut q = sqlx::query_as::<_, MetaRow>(&sql);
-        for (id, _) in &ranked {
+        for (id, _, _) in &ranked {
             q = q.bind(id_text(*id));
         }
         let metas = q.fetch_all(&self.pool).await.map_err(crate::Error::Query)?;
@@ -401,12 +559,13 @@ impl AssetsRepo {
 
         Ok(ranked
             .into_iter()
-            .filter_map(|(id, score)| {
+            .filter_map(|(id, score, frame_ts)| {
                 let m = by_id.remove(&id)?;
                 Some(SearchResult {
                     id,
                     storage_path: PathBuf::from(m.storage_path),
                     score,
+                    frame_ts,
                     mime_type: m.mime_type,
                     file_size: m.file_size,
                     thumbnails_generated: m.thumbnails_generated,
@@ -415,6 +574,7 @@ impl AssetsRepo {
                     camera_model: m.camera_model,
                     latitude: m.latitude,
                     longitude: m.longitude,
+                    duration_secs: m.duration_secs,
                 })
             })
             .collect())
@@ -446,10 +606,11 @@ impl AssetsRepo {
               lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
               shutter, iso, orientation, altitude, gps_direction, exif_raw, \
               country_code, country_name, admin1, place, place_distance_m, \
-              thumbnails_generated) \
+              thumbnails_generated, duration_secs, video_codec, \
+              pixel_width, pixel_height) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?) \
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
@@ -481,6 +642,10 @@ impl AssetsRepo {
         .bind(asset.place.as_deref())
         .bind(asset.place_distance_m)
         .bind(asset.thumbnails_generated)
+        .bind(asset.duration_secs)
+        .bind(asset.video_codec.as_deref())
+        .bind(asset.pixel_width)
+        .bind(asset.pixel_height)
         .fetch_optional(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -504,7 +669,8 @@ const DETAIL_SELECT: &str = "SELECT id, hash, original_filename, storage_path, f
             lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
             shutter, iso, orientation, altitude, gps_direction, exif_raw, \
             country_code, country_name, admin1, place, place_distance_m, \
-            thumbnails_generated \
+            thumbnails_generated, duration_secs, video_codec, \
+            pixel_width, pixel_height \
      FROM assets WHERE id = ?";
 
 #[derive(sqlx::FromRow)]
@@ -538,6 +704,10 @@ struct DetailRow {
     place: Option<String>,
     place_distance_m: Option<f32>,
     thumbnails_generated: bool,
+    duration_secs: Option<f64>,
+    video_codec: Option<String>,
+    pixel_width: Option<i64>,
+    pixel_height: Option<i64>,
 }
 
 impl DetailRow {
@@ -572,6 +742,10 @@ impl DetailRow {
             place: self.place,
             place_distance_m: self.place_distance_m,
             thumbnails_generated: self.thumbnails_generated,
+            duration_secs: self.duration_secs,
+            video_codec: self.video_codec,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
         }
     }
 }
