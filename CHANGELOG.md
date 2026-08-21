@@ -2,6 +2,38 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.4.0 — 2026-08-22
+
+The "videos are real media now" release — and with it, every feature goals.md set out to build is in: ingestion, semantic search, face grouping, and reels. Videos stop being placeholder tiles: they thumbnail, embed, search by *moment*, play in the browser, and get cut into prompt-driven reels. The web viewer grows a People section.
+
+### Added
+
+- **Video pipeline** (ADR-0011) — shells out to system `ffmpeg`/`ffprobe`, found on `PATH` or via `EIDETIC_FFMPEG_PATH`/`EIDETIC_FFPROBE_PATH`. Strictly a *runtime* dependency: builds don't change, and without ffmpeg videos still import — one warning says what to install, and `eidetic thumbnail` + `eidetic embed` backfill later (both re-probe and store the metadata they find).
+  - Import probes duration, codec and rotation-aware display dimensions; the container `creation_time` becomes `date_taken`; the QuickTime ISO 6709 GPS tag iPhones write geocodes offline exactly like photo EXIF.
+  - A representative frame (10% in, ≥0.5s) goes through the photo thumbnail path, so videos get real tiles in the grid.
+- **Semantic search over video moments** — `eidetic embed` samples up to 5 frames across the middle 80% of each video and stores each with its timestamp (`frame_embeddings`). Search ranks image and frame vectors in one pool and collapses to the best moment per asset: one matching second is enough to surface a whole video, and results carry that timestamp (`@7.0s` on default output, `ts` field, JSON). A video whose tail can't decode keeps the frames that did embed.
+- **`eidetic reel "<prompt>"`** — the goals.md stretch goal. Search picks the moments; ffmpeg cuts them: ~4s clips around matched video frames (1.5s lead-in), 3s Ken Burns push-ins for photos (rendered from the upright medium thumbnail, so HEIC and rotated JPEGs come out right), all normalised to one H.264/30fps stream and joined losslessly. `--duration` (default 30s), `--size` (default 1920x1080), `--output`, `--dry-run` for the cut list. Weak matches are refused rather than padded in.
+- **People in the web viewer** — `/persons` (cover face crop, name, face count), `/persons/{id}` (face-crop grid linking to each photo), and a People row on asset detail pages. Face crops are the canonical 112×112 aligned crops rebuilt from stored landmarks — no model loading — JPEG-cached under `.faces/`. Viewing only: naming and merging stay in the CLI.
+- **Video playback in the browser** — detail pages render a `<video>` player, and `/assets/{id}/raw` now answers HTTP Range requests (206/416) so seeking works everywhere, Safari included. Video grid tiles get a ▶ badge.
+
+### Changed
+
+- `eidetic thumbnail` and `eidetic embed` treat videos as first-class pending work (previously image-only); `eidetic stats` counts them in `needs_embed`/`thumbnails_pending`.
+- `VectorIndex::top_k` returns row indices instead of asset ids, so a matched frame keeps its timestamp through ranking.
+
+### Verified on a real mixed library
+
+- Real videos (Big Buck Bunny, jellyfish footage, Ken Burns pans incl. HEVC portrait) + 65 photos: "jellyfish floating underwater" → jellyfish.mp4 @7.0s, "cartoon rabbit in a meadow" → bunny @9.0s, "woman playing tennis" → the Serena pan @0.5s — each with a clean score gap, photos and videos ranking correctly against each other.
+- A truncated mp4 imports, probes, embeds its 2 decodable frames and completes; an audio-only m4a is rejected at import.
+- Reels: a 15s photo reel rendered frame-exact at 15.000s; the jellyfish reel cut exactly the matched moment and refused weak padding.
+- Live server: persons grid, face crops, `<video>` seeking via Range (206 with exact byte counts), play badges, video thumbnails.
+
+### Internals
+
+- New: `eidetic-ingest::video` (probe/extract/sampling), `frame_embeddings` table (migration 004, with `duration_secs`/`video_codec`/`pixel_width`/`pixel_height` on assets), `eidetic-cli::reel`, `FacesRepo` person/face lookup methods, `/faces/{id}/crop` route, `Landmarks::from_template_order`.
+- `/assets/{id}/raw` delegates to tower-http's `ServeFile` for correct range semantics.
+- CI installs ffmpeg; a real-ffmpeg round-trip test synthesises a clip with lavfi and asserts probe + extraction + corrupt-file handling.
+
 ## v0.3.0 — 2026-08-21
 
 The "faces and no more Docker" release. v0.2 could browse and search a library; v0.3 groups the people in it — and drops the database server entirely. Postgres + VectorChord is gone, replaced by a single SQLite file, so the whole system is now one binary plus one file, no container, no daemon.
