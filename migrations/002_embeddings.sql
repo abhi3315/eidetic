@@ -1,19 +1,22 @@
--- Image embedding storage.
+-- Image embedding storage (ADR-0005).
 --
--- Per ADR-0002: pgvector + VectorChord (drop-in pgvector-compatible).
--- Per ADR-0004: SigLIP 2 base produces 768-dimensional vectors.
+-- Embeddings live in their own table rather than as a nullable column on
+-- `assets`. That keeps "which assets still need embedding" a plain anti-join,
+-- avoids rewriting wide asset rows on every embed, and leaves room for a
+-- second embedding type (face vectors, ADR-pending) as another table with the
+-- same shape.
 --
--- The vchordrq index is VectorChord's primary index method. If we
--- ever need to fall back to vanilla pgvector, the migration is:
---   DROP INDEX assets_embedding_idx;
---   CREATE INDEX assets_embedding_idx ON assets
---       USING hnsw (embedding vector_cosine_ops);
--- Schema and column type stay the same.
+-- `vector` is the raw f32 sequence in little-endian byte order. `dim` records
+-- the length so a model change (e.g. 768 -> 1152 per ADR-0007) is detectable
+-- rather than silently mixing dimensions in one search.
+--
+-- There is no ANN index: search is exact brute-force cosine computed in Rust
+-- behind the `VectorIndex` trait. At personal-library scale that is both the
+-- most accurate option (100% recall) and fast enough. See ADR-0005 for the
+-- escalation path.
 
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS vchord;
-
-ALTER TABLE assets ADD COLUMN embedding vector(768);
-
-CREATE INDEX assets_embedding_idx ON assets
-    USING vchordrq (embedding vector_cosine_ops);
+CREATE TABLE embeddings (
+    asset_id TEXT    PRIMARY KEY NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    dim      INTEGER NOT NULL,
+    vector   BLOB    NOT NULL
+);

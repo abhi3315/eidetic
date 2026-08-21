@@ -1,0 +1,586 @@
+//! Loads the two ONNX sessions and runs detect -> align -> embed (ADR-0010).
+
+use super::align::{self, align_face};
+use super::detect::{self, Detection, INPUT_SIZE, STRIDES, StridePlanes};
+use crate::{Error, Result};
+use image::{DynamicImage, RgbImage, imageops::FilterType};
+use ort::session::Session;
+use ort::value::Tensor;
+use std::path::Path;
+
+/// Detector confidence floor. Below this a "face" is usually texture noise.
+const DEFAULT_SCORE_THRESHOLD: f32 = 0.6;
+/// IoU above which two boxes are treated as the same face.
+const DEFAULT_NMS_THRESHOLD: f32 = 0.3;
+/// Faces whose longest side is under this many pixels are too small to embed
+/// reliably. ADR-0010 calls for quality filtering before clustering; this is
+/// the cheapest useful signal.
+const MIN_FACE_PIXELS: f32 = 32.0;
+
+#[derive(Debug)]
+struct ModelPair {
+    detector_repo: &'static str,
+    detector_file: &'static str,
+    embedder_repo: &'static str,
+    embedder_file: &'static str,
+    embed_dim: usize,
+}
+
+/// Permissive default: YuNet (MIT) + SFace (Apache-2.0), both OpenCV Zoo.
+const YUNET_SFACE: ModelPair = ModelPair {
+    detector_repo: "opencv/face_detection_yunet",
+    detector_file: "face_detection_yunet_2023mar.onnx",
+    embedder_repo: "opencv/face_recognition_sface",
+    embedder_file: "face_recognition_sface_2021dec.onnx",
+    embed_dim: 128,
+};
+
+/// YuNet detection paired with AuraFace embedding: Apache-2.0, ResNet100 with
+/// ArcFace loss, 512-dim.
+///
+/// Same accuracy class as ArcFace (LFW 0.9965) without the non-commercial
+/// restriction — fal trained it specifically on commercially-usable data to
+/// avoid exactly the licensing problem that rules out `buffalo_l`. It takes
+/// the same `data` input name and 112x112 aligned crop as SFace, so it is a
+/// drop-in for the embedding half.
+///
+/// Caveat recorded in ADR-0010: the upstream repo is labelled Apache-2.0 but
+/// also ships files carrying verbatim InsightFace names, and its README does
+/// not state which weights fal trained. We use only the recognition model,
+/// which is the one they claim as their own.
+const YUNET_AURAFACE: ModelPair = ModelPair {
+    detector_repo: "opencv/face_detection_yunet",
+    detector_file: "face_detection_yunet_2023mar.onnx",
+    embedder_repo: "fal/AuraFace-v1",
+    embedder_file: "glintr100.onnx",
+    embed_dim: 512,
+};
+
+/// Opt-in: InsightFace SCRFD + ArcFace. Better accuracy, but the weights are
+/// licensed for non-commercial research only — the user chooses this knowingly.
+const BUFFALO_L: ModelPair = ModelPair {
+    detector_repo: "immich-app/buffalo_l",
+    detector_file: "detection/model.onnx",
+    embedder_repo: "immich-app/buffalo_l",
+    embedder_file: "recognition/model.onnx",
+    embed_dim: 512,
+};
+
+fn pair_for(raw: Option<&str>) -> Result<&'static ModelPair> {
+    match raw {
+        None | Some("auraface") => Ok(&YUNET_AURAFACE),
+        Some("sface") => Ok(&YUNET_SFACE),
+        Some("buffalo_l") => Ok(&BUFFALO_L),
+        Some(other) => Err(Error::ModelLoad(format!(
+            "Unknown EIDETIC_FACE_MODEL={other:?}; valid values: auraface, sface, buffalo_l"
+        ))),
+    }
+}
+
+/// A detected face plus its embedding.
+#[derive(Debug, Clone)]
+pub struct AnalyzedFace {
+    pub detection: Detection,
+    /// L2-normalised, so cosine similarity is a plain dot product.
+    pub embedding: Vec<f32>,
+}
+
+/// Owns the detection and recognition sessions.
+///
+/// Synchronous, like [`crate::SiglipEmbedder`]: callers inside a Tokio runtime
+/// should drive it from a blocking worker.
+pub struct FaceAnalyzer {
+    detector: Session,
+    embedder: Session,
+    pair: &'static ModelPair,
+    score_threshold: f32,
+    min_face_pixels: f32,
+}
+
+impl FaceAnalyzer {
+    /// Load the active model pair, downloading on first use.
+    ///
+    /// Selected by `EIDETIC_FACE_MODEL` (`yunet` default, `buffalo_l` opt-in).
+    /// Unknown values are rejected rather than silently falling back, matching
+    /// `EIDETIC_MODEL` and `EIDETIC_ACCELERATOR`.
+    pub fn load(models_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(models_dir)
+            .map_err(|e| Error::ModelLoad(format!("cannot create models dir: {e}")))?;
+
+        let pair = pair_for(std::env::var("EIDETIC_FACE_MODEL").ok().as_deref())?;
+
+        if std::ptr::eq(pair, &BUFFALO_L) {
+            tracing::warn!(
+                "EIDETIC_FACE_MODEL=buffalo_l uses InsightFace weights, which upstream \
+                 licenses for non-commercial research use only. You are downloading them \
+                 yourself; eidetic neither bundles nor redistributes them. See \
+                 docs/adr/0010-face-stack.md."
+            );
+        }
+
+        let detector_path =
+            crate::siglip::download(models_dir, pair.detector_repo, pair.detector_file)?;
+        let embedder_path =
+            crate::siglip::download(models_dir, pair.embedder_repo, pair.embedder_file)?;
+
+        Ok(Self {
+            detector: crate::siglip::session_for_current_accelerator(&detector_path, models_dir)?,
+            embedder: crate::siglip::session_for_current_accelerator(&embedder_path, models_dir)?,
+            pair,
+            score_threshold: DEFAULT_SCORE_THRESHOLD,
+            min_face_pixels: MIN_FACE_PIXELS,
+        })
+    }
+
+    pub fn embed_dim(&self) -> usize {
+        self.pair.embed_dim
+    }
+
+    /// Decode the file at `path` and analyze it.
+    ///
+    /// Uses the same loader as [`crate::SiglipEmbedder::embed`], so HEIC, DNG
+    /// and EXIF rotation behave identically for face detection and for
+    /// semantic search.
+    pub fn analyze_path(&mut self, path: &Path) -> Result<Vec<AnalyzedFace>> {
+        let image = crate::image_io::load_oriented_image(path)?;
+        self.analyze(&image)
+    }
+
+    /// Detect every face in `image`, align it, and embed it.
+    ///
+    /// Faces below the size floor are dropped: a 20px face produces an
+    /// embedding that is mostly noise and would poison a cluster.
+    pub fn analyze(&mut self, image: &DynamicImage) -> Result<Vec<AnalyzedFace>> {
+        let detections = self.detect(image)?;
+
+        let mut out = Vec::with_capacity(detections.len());
+        for detection in detections {
+            if detection.bbox.max_side() < self.min_face_pixels {
+                continue;
+            }
+            let Some(aligned) = align_face(image, &detection.landmarks) else {
+                // Degenerate landmarks; nothing sensible to embed.
+                continue;
+            };
+            let embedding = self.embed_aligned(&aligned)?;
+            out.push(AnalyzedFace {
+                detection,
+                embedding,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Run the detector and decode all three strides.
+    fn detect(&mut self, image: &DynamicImage) -> Result<Vec<Detection>> {
+        let (input, scale) = letterbox(image);
+        let shape = [1usize, 3, INPUT_SIZE as usize, INPUT_SIZE as usize];
+        let tensor = Tensor::<f32>::from_array((shape, input))
+            .map_err(|e| Error::Inference(format!("create detector tensor: {e}")))?;
+
+        let outputs = self
+            .detector
+            .run(ort::inputs!["input" => tensor])
+            .map_err(|e: ort::Error| Error::Inference(e.to_string()))?;
+
+        // Pull all twelve planes first; decoding borrows them.
+        let mut planes = Vec::with_capacity(STRIDES.len());
+        for (stride, grid) in STRIDES {
+            let get = |prefix: &str| -> Result<Vec<f32>> {
+                let name = format!("{prefix}_{stride}");
+                let (_shape, data) = outputs[name.as_str()]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| Error::Inference(format!("{name}: {e}")))?;
+                Ok(data.to_vec())
+            };
+            planes.push((
+                stride,
+                grid,
+                get("cls")?,
+                get("obj")?,
+                get("bbox")?,
+                get("kps")?,
+            ));
+        }
+
+        let mut dets = Vec::new();
+        for (stride, grid, cls, obj, bbox, kps) in &planes {
+            detect::decode_stride(
+                &StridePlanes {
+                    stride: *stride,
+                    grid: *grid,
+                    cls,
+                    obj,
+                    bbox,
+                    kps,
+                },
+                self.score_threshold,
+                scale,
+                // Top-left placement, so there is no offset to undo.
+                0.0,
+                0.0,
+                &mut dets,
+            );
+        }
+
+        Ok(detect::non_max_suppression(dets, DEFAULT_NMS_THRESHOLD))
+    }
+
+    /// Embed one aligned 112x112 crop.
+    fn embed_aligned(&mut self, aligned: &RgbImage) -> Result<Vec<f32>> {
+        let pixels = align::to_input_tensor(aligned);
+        let size = align::ALIGNED_SIZE as usize;
+        let tensor = Tensor::<f32>::from_array(([1usize, 3, size, size], pixels))
+            .map_err(|e| Error::Inference(format!("create embedder tensor: {e}")))?;
+
+        let outputs = self
+            .embedder
+            .run(ort::inputs!["data" => tensor])
+            .map_err(|e: ort::Error| Error::Inference(e.to_string()))?;
+
+        // SFace names its output `fc1`; take the sole output rather than
+        // hard-coding a name that differs across the two model pairs. Bound the
+        // borrow to a local so the temporary outlives the extract.
+        let (_name, value) = outputs
+            .iter()
+            .next()
+            .ok_or_else(|| Error::Inference("embedder produced no output".into()))?;
+        let (_shape, data) = value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| Error::Inference(e.to_string()))?;
+
+        let mut vec = data.to_vec();
+        if vec.len() != self.pair.embed_dim {
+            return Err(Error::Inference(format!(
+                "expected {}-dim face embedding, model produced {}",
+                self.pair.embed_dim,
+                vec.len()
+            )));
+        }
+        l2_normalize(&mut vec);
+        Ok(vec)
+    }
+}
+
+/// Resize into a fixed 640x640 buffer, preserving aspect ratio and placing the
+/// image top-left so decoding only has to undo `scale`.
+///
+/// Returns the CHW tensor and the scale factor applied.
+///
+/// **Channel order and value range are the unverified part of this pipeline.**
+/// YuNet ships through OpenCV, whose images are BGR with raw 0-255 values and
+/// no mean/std normalisation, so that is what we feed it. Getting this wrong
+/// does not error — it just makes detection quietly poor — so ADR-0010 lists it
+/// as needing confirmation against a real photo.
+fn letterbox(image: &DynamicImage) -> (Vec<f32>, f32) {
+    let (w, h) = (image.width().max(1), image.height().max(1));
+    let scale = (INPUT_SIZE as f32 / w as f32).min(INPUT_SIZE as f32 / h as f32);
+    let new_w = ((w as f32 * scale).round() as u32).clamp(1, INPUT_SIZE);
+    let new_h = ((h as f32 * scale).round() as u32).clamp(1, INPUT_SIZE);
+
+    let resized = image
+        .resize_exact(new_w, new_h, FilterType::Triangle)
+        .to_rgb8();
+
+    let size = INPUT_SIZE as usize;
+    let plane = size * size;
+    let mut chw = vec![0.0f32; 3 * plane];
+
+    for y in 0..new_h as usize {
+        for x in 0..new_w as usize {
+            let px = resized.get_pixel(x as u32, y as u32);
+            let idx = y * size + x;
+            // BGR, matching OpenCV's channel order.
+            chw[idx] = px.0[2] as f32;
+            chw[plane + idx] = px.0[1] as f32;
+            chw[2 * plane + idx] = px.0[0] as f32;
+        }
+    }
+
+    (chw, scale)
+}
+
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_for_known_values() {
+        // Default is the 512-dim permissive pair.
+        assert_eq!(pair_for(None).unwrap().embed_dim, 512);
+        assert_eq!(pair_for(Some("auraface")).unwrap().embed_dim, 512);
+        assert_eq!(pair_for(Some("sface")).unwrap().embed_dim, 128);
+        assert_eq!(pair_for(Some("buffalo_l")).unwrap().embed_dim, 512);
+    }
+
+    #[test]
+    fn every_pair_detects_with_a_permissive_model() {
+        // Only buffalo_l may use the non-commercial detector; the other two
+        // must stay on YuNet. Guards against a future edit quietly promoting
+        // an encumbered detector into a default path.
+        for name in [None, Some("auraface"), Some("sface")] {
+            let pair = pair_for(name).unwrap();
+            assert_eq!(
+                pair.detector_repo, "opencv/face_detection_yunet",
+                "{name:?} must detect with YuNet"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_for_unknown_value_errors() {
+        let err = pair_for(Some("scrfd")).unwrap_err().to_string();
+        assert!(err.contains("scrfd"), "should echo the bad value: {err}");
+        assert!(err.contains("buffalo_l"), "should list valid values: {err}");
+    }
+
+    #[test]
+    fn letterbox_preserves_aspect_and_fills_target() {
+        // 1280x640 halves to 640x320, so scale is 0.5.
+        let img = DynamicImage::new_rgb8(1280, 640);
+        let (tensor, scale) = letterbox(&img);
+        assert!((scale - 0.5).abs() < 1e-6, "scale was {scale}");
+        assert_eq!(tensor.len(), 3 * (INPUT_SIZE as usize).pow(2));
+    }
+
+    #[test]
+    fn letterbox_upscales_small_images() {
+        let img = DynamicImage::new_rgb8(64, 64);
+        let (_t, scale) = letterbox(&img);
+        assert!((scale - 10.0).abs() < 1e-6, "scale was {scale}");
+    }
+
+    #[test]
+    fn letterbox_channel_order_is_bgr() {
+        // Solid red image: R=255. In BGR the FIRST plane is blue (0) and the
+        // THIRD is red (255).
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            INPUT_SIZE,
+            INPUT_SIZE,
+            image::Rgb([255, 0, 0]),
+        ));
+        let (t, _) = letterbox(&img);
+        let plane = (INPUT_SIZE as usize).pow(2);
+        assert_eq!(t[0], 0.0, "first plane should be blue");
+        assert_eq!(t[2 * plane], 255.0, "third plane should be red");
+    }
+
+    #[test]
+    fn l2_normalize_produces_unit_vector() {
+        let mut v = vec![3.0f32, 4.0];
+        l2_normalize(&mut v);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_leaves_zero_vector_alone() {
+        let mut v = vec![0.0f32; 128];
+        l2_normalize(&mut v);
+        assert!(v.iter().all(|&x| x == 0.0));
+    }
+
+    /// Discrimination check against a directory of LFW-style images.
+    ///
+    /// The real-portrait test below validates geometry on one face; this one
+    /// validates what actually matters for clustering — that two photos of
+    /// the same person embed closer than photos of different people. The
+    /// landmark-order bug this guards against (eyes and mouths swapped into a
+    /// mirrored correspondence the similarity transform cannot fit) passed
+    /// every geometry assertion while collapsing same-person cosine
+    /// similarity from ~0.67 to ~0.39 against different-person ~0.32.
+    ///
+    /// Point `EIDETIC_FACE_LFW_DIR` at a flat directory of `Name_NNNN.jpg`
+    /// files (LFW naming), several identities with several photos each. The
+    /// largest face per image is taken as the named person.
+    #[test]
+    #[ignore = "requires face models + LFW images; set EIDETIC_MODELS_CACHE and EIDETIC_FACE_LFW_DIR"]
+    fn lfw_same_person_similarity_beats_different_person() {
+        let models_dir = std::env::var("EIDETIC_MODELS_CACHE")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_MODELS_CACHE");
+        let lfw_dir = std::env::var("EIDETIC_FACE_LFW_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_FACE_LFW_DIR=/path/to/flat/lfw/images");
+
+        let mut analyzer = FaceAnalyzer::load(&models_dir).expect("load face models");
+
+        // identity -> main-face embeddings, one per image.
+        let mut by_identity: std::collections::HashMap<String, Vec<Vec<f32>>> =
+            std::collections::HashMap::new();
+        for entry in std::fs::read_dir(&lfw_dir).expect("read LFW dir") {
+            let path = entry.expect("dir entry").path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // `George_W_Bush_0001` -> `George_W_Bush`.
+            let Some((identity, _)) = stem.rsplit_once('_') else {
+                continue;
+            };
+            let Ok(faces) = analyzer.analyze_path(&path) else {
+                continue;
+            };
+            let Some(main) = faces.iter().max_by(|a, b| {
+                (a.detection.bbox.width * a.detection.bbox.height)
+                    .total_cmp(&(b.detection.bbox.width * b.detection.bbox.height))
+            }) else {
+                continue;
+            };
+            by_identity
+                .entry(identity.to_string())
+                .or_default()
+                .push(main.embedding.clone());
+        }
+
+        let multi: Vec<_> = by_identity.values().filter(|v| v.len() >= 2).collect();
+        assert!(
+            multi.len() >= 2,
+            "need at least two identities with two or more photos each; got {}",
+            multi.len()
+        );
+
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+
+        let mut intra = Vec::new();
+        for vs in by_identity.values() {
+            for i in 0..vs.len() {
+                for j in i + 1..vs.len() {
+                    intra.push(cos(&vs[i], &vs[j]));
+                }
+            }
+        }
+        let ids: Vec<_> = by_identity.values().collect();
+        let mut inter = Vec::new();
+        for i in 0..ids.len() {
+            for j in i + 1..ids.len() {
+                for a in ids[i] {
+                    for b in ids[j] {
+                        inter.push(cos(a, b));
+                    }
+                }
+            }
+        }
+
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (intra_mean, inter_mean) = (mean(&intra), mean(&inter));
+        println!(
+            "intra n={} mean={intra_mean:.3}; inter n={} mean={inter_mean:.3}",
+            intra.len(),
+            inter.len()
+        );
+
+        // Healthy ArcFace-family separation is ~0.6 vs ~0.1. The mirrored-
+        // alignment bug produced 0.39 vs 0.32, so a 0.25 margin cleanly splits
+        // working from broken without being brittle to the exact image subset.
+        assert!(
+            intra_mean > 0.5,
+            "same-person similarity too low ({intra_mean:.3}) — alignment or \
+             preprocessing is likely degrading the crops"
+        );
+        assert!(
+            intra_mean - inter_mean > 0.25,
+            "same-person ({intra_mean:.3}) barely beats different-person \
+             ({inter_mean:.3}) — embeddings are not discriminating identities"
+        );
+    }
+
+    /// End-to-end check against a real photograph.
+    ///
+    /// This is the test that validates the two assumptions unit tests cannot:
+    /// the BGR / raw-0-255 input convention, and the landmark ordering. Both
+    /// fail *silently* — a mirrored alignment or swapped channels still produce
+    /// a well-formed embedding, just a worse one — so the only way to catch
+    /// them is to require plausible geometry on a known face.
+    #[test]
+    #[ignore = "requires face models + a photo; set EIDETIC_MODELS_CACHE and EIDETIC_FACE_TEST_IMAGE"]
+    fn detects_and_embeds_a_real_face() {
+        let models_dir = std::env::var("EIDETIC_MODELS_CACHE")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_MODELS_CACHE");
+        let image_path = std::env::var("EIDETIC_FACE_TEST_IMAGE")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_FACE_TEST_IMAGE=/path/to/portrait.jpg");
+
+        let image = image::ImageReader::open(&image_path)
+            .expect("open test image")
+            .with_guessed_format()
+            .expect("guess format")
+            .decode()
+            .expect("decode test image");
+
+        let mut analyzer = FaceAnalyzer::load(&models_dir).expect("load face models");
+        let faces = analyzer.analyze(&image).expect("analyze");
+
+        assert!(
+            !faces.is_empty(),
+            "no face found in {} — suggests the input convention (BGR vs RGB, \
+             0-255 vs normalised) or the stride decode is wrong",
+            image_path.display()
+        );
+
+        let face = &faces[0];
+        println!(
+            "detected {} face(s); best score {:.3} bbox {:?}",
+            faces.len(),
+            face.detection.score,
+            face.detection.bbox
+        );
+
+        // Embedding shape and normalisation.
+        assert_eq!(face.embedding.len(), analyzer.embed_dim());
+        let norm: f32 = face.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "embedding not unit-norm: {norm}");
+
+        // Geometry sanity: the box must sit inside the frame and be a plausible
+        // size, which catches a decode that forgot to undo the letterbox scale.
+        let b = face.detection.bbox;
+        assert!(
+            b.x > -b.width && b.y > -b.height,
+            "bbox starts far outside the frame: {b:?}"
+        );
+        assert!(
+            b.width < image.width() as f32 * 1.5 && b.height < image.height() as f32 * 1.5,
+            "bbox larger than the image, letterbox scale likely not undone: {b:?}"
+        );
+        assert!(b.max_side() >= MIN_FACE_PIXELS);
+
+        // Landmark ordering: for any roughly upright portrait the subject's
+        // right eye appears on the LEFT of the frame, so `right_eye.x` must be
+        // the smaller value. This is the assertion that catches a mirrored
+        // alignment, which is otherwise invisible.
+        let lm = face.detection.landmarks;
+        println!(
+            "landmarks: right_eye {:?} left_eye {:?} nose {:?}",
+            lm.right_eye, lm.left_eye, lm.nose
+        );
+        assert!(
+            lm.right_eye.0 < lm.left_eye.0,
+            "subject's right eye should sit at a smaller x than the left eye; \
+             got right={:?} left={:?} — keypoint order is probably swapped",
+            lm.right_eye,
+            lm.left_eye
+        );
+        // Eyes above nose, nose above mouth, in image coordinates.
+        assert!(
+            lm.right_eye.1 < lm.nose.1 && lm.left_eye.1 < lm.nose.1,
+            "eyes should be above the nose: eyes {:?}/{:?} nose {:?}",
+            lm.right_eye,
+            lm.left_eye,
+            lm.nose
+        );
+        assert!(
+            lm.nose.1 < lm.left_mouth.1 && lm.nose.1 < lm.right_mouth.1,
+            "nose should be above the mouth: nose {:?} mouth {:?}/{:?}",
+            lm.nose,
+            lm.left_mouth,
+            lm.right_mouth
+        );
+    }
+}

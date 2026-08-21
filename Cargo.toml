@@ -20,8 +20,8 @@ authors = ["Abhishek Sharma"]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
-# Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+# Database (embedded SQLite; libsqlite3-sys is bundled + statically linked)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -44,9 +44,6 @@ ndarray = "0.17"
 
 # Text tokenization (HuggingFace tokenizers port)
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-
-# pgvector sqlx type integration
-pgvector = { version = "0.4", features = ["sqlx"] }
 
 # Errors
 thiserror = "2"
@@ -92,7 +89,6 @@ walkdir = "2"
 csv = "1"
 
 # Testing
-testcontainers = { version = "0.27" }
 tempfile = "3"
 
 [profile.release]

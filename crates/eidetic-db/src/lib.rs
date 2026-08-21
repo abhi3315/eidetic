@@ -1,35 +1,65 @@
 //! No other crate touches `sqlx::Pool` directly; all DB access goes through
-//! `PgAssetsRepo`.
+//! `AssetsRepo`.
+//!
+//! Storage is embedded SQLite (ADR-0005): one file, no server process. The
+//! pool is opened with WAL journaling so readers never block the single
+//! writer, and with a busy timeout so concurrent commands wait rather than
+//! failing with `SQLITE_BUSY`.
 
 use eidetic_core::Config;
-use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use std::str::FromStr;
+use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::time::Duration;
 use tracing::info;
 
 pub mod assets;
 pub use assets::{
-    AssetDetail, InsertOutcome, LibraryStats, NewAsset, PgAssetsRepo, RecentAsset, SearchResult,
+    AssetDetail, AssetsRepo, InsertOutcome, LibraryStats, NewAsset, RecentAsset, SearchResult,
 };
+
+pub mod cluster;
+pub use cluster::{ClusterParams, Constraints, Face, PersonExemplars, ProposedPerson};
+
+pub mod faces;
+pub use faces::{FaceEmbedding, FacesRepo, NewFace, Person};
+
+pub mod vector;
+pub use vector::{BruteForce, VectorIndex};
 
 pub mod error;
 pub use error::{Error, Result};
 
-/// Connect to Postgres and run any pending migrations.
+/// Open (creating if absent) the SQLite database and run pending migrations.
 ///
-/// sqlx uses advisory locks internally, so concurrent startups from multiple
-/// processes are safe.
-pub async fn connect(config: &Config) -> Result<PgPool> {
-    info!(database_url = %sanitize_url(&config.database_url), "connecting to postgres");
+/// sqlx takes a migration lock internally, so concurrent startups from
+/// multiple processes are safe.
+pub async fn connect(config: &Config) -> Result<SqlitePool> {
+    let path = &config.database_path;
+    info!(database_path = %path.display(), "opening sqlite database");
 
-    // Parse the URL ourselves so any later sqlx error references structured
-    // fields (host, port, user) instead of round-tripping the raw URL, which
-    // sqlx::Error::Configuration would otherwise echo verbatim through anyhow.
-    let options =
-        PgConnectOptions::from_str(&config.database_url).map_err(|_| Error::InvalidUrl)?;
+    // SQLite creates the file, but not its parent directory.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| Error::OpenFile {
+            path: parent.display().to_string(),
+            source: e,
+        })?;
+    }
 
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        // WAL: concurrent readers alongside the single writer. NORMAL sync is
+        // the recommended pairing — durable across app crashes, trading only
+        // the OS-crash window, which is acceptable for a re-importable library.
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(30));
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
         .connect_with(options)
         .await
         .map_err(Error::Connect)?;
@@ -41,43 +71,4 @@ pub async fn connect(config: &Config) -> Result<PgPool> {
         .map_err(Error::Migrate)?;
 
     Ok(pool)
-}
-
-/// Strip the password from a Postgres URL before logging it.
-fn sanitize_url(url: &str) -> String {
-    if let Some(at_idx) = url.find('@')
-        && let Some(scheme_end) = url.find("://")
-        && scheme_end + 3 < at_idx
-    {
-        let creds_start = scheme_end + 3;
-        if let Some(colon_idx) = url[creds_start..at_idx].find(':') {
-            let mut sanitized = String::with_capacity(url.len());
-            sanitized.push_str(&url[..creds_start + colon_idx + 1]);
-            sanitized.push_str("****");
-            sanitized.push_str(&url[at_idx..]);
-            return sanitized;
-        }
-    }
-    url.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_url_redacts_password() {
-        let url = "postgres://eidetic:secret@localhost:5432/eidetic";
-        assert_eq!(
-            sanitize_url(url),
-            "postgres://eidetic:****@localhost:5432/eidetic"
-        );
-    }
-
-    #[test]
-    fn sanitize_url_without_password_returns_unchanged() {
-        // URL with user but no password, no colon in creds, should pass through
-        let url = "postgres://eidetic@localhost:5432/eidetic";
-        assert_eq!(sanitize_url(url), url);
-    }
 }

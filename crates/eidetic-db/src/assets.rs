@@ -1,6 +1,7 @@
+use crate::vector::{self, BruteForce, VectorIndex};
 use chrono::{DateTime, Utc};
 use eidetic_core::AssetId;
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -40,8 +41,13 @@ pub enum InsertOutcome {
     Existing(AssetId),
 }
 
-pub struct PgAssetsRepo {
-    pool: PgPool,
+/// Asset CRUD + search over the embedded SQLite database.
+///
+/// Vector ranking is delegated to a [`VectorIndex`] so the strategy can change
+/// without touching callers (ADR-0005).
+pub struct AssetsRepo {
+    pool: SqlitePool,
+    index: Box<dyn VectorIndex>,
 }
 
 pub struct LibraryStats {
@@ -112,9 +118,35 @@ pub struct AssetDetail {
     pub thumbnails_generated: bool,
 }
 
-impl PgAssetsRepo {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+/// UUIDs are stored as lowercase hyphenated TEXT so the database stays
+/// readable from the `sqlite3` CLI.
+fn id_text(id: AssetId) -> String {
+    id.as_uuid().to_string()
+}
+
+fn parse_id(raw: &str) -> AssetId {
+    let uuid = uuid::Uuid::parse_str(raw)
+        .expect("id column holds hyphenated UUID text written by id_text()");
+    AssetId::from(uuid)
+}
+
+fn parse_hash(raw: &str) -> eidetic_core::Sha256 {
+    eidetic_core::Sha256::from_hex(raw)
+        .expect("hash column is 64 lowercase hex chars written by our own code")
+}
+
+impl AssetsRepo {
+    /// Exact brute-force vector search (ADR-0005 default).
+    pub fn new(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            index: Box::new(BruteForce),
+        }
+    }
+
+    /// Override the ranking strategy — the seam for an approximate index.
+    pub fn with_index(pool: SqlitePool, index: Box<dyn VectorIndex>) -> Self {
+        Self { pool, index }
     }
 
     pub async fn fetch_stats(&self) -> crate::Result<LibraryStats> {
@@ -133,18 +165,19 @@ impl PgAssetsRepo {
 
         let row: StatsRow = sqlx::query_as(
             "SELECT \
-               COUNT(*)                                                   AS total, \
-               COUNT(*) FILTER (WHERE mime_type LIKE 'image/%')           AS images, \
-               COUNT(*) FILTER (WHERE mime_type LIKE 'video/%')           AS videos, \
-               COUNT(*) FILTER (WHERE embedding IS NOT NULL)              AS embedded, \
-               COUNT(*) FILTER (WHERE embedding IS NULL \
-                                  AND mime_type LIKE 'image/%')           AS needs_embed, \
-               COUNT(*) FILTER (WHERE thumbnails_generated = FALSE \
-                                  AND mime_type LIKE 'image/%')           AS thumbnails_pending, \
-               COALESCE(SUM(file_size), 0)::bigint                        AS total_bytes, \
-               MIN(date_taken)                                            AS earliest, \
-               MAX(date_taken)                                            AS latest \
-             FROM assets",
+               COUNT(*)                                                     AS total, \
+               COUNT(*) FILTER (WHERE a.mime_type LIKE 'image/%')           AS images, \
+               COUNT(*) FILTER (WHERE a.mime_type LIKE 'video/%')           AS videos, \
+               COUNT(*) FILTER (WHERE e.asset_id IS NOT NULL)               AS embedded, \
+               COUNT(*) FILTER (WHERE e.asset_id IS NULL \
+                                  AND a.mime_type LIKE 'image/%')           AS needs_embed, \
+               COUNT(*) FILTER (WHERE a.thumbnails_generated = 0 \
+                                  AND a.mime_type LIKE 'image/%')           AS thumbnails_pending, \
+               COALESCE(SUM(a.file_size), 0)                                AS total_bytes, \
+               MIN(a.date_taken)                                            AS earliest, \
+               MAX(a.date_taken)                                            AS latest \
+             FROM assets a \
+             LEFT JOIN embeddings e ON e.asset_id = a.id",
         )
         .fetch_one(&self.pool)
         .await
@@ -164,10 +197,11 @@ impl PgAssetsRepo {
     }
 
     pub async fn fetch_unembedded(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
-        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-            "SELECT id, storage_path FROM assets \
-             WHERE embedding IS NULL AND mime_type LIKE 'image/%' \
-             ORDER BY id",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.id, a.storage_path FROM assets a \
+             LEFT JOIN embeddings e ON e.asset_id = a.id \
+             WHERE e.asset_id IS NULL AND a.mime_type LIKE 'image/%' \
+             ORDER BY a.id",
         )
         .fetch_all(&self.pool)
         .await
@@ -175,7 +209,7 @@ impl PgAssetsRepo {
 
         Ok(rows
             .into_iter()
-            .map(|(uuid, path)| (AssetId::from(uuid), PathBuf::from(path)))
+            .map(|(id, path)| (parse_id(&id), PathBuf::from(path)))
             .collect())
     }
 
@@ -183,9 +217,9 @@ impl PgAssetsRepo {
     pub async fn fetch_unthumbnailed(
         &self,
     ) -> crate::Result<Vec<(AssetId, eidetic_core::Sha256, PathBuf)>> {
-        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, hash, storage_path FROM assets \
-             WHERE thumbnails_generated = FALSE \
+             WHERE thumbnails_generated = 0 \
                AND mime_type LIKE 'image/%' \
              ORDER BY id",
         )
@@ -195,11 +229,7 @@ impl PgAssetsRepo {
 
         Ok(rows
             .into_iter()
-            .map(|(uuid, hash_hex, path)| {
-                let hash = eidetic_core::Sha256::from_hex(&hash_hex)
-                    .expect("hash column is CHAR(64) of lowercase hex written by our own code");
-                (AssetId::from(uuid), hash, PathBuf::from(path))
-            })
+            .map(|(id, hash_hex, path)| (parse_id(&id), parse_hash(&hash_hex), PathBuf::from(path)))
             .collect())
     }
 
@@ -210,16 +240,16 @@ impl PgAssetsRepo {
     ) -> crate::Result<()> {
         sqlx::query(
             "UPDATE assets SET \
-               country_code = $2, country_name = $3, admin1 = $4, \
-               place = $5, place_distance_m = $6 \
-             WHERE id = $1",
+               country_code = ?, country_name = ?, admin1 = ?, \
+               place = ?, place_distance_m = ? \
+             WHERE id = ?",
         )
-        .bind(id.as_uuid())
         .bind(&place.country_code)
         .bind(&place.country_name)
         .bind(&place.admin1)
         .bind(&place.place)
         .bind(place.distance_m)
+        .bind(id_text(id))
         .execute(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -227,8 +257,8 @@ impl PgAssetsRepo {
     }
 
     pub async fn mark_thumbnailed(&self, id: AssetId) -> crate::Result<()> {
-        sqlx::query("UPDATE assets SET thumbnails_generated = TRUE WHERE id = $1")
-            .bind(id.as_uuid())
+        sqlx::query("UPDATE assets SET thumbnails_generated = 1 WHERE id = ?")
+            .bind(id_text(id))
             .execute(&self.pool)
             .await
             .map_err(crate::Error::Query)?;
@@ -237,7 +267,7 @@ impl PgAssetsRepo {
 
     pub async fn fetch_recent(&self, limit: u32) -> crate::Result<Vec<RecentAsset>> {
         type Row = (
-            uuid::Uuid,
+            String,
             String,
             String,
             String,
@@ -250,7 +280,7 @@ impl PgAssetsRepo {
              FROM assets \
              WHERE mime_type IS NOT NULL \
              ORDER BY imported_at DESC \
-             LIMIT $1",
+             LIMIT ?",
         )
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -261,133 +291,95 @@ impl PgAssetsRepo {
             .into_iter()
             .map(
                 |(
-                    uuid,
+                    id,
                     hash_hex,
                     original_filename,
                     mime_type,
                     thumbnails_generated,
                     file_size,
                     imported_at,
-                )| {
-                    let hash = eidetic_core::Sha256::from_hex(&hash_hex)
-                        .expect("hash column is CHAR(64) of lowercase hex");
-                    RecentAsset {
-                        id: AssetId::from(uuid),
-                        hash,
-                        original_filename,
-                        mime_type,
-                        thumbnails_generated,
-                        file_size,
-                        imported_at,
-                    }
+                )| RecentAsset {
+                    id: parse_id(&id),
+                    hash: parse_hash(&hash_hex),
+                    original_filename,
+                    mime_type,
+                    thumbnails_generated,
+                    file_size,
+                    imported_at,
                 },
             )
             .collect())
     }
 
     pub async fn fetch_by_id(&self, id: AssetId) -> crate::Result<Option<AssetDetail>> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: uuid::Uuid,
-            hash: String,
-            original_filename: String,
-            storage_path: String,
-            file_size: i64,
-            mime_type: Option<String>,
-            imported_at: chrono::DateTime<chrono::Utc>,
-            date_taken: Option<chrono::DateTime<chrono::Utc>>,
-            latitude: Option<f64>,
-            longitude: Option<f64>,
-            camera_make: Option<String>,
-            camera_model: Option<String>,
-            lens_make: Option<String>,
-            lens_model: Option<String>,
-            focal_length: Option<f32>,
-            focal_length_35mm: Option<f32>,
-            aperture: Option<f32>,
-            shutter: Option<String>,
-            iso: Option<i32>,
-            orientation: Option<i16>,
-            altitude: Option<f64>,
-            gps_direction: Option<f64>,
-            exif_raw: Option<serde_json::Value>,
-            country_code: Option<String>,
-            country_name: Option<String>,
-            admin1: Option<String>,
-            place: Option<String>,
-            place_distance_m: Option<f32>,
-            thumbnails_generated: bool,
-        }
+        let row: Option<DetailRow> = sqlx::query_as(DETAIL_SELECT)
+            .bind(id_text(id))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
 
-        let row: Option<Row> = sqlx::query_as(
-            "SELECT id, hash, original_filename, storage_path, file_size, mime_type, \
-                    imported_at, date_taken, latitude, longitude, camera_make, camera_model, \
-                    lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
-                    shutter, iso, orientation, altitude, gps_direction, exif_raw, \
-                    country_code, country_name, admin1, place, place_distance_m, \
-                    thumbnails_generated \
-             FROM assets WHERE id = $1",
-        )
-        .bind(id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
-
-        Ok(row.map(|r| AssetDetail {
-            id: AssetId::from(r.id),
-            hash: eidetic_core::Sha256::from_hex(&r.hash)
-                .expect("hash column is CHAR(64) of lowercase hex"),
-            original_filename: r.original_filename,
-            storage_path: PathBuf::from(r.storage_path),
-            file_size: r.file_size,
-            mime_type: r.mime_type,
-            imported_at: r.imported_at,
-            date_taken: r.date_taken,
-            latitude: r.latitude,
-            longitude: r.longitude,
-            camera_make: r.camera_make,
-            camera_model: r.camera_model,
-            lens_make: r.lens_make,
-            lens_model: r.lens_model,
-            focal_length: r.focal_length,
-            focal_length_35mm: r.focal_length_35mm,
-            aperture: r.aperture,
-            shutter: r.shutter,
-            iso: r.iso,
-            orientation: r.orientation,
-            altitude: r.altitude,
-            gps_direction: r.gps_direction,
-            exif_raw: r.exif_raw,
-            country_code: r.country_code,
-            country_name: r.country_name,
-            admin1: r.admin1,
-            place: r.place,
-            place_distance_m: r.place_distance_m,
-            thumbnails_generated: r.thumbnails_generated,
-        }))
+        Ok(row.map(DetailRow::into_detail))
     }
 
     pub async fn store_embedding(&self, id: AssetId, embedding: &[f32]) -> crate::Result<()> {
-        let vec = pgvector::Vector::from(embedding.to_vec());
-        sqlx::query("UPDATE assets SET embedding = $1 WHERE id = $2")
-            .bind(vec)
-            .bind(id.as_uuid())
-            .execute(&self.pool)
-            .await
-            .map_err(crate::Error::Query)?;
+        sqlx::query(
+            "INSERT INTO embeddings (asset_id, dim, vector) VALUES (?, ?, ?) \
+             ON CONFLICT(asset_id) DO UPDATE SET dim = excluded.dim, vector = excluded.vector",
+        )
+        .bind(id_text(id))
+        .bind(embedding.len() as i64)
+        .bind(vector::encode(embedding))
+        .execute(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
         Ok(())
     }
 
+    /// Rank every stored embedding against `query_vec` and hydrate the top hits.
+    ///
+    /// Two round trips: load the vectors, then fetch metadata for the winners.
+    /// Ranking itself is exact and happens in-process (ADR-0005).
     pub async fn search_similar(
         &self,
         query_vec: &[f32],
         limit: u32,
     ) -> crate::Result<Vec<SearchResult>> {
+        let rows: Vec<(String, Vec<u8>)> =
+            sqlx::query_as("SELECT asset_id, vector FROM embeddings")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
+
+        let mut stored = Vec::with_capacity(rows.len());
+        for (id, blob) in rows {
+            let decoded = vector::decode(&blob).ok_or_else(|| crate::Error::CorruptRow {
+                table: "embeddings",
+                column: "vector",
+                detail: format!("asset {id}: blob of {} bytes is not whole f32s", blob.len()),
+            })?;
+            stored.push((parse_id(&id), decoded));
+        }
+
+        let ranked = self.index.top_k(query_vec, &stored, limit as usize);
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Hydrate metadata for the winners in one query, then restore the
+        // ranked order (SQL makes no ordering promise for an IN filter).
+        let placeholders = std::iter::repeat_n("?", ranked.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, storage_path, mime_type, file_size, thumbnails_generated, date_taken, \
+                    camera_make, camera_model, latitude, longitude \
+             FROM assets WHERE id IN ({placeholders})"
+        );
+
         #[derive(sqlx::FromRow)]
-        struct SearchRow {
-            id: uuid::Uuid,
+        struct MetaRow {
+            id: String,
             storage_path: String,
-            score: f32,
             mime_type: Option<String>,
             file_size: i64,
             thumbnails_generated: bool,
@@ -398,48 +390,44 @@ impl PgAssetsRepo {
             longitude: Option<f64>,
         }
 
-        let vec = pgvector::Vector::from(query_vec.to_vec());
-        let rows: Vec<SearchRow> = sqlx::query_as(
-            "SELECT id, storage_path, mime_type, file_size, thumbnails_generated, date_taken, \
-                    camera_make, camera_model, latitude, longitude, \
-                    (1.0 - (embedding <=> $1))::real AS score \
-             FROM assets \
-             WHERE embedding IS NOT NULL \
-             ORDER BY embedding <=> $1 \
-             LIMIT $2",
-        )
-        .bind(vec)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
+        let mut q = sqlx::query_as::<_, MetaRow>(&sql);
+        for (id, _) in &ranked {
+            q = q.bind(id_text(*id));
+        }
+        let metas = q.fetch_all(&self.pool).await.map_err(crate::Error::Query)?;
 
-        Ok(rows
+        let mut by_id: std::collections::HashMap<AssetId, MetaRow> =
+            metas.into_iter().map(|m| (parse_id(&m.id), m)).collect();
+
+        Ok(ranked
             .into_iter()
-            .map(|r| SearchResult {
-                id: AssetId::from(r.id),
-                storage_path: PathBuf::from(r.storage_path),
-                score: r.score,
-                mime_type: r.mime_type,
-                file_size: r.file_size,
-                thumbnails_generated: r.thumbnails_generated,
-                date_taken: r.date_taken,
-                camera_make: r.camera_make,
-                camera_model: r.camera_model,
-                latitude: r.latitude,
-                longitude: r.longitude,
+            .filter_map(|(id, score)| {
+                let m = by_id.remove(&id)?;
+                Some(SearchResult {
+                    id,
+                    storage_path: PathBuf::from(m.storage_path),
+                    score,
+                    mime_type: m.mime_type,
+                    file_size: m.file_size,
+                    thumbnails_generated: m.thumbnails_generated,
+                    date_taken: m.date_taken,
+                    camera_make: m.camera_make,
+                    camera_model: m.camera_model,
+                    latitude: m.latitude,
+                    longitude: m.longitude,
+                })
             })
             .collect())
     }
 
     pub async fn find_by_hash(&self, hash: &str) -> crate::Result<Option<AssetId>> {
-        let row: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM assets WHERE hash = $1")
+        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM assets WHERE hash = ?")
             .bind(hash)
             .fetch_optional(&self.pool)
             .await
             .map_err(crate::Error::Query)?;
 
-        Ok(row.map(|(uuid,)| AssetId::from(uuid)))
+        Ok(row.map(|(id,)| parse_id(&id)))
     }
 
     pub async fn insert_asset(&self, asset: NewAsset) -> crate::Result<InsertOutcome> {
@@ -451,7 +439,7 @@ impl PgAssetsRepo {
             .exif_raw
             .clone()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        let row: Option<(String,)> = sqlx::query_as(
             "INSERT INTO assets \
              (id, hash, original_filename, storage_path, file_size, mime_type, \
               date_taken, latitude, longitude, camera_make, camera_model, \
@@ -459,13 +447,13 @@ impl PgAssetsRepo {
               shutter, iso, orientation, altitude, gps_direction, exif_raw, \
               country_code, country_name, admin1, place, place_distance_m, \
               thumbnails_generated) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
-                     $23, $24, $25, $26, $27, $28) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                     ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (hash) DO NOTHING \
              RETURNING id",
         )
-        .bind(new_id.as_uuid())
+        .bind(id_text(new_id))
         .bind(&asset.hash)
         .bind(&asset.original_filename)
         .bind(asset.storage_path.to_string_lossy().as_ref())
@@ -498,16 +486,92 @@ impl PgAssetsRepo {
         .map_err(crate::Error::Query)?;
 
         match row {
-            Some((uuid,)) => Ok(InsertOutcome::Inserted(AssetId::from(uuid))),
+            Some((id,)) => Ok(InsertOutcome::Inserted(parse_id(&id))),
             None => {
-                let (uuid,): (uuid::Uuid,) =
-                    sqlx::query_as("SELECT id FROM assets WHERE hash = $1")
-                        .bind(&asset.hash)
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(crate::Error::Query)?;
-                Ok(InsertOutcome::Existing(AssetId::from(uuid)))
+                let (id,): (String,) = sqlx::query_as("SELECT id FROM assets WHERE hash = ?")
+                    .bind(&asset.hash)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(crate::Error::Query)?;
+                Ok(InsertOutcome::Existing(parse_id(&id)))
             }
+        }
+    }
+}
+
+const DETAIL_SELECT: &str = "SELECT id, hash, original_filename, storage_path, file_size, mime_type, \
+            imported_at, date_taken, latitude, longitude, camera_make, camera_model, \
+            lens_make, lens_model, focal_length, focal_length_35mm, aperture, \
+            shutter, iso, orientation, altitude, gps_direction, exif_raw, \
+            country_code, country_name, admin1, place, place_distance_m, \
+            thumbnails_generated \
+     FROM assets WHERE id = ?";
+
+#[derive(sqlx::FromRow)]
+struct DetailRow {
+    id: String,
+    hash: String,
+    original_filename: String,
+    storage_path: String,
+    file_size: i64,
+    mime_type: Option<String>,
+    imported_at: chrono::DateTime<chrono::Utc>,
+    date_taken: Option<chrono::DateTime<chrono::Utc>>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+    lens_make: Option<String>,
+    lens_model: Option<String>,
+    focal_length: Option<f32>,
+    focal_length_35mm: Option<f32>,
+    aperture: Option<f32>,
+    shutter: Option<String>,
+    iso: Option<i32>,
+    orientation: Option<i16>,
+    altitude: Option<f64>,
+    gps_direction: Option<f64>,
+    exif_raw: Option<serde_json::Value>,
+    country_code: Option<String>,
+    country_name: Option<String>,
+    admin1: Option<String>,
+    place: Option<String>,
+    place_distance_m: Option<f32>,
+    thumbnails_generated: bool,
+}
+
+impl DetailRow {
+    fn into_detail(self) -> AssetDetail {
+        AssetDetail {
+            id: parse_id(&self.id),
+            hash: parse_hash(&self.hash),
+            original_filename: self.original_filename,
+            storage_path: PathBuf::from(self.storage_path),
+            file_size: self.file_size,
+            mime_type: self.mime_type,
+            imported_at: self.imported_at,
+            date_taken: self.date_taken,
+            latitude: self.latitude,
+            longitude: self.longitude,
+            camera_make: self.camera_make,
+            camera_model: self.camera_model,
+            lens_make: self.lens_make,
+            lens_model: self.lens_model,
+            focal_length: self.focal_length,
+            focal_length_35mm: self.focal_length_35mm,
+            aperture: self.aperture,
+            shutter: self.shutter,
+            iso: self.iso,
+            orientation: self.orientation,
+            altitude: self.altitude,
+            gps_direction: self.gps_direction,
+            exif_raw: self.exif_raw,
+            country_code: self.country_code,
+            country_name: self.country_name,
+            admin1: self.admin1,
+            place: self.place,
+            place_distance_m: self.place_distance_m,
+            thumbnails_generated: self.thumbnails_generated,
         }
     }
 }

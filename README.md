@@ -12,12 +12,20 @@ Written in Rust.
   - Extracts EXIF: date taken, GPS, camera make/model, lens, focal length, aperture, shutter, ISO, orientation, altitude, plus a JSONB tail with every other tag kamadak-exif can parse
   - Reverse-geocodes GPS coordinates to country, state, and nearest-place name using an offline GeoNames cities500 dataset (~13 MB, auto-downloaded into `~/.cache/eidetic/geonames/` on first import; photo coordinates never leave the machine)
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
-  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif), and DNG/Apple ProRAW (via embedded JPEG preview)
+  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif, on by default — see [Build features](#build-features)), and DNG/Apple ProRAW (via embedded JPEG preview)
 - `eidetic embed`: generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
 - `eidetic search "dog on beach"`: find photos by natural-language description
   - `--limit N`: number of results (default 10)
   - `--fields score,date,path`: tab-separated column output
   - `--json`: full JSON array
+- `eidetic faces`: detect faces in imported images, then group them into people
+  - Detection is YuNet, embedding is AuraFace (512-dim) by default — both permissively licensed, see [ADR-0010](docs/adr/0010-face-stack.md)
+  - `EIDETIC_FACE_MODEL`: `auraface` (default), `sface` (smaller/faster, 128-dim), or `buffalo_l` (InsightFace; better accuracy but **non-commercial weights** you download yourself)
+  - `--cluster-only`: re-run grouping over already-detected faces without scanning again
+  - A face joins an existing person when it's close enough; leftovers are grouped into new candidates once at least 3 agree
+  - Your corrections are durable: naming, merges and splits are stored as constraints, so re-running clustering never discards them
+- `eidetic persons`: list grouped people with face counts
+- `eidetic name-person <id> <name>`: name a person
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>`: SHA-256 a file, no setup needed
 - `eidetic eval --coco-csv <path> --coco-images <dir> [--limit N]`: text-to-image retrieval eval on the COCO 5K Karpathy split. Reports R@1/5/10 + MRR; bypasses the database.
@@ -28,23 +36,19 @@ Written in Rust.
 # 0. Install the CLI (or prefix every `eidetic` below with `cargo run --release -p eidetic-cli --`)
 cargo install --path crates/eidetic-cli
 
-# 1. Start Postgres (VectorChord variant required for vector search)
-docker compose up -d
-
-# 2. Set env vars (or copy .env.example to .env and source it)
-export EIDETIC_DATABASE_URL="postgres://eidetic:eidetic@localhost:5432/eidetic"
-
-# 3. Import your photos (migrations run automatically on first connect)
+# 1. Import your photos
+#    The SQLite database is created and migrated on first connect — there is
+#    no server to start and nothing to configure.
 eidetic import ~/Pictures/
 
-# 4. Generate embeddings (downloads SigLIP 2 model ~1.4 GiB on first run)
+# 2. Generate embeddings (downloads SigLIP 2 model ~1.4 GiB on first run)
 eidetic embed
 
-# 5. Search
+# 3. Search
 eidetic search "golden hour at the beach"
 eidetic search "birthday cake" --limit 5 --fields score,date,path
 
-# 6. See what's in the library
+# 4. See what's in the library
 eidetic stats
 ```
 
@@ -54,12 +58,12 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 
 | Variable | Default | Description |
 |---|---|---|
-| `EIDETIC_DATABASE_URL` | `postgres://eidetic:eidetic@localhost:5432/eidetic` | Postgres connection string |
+| `EIDETIC_DATABASE_PATH` | `~/.cache/eidetic/eidetic.db` | SQLite database file. Created on first run; no server process. |
 | `EIDETIC_LIBRARY_DIR` | `~/.cache/eidetic/library` | Content-addressable file store |
 | `EIDETIC_MODELS_CACHE` | `~/.cache/eidetic/models` | SigLIP 2 ONNX model cache |
-| `EIDETIC_LOG` | `info,ort=warn` | Log level (trace/debug/info/warn/error). `ort=warn` mutes the CoreML EP's verbose graph-partition output. |
-| `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download) or `large` (1024-dim, 3.6 GB, ~5x slower). |
-| `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider. `cpu` or `coreml`. CoreML is wired up and can be enabled, but **does not currently accelerate this workload**. See "Why CoreML is opt-in" below. |
+| `EIDETIC_LOG` | `info,ort=error` | Log level (trace/debug/info/warn/error). `ort=error` mutes ONNX Runtime's non-actionable noise — CoreML graph partitioning, and the per-initializer warnings some model exports emit. Real ort failures still surface. |
+| `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download), `large` (1024-dim, 3.6 GB), or `so400m` (1152-dim, best retrieval quality — practical on a GPU). Unknown values are rejected rather than silently falling back. Changing this requires re-embedding the library. |
+| `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider: `cpu`, `cuda`, or `coreml`. `cuda` needs a build with `--features cuda` plus an ONNX Runtime ≥ 1.27 CUDA build at runtime (see [ADR-0006](docs/adr/0006-gpu-execution-provider.md)). CoreML is macOS-only and **does not currently accelerate this workload** — see "Why CoreML is opt-in" below. |
 
 Copy `.env.example` to `.env` and adjust as needed. There is no config file; env vars are the only configuration layer for now.
 
@@ -84,20 +88,22 @@ Current behavior: `EIDETIC_ACCELERATOR=coreml` registers the CoreML EP and runs 
 
 ## Database
 
-Requires Postgres with the [VectorChord](https://github.com/tensorchord/VectorChord) extension (`pgvector` compatible, built-in ANN index). The `docker-compose.yml` uses the official image.
+Embedded SQLite — a single file at `~/.cache/eidetic/eidetic.db` (override with `EIDETIC_DATABASE_PATH`). No server, no Docker, no connection string. SQLite is compiled into the binary; the file is created on first run.
 
 ```bash
-# Start
-docker compose up -d
+# Inspect it with the standard CLI
+sqlite3 ~/.cache/eidetic/eidetic.db '.tables'
 
-# Stop (data persists in Docker volume)
-docker compose down
+# Back it up (safe while eidetic is running)
+sqlite3 ~/.cache/eidetic/eidetic.db ".backup '/tmp/eidetic-backup.db'"
 
 # Wipe everything and start fresh
-docker compose down -v
+rm ~/.cache/eidetic/eidetic.db*
 ```
 
-Migrations run automatically on every `eidetic` startup that connects to the database. They are idempotent and safe to run repeatedly.
+Migrations run automatically on every `eidetic` startup that opens the database. They are idempotent and safe to run repeatedly.
+
+Embeddings live in their own `embeddings` table as raw f32 blobs, and search is **exact** brute-force cosine computed in-process — 100% recall, no ANN index to tune. See [ADR-0005](docs/adr/0005-vector-storage-sqlite.md) for why, and for the escalation path if a library ever outgrows it.
 
 ## System dependencies
 
@@ -120,9 +126,29 @@ If `libheif` isn't installed, Eidetic builds fine but fails at runtime with a dy
 # Build
 cargo build --workspace
 
-# Test (integration tests require Docker)
+# Test (no services required — tests create their own temp SQLite database)
 cargo test --workspace
 ```
+
+### Build features
+
+| Feature | Default | What it does |
+|---|---|---|
+| `heic` | **on** | HEIC/HEIF decoding via libheif. Needs the libheif C library installed at build time (`libheif-dev` / `libheif-devel`). |
+| `cuda` | off | NVIDIA GPU inference via the ONNX Runtime CUDA execution provider. Requires an ONNX Runtime ≥ 1.27 CUDA build supplied at runtime through `ORT_DYLIB_PATH`, plus CUDA 13 + cuDNN 9 on the host. See [ADR-0006](docs/adr/0006-gpu-execution-provider.md). |
+
+```bash
+# Default: HEIC support, CPU inference. Needs libheif installed.
+cargo build --release -p eidetic-cli
+
+# No system dependencies at all — pure-Rust decoders only (no HEIC).
+cargo build --release -p eidetic-cli --no-default-features
+
+# GPU build
+cargo build --release -p eidetic-cli --features cuda
+```
+
+HEIC is on by default because it is the primary format for iPhone photos and libheif is the mature, correct decoder for it (LGPL, so linking it from this MIT/Apache codebase is distribution-clean). The trade-off is a system dependency; `--no-default-features` drops it entirely at the cost of HEIC support. See [ADR-0008](docs/adr/0008-heic-decode.md).
 
 ## Documentation
 

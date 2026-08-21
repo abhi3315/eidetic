@@ -7,10 +7,17 @@ license.workspace = true
 authors.workspace = true
 description = "Axum HTTP server for Eidetic."
 
+[features]
+default = ["heic"]
+heic = ["eidetic-ml/heic"]
+cuda = ["eidetic-ml/cuda"]
+
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
 eidetic-db = { path = "../eidetic-db" }
-eidetic-ml = { path = "../eidetic-ml" }
+# default-features = false so --no-default-features here actually reaches
+# eidetic-ml's libheif dependency instead of being silently re-enabled.
+eidetic-ml = { path = "../eidetic-ml", default-features = false }
 anyhow = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
@@ -29,4 +36,3 @@ uuid = { workspace = true }
 http-body-util = "0.1"
 tower = { workspace = true }
 tempfile = { workspace = true }
-testcontainers = { workspace = true }

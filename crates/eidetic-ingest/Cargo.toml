@@ -7,6 +7,14 @@ license.workspace = true
 authors.workspace = true
 description = "File ingestion for Eidetic: hashing, watching, content-addressable storage."
 
+[features]
+default = ["heic"]
+# HEIC/HEIF decoding via libheif (LGPL C library + libde265). ON by default:
+# it is the mature, correct decoder for iPhone photos (ADR-0008). Building
+# with --no-default-features drops the system dependency entirely, which is
+# what makes a libheif-free portable build possible.
+heic = ["dep:libheif-rs"]
+
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
 eidetic-db = { path = "../eidetic-db" }
@@ -17,7 +25,7 @@ tokio = { workspace = true }
 walkdir = { workspace = true }
 chrono = { workspace = true }
 image = { workspace = true }
-libheif-rs = { workspace = true }
+libheif-rs = { workspace = true, optional = true }
 infer = { workspace = true }
 kamadak-exif = { workspace = true }
 serde_json = { workspace = true }

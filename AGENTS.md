@@ -19,11 +19,11 @@ This is one person's photo library on one person's hardware. Not a SaaS, not mul
 - **Language:** Rust 1.92, edition 2024
 - **Async runtime:** Tokio
 - **Web framework:** Axum (added when `eidetic-server` exists)
-- **Database:** PostgreSQL + pgvector + VectorChord (see ADR-0002)
-- **ML inference:** ONNX Runtime via the `ort` crate (see ADR-0003 once written)
-- **Image embedding:** SigLIP 2 base, 768-dim (see ADR-0004 once written)
-- **Face detection / recognition:** SCRFD + ArcFace via `ort`
-- **Vector storage:** pgvector + VectorChord index
+- **Database:** embedded SQLite, single file, no server (see ADR-0005; supersedes ADR-0002)
+- **ML inference:** ONNX Runtime via the `ort` crate (see ADR-0003; CUDA EP per ADR-0006)
+- **Image embedding:** SigLIP 2, 768-dim `base` today (see ADR-0004; ADR-0007 moves the default to so400m/1152-dim)
+- **Face detection / recognition:** YuNet (MIT) detect + AuraFace (Apache-2.0, 512-dim) embed via `ort`; `sface` and InsightFace `buffalo_l` selectable via `EIDETIC_FACE_MODEL` (see ADR-0010 — SCRFD+ArcFace was dropped as the default because those weights are non-commercial only)
+- **Vector storage:** `embeddings` table (f32 blobs) + exact brute-force cosine behind the `VectorIndex` trait (see ADR-0005)
 - **CLI:** clap (derive)
 - **Errors:** `thiserror` in libraries, `anyhow` in binaries
 - **Logging:** `tracing` + `tracing-subscriber`
@@ -39,8 +39,8 @@ Crates under `crates/`:
 | Crate | Role | Depends on |
 |---|---|---|
 | `eidetic-core` | Shared types: `AssetId`, `Sha256`, `Config`, `Paths`. Zero deps on tokio/sqlx/ort. Hosts `dng::extract_largest_jpeg_preview` (DNG decoding needed by both ingest and ml, pure-Rust via kamadak-exif) and `geocoder::Geocoder` (offline nearest-city lookup over a GeoNames cities500 dataset cached at `~/.cache/eidetic/geonames/`). | (nothing internal) |
-| `eidetic-db` | sqlx pool, migration runner. `PgAssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
-| `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation (JPEG/PNG/WEBP + HEIC via libheif hook + DNG via embedded preview extraction), comprehensive EXIF extraction (typed camera-settings columns + JSONB long tail). Calls `PgAssetsRepo` directly. Owns `ensure_heic_registered` — any new decode site in this crate must call it. | `eidetic-core`, `eidetic-db` |
+| `eidetic-db` | sqlx pool, migration runner. `AssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
+| `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation (JPEG/PNG/WEBP + HEIC via libheif hook + DNG via embedded preview extraction), comprehensive EXIF extraction (typed camera-settings columns + JSONB long tail). Calls `AssetsRepo` directly. Owns `ensure_heic_registered` — any new decode site in this crate must call it. | `eidetic-core`, `eidetic-db` |
 | `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. Decodes JPEG/PNG/WEBP/HEIC/DNG via the `image` crate (HEIC through the libheif hook; DNG via `eidetic_core::dng::extract_largest_jpeg_preview`). | `eidetic-core` |
 | `eidetic-server` | Axum HTTP server. `serve()` owns the embedder worker and the route table (`/`, `/search`, `/assets/:id`, `/assets/:id/raw`, `/thumbs/:size/:hash`). Localhost-bound, no auth. | `eidetic-core`, `eidetic-db`, `eidetic-ml` |
 | `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest`, `eidetic-server` |
@@ -79,7 +79,7 @@ Crates added later when there's actual code that wants to live in them:
 
 - Unit tests in-file with `#[cfg(test)] mod tests { … }`.
 - Integration tests in `crates/<crate>/tests/`.
-- DB tests use `testcontainers` against real Postgres + pgvector + VectorChord. **No SQL mocks.**
+- DB tests run against a real SQLite database in a `tempfile::TempDir`, created and migrated per test. **No SQL mocks.** (Keep the `TempDir` guard bound for the whole test — dropping it deletes the database.)
 - End-to-end tests live in `crates/eidetic-e2e/tests/` (when that crate exists).
 
 ### Commits
@@ -124,7 +124,7 @@ cargo test -p eidetic-ingest
 cargo run -p eidetic-cli -- <subcommand>
 ```
 
-For database work, `eidetic-db` expects `EIDETIC_DATABASE_URL` set or a default `postgres://eidetic:eidetic@localhost:5432/eidetic`.
+No database setup is needed: `eidetic-db` opens (and creates) a SQLite file at `EIDETIC_DATABASE_PATH`, defaulting to `~/.cache/eidetic/eidetic.db`.
 
 ---
 

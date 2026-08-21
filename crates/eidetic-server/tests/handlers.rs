@@ -1,59 +1,36 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use eidetic_core::{Config, Paths};
-use eidetic_db::{NewAsset, PgAssetsRepo};
+use eidetic_db::{AssetsRepo, NewAsset};
 use http_body_util::BodyExt;
-use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 use tower::ServiceExt;
 
-async fn start_db() -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    let container = GenericImage::new("tensorchord/vchord-postgres", "pg17-v0.4.3")
-        .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
-        .with_env_var("POSTGRES_USER", "eidetic")
-        .with_env_var("POSTGRES_PASSWORD", "eidetic")
-        .with_env_var("POSTGRES_DB", "eidetic")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://eidetic:eidetic@127.0.0.1:{port}/eidetic");
-    (container, url)
-}
-
-async fn fixture() -> (
-    eidetic_server::TestRouter,
-    PgAssetsRepo,
-    tempfile::TempDir,
-    testcontainers::ContainerAsync<GenericImage>,
-) {
-    let (container, url) = start_db().await;
+/// One temp dir holds both the SQLite file and the library tree. The returned
+/// `TempDir` guard must outlive the test body, or the database file is
+/// deleted mid-test.
+async fn fixture() -> (eidetic_server::TestRouter, AssetsRepo, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let config = Config {
-        database_url: url.clone(),
+        database_path: tmp.path().join("eidetic.db"),
         paths: Paths {
             library_dir: tmp.path().join("library"),
             models_cache: tmp.path().join("models"),
         },
     };
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
 
-    // Build a second repo for the test to use directly (the router takes
-    // one by value). Same pool URL, fresh connection.
-    let config2 = Config {
-        database_url: url,
-        ..config.clone()
-    };
-    let pool2 = eidetic_db::connect(&config2).await.expect("connect2");
-    let repo_clone = PgAssetsRepo::new(pool2);
+    // The router takes a repo by value, so the test gets a second one over
+    // the same pool to seed rows with.
+    let repo = AssetsRepo::new(pool.clone());
+    let repo_for_test = AssetsRepo::new(pool);
 
     let router = eidetic_server::test_router(repo, config.paths.library_dir.clone());
-    (router, repo_clone, tmp, container)
+    (router, repo_for_test, tmp)
 }
 
 #[tokio::test]
 async fn index_with_empty_db_renders_empty_grid() {
-    let (router, _repo, _tmp, _container) = fixture().await;
+    let (router, _repo, _tmp) = fixture().await;
 
     let response = router
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -68,7 +45,7 @@ async fn index_with_empty_db_renders_empty_grid() {
 
 #[tokio::test]
 async fn search_with_empty_q_redirects_to_index() {
-    let (router, _repo, _tmp, _container) = fixture().await;
+    let (router, _repo, _tmp) = fixture().await;
 
     let response = router
         .oneshot(
@@ -90,7 +67,7 @@ async fn search_with_empty_q_redirects_to_index() {
 
 #[tokio::test]
 async fn assets_id_unknown_returns_404() {
-    let (router, _repo, _tmp, _container) = fixture().await;
+    let (router, _repo, _tmp) = fixture().await;
 
     let response = router
         .oneshot(
@@ -106,7 +83,7 @@ async fn assets_id_unknown_returns_404() {
 
 #[tokio::test]
 async fn thumbs_invalid_size_returns_404() {
-    let (router, _repo, _tmp, _container) = fixture().await;
+    let (router, _repo, _tmp) = fixture().await;
 
     let response = router
         .oneshot(
@@ -122,7 +99,7 @@ async fn thumbs_invalid_size_returns_404() {
 
 #[tokio::test]
 async fn thumbs_invalid_hash_returns_404() {
-    let (router, _repo, _tmp, _container) = fixture().await;
+    let (router, _repo, _tmp) = fixture().await;
 
     let response = router
         .oneshot(
@@ -138,7 +115,7 @@ async fn thumbs_invalid_hash_returns_404() {
 
 #[tokio::test]
 async fn thumb_serves_jpeg_bytes_when_file_exists() {
-    let (router, _repo, tmp, _container) = fixture().await;
+    let (router, _repo, tmp) = fixture().await;
 
     let library = tmp.path().join("library");
     let hash = "abcd000000000000000000000000000000000000000000000000000000000001";
@@ -168,7 +145,7 @@ async fn thumb_serves_jpeg_bytes_when_file_exists() {
 
 #[tokio::test]
 async fn raw_streams_original_with_mime_and_disposition() {
-    let (router, repo, tmp, _container) = fixture().await;
+    let (router, repo, tmp) = fixture().await;
 
     let library = tmp.path().join("library");
     std::fs::create_dir_all(&library).unwrap();

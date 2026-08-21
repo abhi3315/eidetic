@@ -18,10 +18,17 @@ pub use store::{commit_staged, stage_file};
 /// optimisation to keep the hot path cheap. Duplicated in eidetic-ml,
 /// because centralising in eidetic-core would drag a heavy C-binding dep
 /// into the foundation crate.
+///
+/// Without the `heic` feature this is a no-op: HEIC files then fail to
+/// decode like any other unsupported format, and every other format keeps
+/// working through the pure-Rust decoders in the `image` crate (ADR-0008).
 pub fn ensure_heic_registered() {
-    use std::sync::Once;
-    static HEIC_INIT: Once = Once::new();
-    HEIC_INIT.call_once(|| {
-        libheif_rs::integration::image::register_all_decoding_hooks();
-    });
+    #[cfg(feature = "heic")]
+    {
+        use std::sync::Once;
+        static HEIC_INIT: Once = Once::new();
+        HEIC_INIT.call_once(|| {
+            libheif_rs::integration::image::register_all_decoding_hooks();
+        });
+    }
 }

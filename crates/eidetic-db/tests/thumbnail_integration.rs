@@ -1,43 +1,24 @@
 use eidetic_core::{Config, Paths};
-use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
+use eidetic_db::{AssetsRepo, InsertOutcome, NewAsset};
 use eidetic_ingest::{ImportOutcome, hash_file, import_file, thumbnail};
 use image::{ImageBuffer, ImageFormat, Rgb};
 use std::path::{Path, PathBuf};
-use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 
-async fn start_db() -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    let container = GenericImage::new("tensorchord/vchord-postgres", "pg17-v0.4.3")
-        .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
-        .with_env_var("POSTGRES_USER", "eidetic")
-        .with_env_var("POSTGRES_PASSWORD", "eidetic")
-        .with_env_var("POSTGRES_DB", "eidetic")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://eidetic:eidetic@127.0.0.1:{port}/eidetic");
-    (container, url)
-}
-
-async fn fixture() -> (
-    PgAssetsRepo,
-    Paths,
-    tempfile::TempDir,
-    testcontainers::ContainerAsync<GenericImage>,
-) {
-    let (container, url) = start_db().await;
+/// One temp dir holds both the SQLite file and the library tree. The returned
+/// `TempDir` guard must outlive the test body, or the database file is
+/// deleted mid-test.
+async fn fixture() -> (AssetsRepo, Paths, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let config = Config {
-        database_url: url,
+        database_path: tmp.path().join("eidetic.db"),
         paths: Paths {
             library_dir: tmp.path().join("library"),
             models_cache: tmp.path().join("models"),
         },
     };
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
-    (repo, config.paths, tmp, container)
+    let repo = AssetsRepo::new(pool);
+    (repo, config.paths, tmp)
 }
 
 /// Write a real JPEG (not a 4-byte stub) so `image::decode` succeeds.
@@ -53,7 +34,7 @@ fn write_real_jpeg(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
 
 #[tokio::test]
 async fn imported_image_has_thumbnails_generated_true() {
-    let (repo, paths, tmp, _container) = fixture().await;
+    let (repo, paths, tmp) = fixture().await;
     let src = write_real_jpeg(tmp.path(), "photo.jpg", 800, 600);
 
     let outcome = import_file(&src, &repo, &paths, None).await;
@@ -77,7 +58,7 @@ async fn imported_image_has_thumbnails_generated_true() {
 
 #[tokio::test]
 async fn imported_video_stays_thumbnails_generated_false() {
-    let (repo, paths, tmp, _container) = fixture().await;
+    let (repo, paths, tmp) = fixture().await;
 
     // Stub video: 12 bytes of an MP4-ish header that `infer` accepts.
     // The byte pattern 00 00 00 20 66 74 79 70 69 73 6F 6D = "....ftypisom"
@@ -108,7 +89,7 @@ async fn imported_video_stays_thumbnails_generated_false() {
 
 #[tokio::test]
 async fn corrupt_image_lands_but_thumbnails_stay_pending() {
-    let (repo, paths, tmp, _container) = fixture().await;
+    let (repo, paths, tmp) = fixture().await;
 
     // 4-byte JPEG-magic stub: passes `infer` (which only checks the
     // first few bytes) but `image::decode` rejects it. The asset row
@@ -133,7 +114,7 @@ async fn corrupt_image_lands_but_thumbnails_stay_pending() {
 
 #[tokio::test]
 async fn backfill_flow_generates_and_marks_pending_image() {
-    let (repo, paths, tmp, _container) = fixture().await;
+    let (repo, paths, tmp) = fixture().await;
 
     // Seed the DB with a row whose thumbnails_generated = FALSE,
     // simulating an asset imported before this feature existed.

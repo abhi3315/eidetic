@@ -1,33 +1,24 @@
 use eidetic_core::Config;
 use eidetic_core::geocoder::Place;
-use eidetic_db::{InsertOutcome, NewAsset, PgAssetsRepo};
+use eidetic_db::{AssetsRepo, InsertOutcome, NewAsset};
 use std::path::PathBuf;
-use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 
-async fn start_db() -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    let container = GenericImage::new("tensorchord/vchord-postgres", "pg17-v0.4.3")
-        .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
-        .with_env_var("POSTGRES_USER", "eidetic")
-        .with_env_var("POSTGRES_PASSWORD", "eidetic")
-        .with_env_var("POSTGRES_DB", "eidetic")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://eidetic:eidetic@127.0.0.1:{port}/eidetic");
-    (container, url)
+/// A throwaway SQLite database in its own temp dir. The `TempDir` guard must
+/// outlive the test body, or the database file is deleted mid-test.
+fn temp_db() -> (tempfile::TempDir, Config) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = Config {
+        database_path: dir.path().join("eidetic.db"),
+        ..Default::default()
+    };
+    (dir, config)
 }
 
 #[tokio::test]
 async fn update_place_columns_writes_all_five_fields() {
-    let (_container, url) = start_db().await;
-    let config = Config {
-        database_url: url,
-        ..Default::default()
-    };
+    let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
-    let repo = PgAssetsRepo::new(pool);
+    let repo = AssetsRepo::new(pool);
 
     let id = match repo
         .insert_asset(NewAsset {

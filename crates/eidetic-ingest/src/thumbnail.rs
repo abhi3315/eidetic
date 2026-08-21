@@ -166,6 +166,7 @@ mod tests {
         path
     }
 
+    #[cfg(feature = "heic")]
     fn make_synthetic_heic(dir: &Path, w: u32, h: u32) -> PathBuf {
         use libheif_rs::{
             Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif,
@@ -270,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "heic")]
     fn generate_writes_thumbnails_from_heic_source() {
         crate::ensure_heic_registered();
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -286,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "heic")]
     fn heic_decode_returns_dynamic_image_with_correct_dimensions() {
         crate::ensure_heic_registered();
         let tmp = tempfile::tempdir().expect("tmpdir");

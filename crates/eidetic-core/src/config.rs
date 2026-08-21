@@ -9,7 +9,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub paths: Paths,
-    pub database_url: String,
+    /// Path to the embedded SQLite database file (ADR-0005). Created on first
+    /// connect if missing; no server process is involved.
+    pub database_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +28,7 @@ impl Default for Config {
                 library_dir: cache.join("library"),
                 models_cache: cache.join("models"),
             },
-            database_url: "postgres://eidetic:eidetic@localhost:5432/eidetic".to_string(),
+            database_path: cache.join("eidetic.db"),
         }
     }
 }
@@ -36,14 +38,14 @@ impl Config {
     /// overriding individual fields.
     ///
     /// Recognized env vars:
-    /// - `EIDETIC_DATABASE_URL`
+    /// - `EIDETIC_DATABASE_PATH`
     /// - `EIDETIC_LIBRARY_DIR`
     /// - `EIDETIC_MODELS_CACHE`
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(v) = std::env::var("EIDETIC_DATABASE_URL") {
-            config.database_url = v;
+        if let Ok(v) = std::env::var("EIDETIC_DATABASE_PATH") {
+            config.database_path = PathBuf::from(v);
         }
         if let Ok(v) = std::env::var("EIDETIC_LIBRARY_DIR") {
             config.paths.library_dir = PathBuf::from(v);

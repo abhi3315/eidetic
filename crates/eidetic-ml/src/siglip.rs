@@ -1,12 +1,14 @@
 use crate::{Error, Result};
 use ort::session::Session;
 use ort::value::Tensor;
-use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
 #[cfg(target_os = "macos")]
 use ort::ep::{CoreML, coreml::ComputeUnits};
+
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+use ort::ep::CUDA;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -19,20 +21,25 @@ enum Mode {
     Default,
     /// Explicitly requested CoreML. Errors on non-macOS.
     CoreML,
+    /// Explicitly requested CUDA (NVIDIA GPU). Errors on macOS and when the
+    /// binary was built without the `cuda` feature. Requires an ONNX Runtime
+    /// >= 1.27 CUDA build at runtime — see ADR-0006.
+    Cuda,
     /// Explicitly requested CPU. Always valid.
     Cpu,
 }
 
 /// Parse the `EIDETIC_ACCELERATOR` env var. Unknown non-empty values are
-/// rejected so a typo (`metal`, `cuda`, etc.) fails loudly rather than
+/// rejected so a typo (`metal`, `gpu`, etc.) fails loudly rather than
 /// quietly selecting CPU.
 fn parse_accelerator(raw: Option<&str>) -> Result<Mode> {
     match raw {
         None => Ok(Mode::Default),
         Some("coreml") => Ok(Mode::CoreML),
+        Some("cuda") => Ok(Mode::Cuda),
         Some("cpu") => Ok(Mode::Cpu),
         Some(other) => Err(Error::ModelLoad(format!(
-            "Unknown EIDETIC_ACCELERATOR={other:?}; valid values: coreml, cpu"
+            "Unknown EIDETIC_ACCELERATOR={other:?}; valid values: coreml, cuda, cpu"
         ))),
     }
 }
@@ -41,6 +48,7 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const SEQ_LEN: usize = 64;
 const PAD_TOKEN_ID: i64 = 1;
 
+#[derive(Debug)]
 struct ModelVariant {
     repo: &'static str,
     vision_model: &'static str,
@@ -72,15 +80,43 @@ const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
     embed_dim: 1024,
 };
 
-fn current_variant() -> &'static ModelVariant {
-    match std::env::var("EIDETIC_MODEL").as_deref() {
-        Ok("large") => &SIGLIP2_LARGE_384,
-        _ => &SIGLIP2_BASE_256,
+/// The quality option (ADR-0007). Same shape as `large` — the text model
+/// keeps its weights in an external `.onnx_data` companion — but 400M
+/// params and a 1152-dim embedding. Immich ships this variant for the same
+/// text-to-image job. Not yet the default: ADR-0007 requires the switch be
+/// justified by measured recall from `eidetic eval`, not assumed.
+const SIGLIP2_SO400M_384: ModelVariant = ModelVariant {
+    repo: "onnx-community/siglip2-so400m-patch14-384-ONNX",
+    vision_model: "onnx/vision_model.onnx",
+    text_model: "onnx/text_model.onnx",
+    text_model_data: Some("onnx/text_model.onnx_data"),
+    image_size: 384,
+    embed_dim: 1152,
+};
+
+/// Resolve the `EIDETIC_MODEL` value to a variant.
+///
+/// Unknown values are rejected rather than silently falling back to `base`:
+/// a typo would otherwise produce a whole library of embeddings at the wrong
+/// dimension, which only surfaces much later as empty search results.
+fn variant_for(raw: Option<&str>) -> Result<&'static ModelVariant> {
+    match raw {
+        None | Some("base") => Ok(&SIGLIP2_BASE_256),
+        Some("large") => Ok(&SIGLIP2_LARGE_384),
+        Some("so400m") => Ok(&SIGLIP2_SO400M_384),
+        Some(other) => Err(Error::ModelLoad(format!(
+            "Unknown EIDETIC_MODEL={other:?}; valid values: base, large, so400m"
+        ))),
     }
 }
 
+fn current_variant() -> Result<&'static ModelVariant> {
+    variant_for(std::env::var("EIDETIC_MODEL").ok().as_deref())
+}
+
 /// Produces L2-normalised embeddings for images and text. Variant selected
-/// via `EIDETIC_MODEL` (`base` by default, `large` for the 384-patch model).
+/// via `EIDETIC_MODEL`: `base` (default, 768-dim), `large` (1024-dim), or
+/// `so400m` (1152-dim, best quality).
 pub struct SiglipEmbedder {
     vision_session: Session,
     text_session: Session,
@@ -98,7 +134,7 @@ impl SiglipEmbedder {
         std::fs::create_dir_all(models_dir)
             .map_err(|e| Error::ModelLoad(format!("cannot create models dir: {e}")))?;
 
-        let variant = current_variant();
+        let variant = current_variant()?;
         let vision_path = download(models_dir, variant.repo, variant.vision_model)?;
         // Pre-download the external-data companion (if any) so it sits
         // beside text_model.onnx in the snapshot dir before ort opens it.
@@ -184,7 +220,15 @@ impl SiglipEmbedder {
     }
 }
 
-fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::PathBuf> {
+/// Fetch one file from a HuggingFace repo into the local model cache.
+///
+/// Shared with the face stack (ADR-0010) so both pipelines use one download
+/// and caching path.
+pub(crate) fn download(
+    models_dir: &Path,
+    repo: &str,
+    filename: &str,
+) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
 
     tracing::info!("Loading {filename} from {repo}…");
@@ -202,6 +246,19 @@ fn download(models_dir: &Path, repo: &str, filename: &str) -> Result<std::path::
     Ok(path)
 }
 
+/// Build a session using whichever accelerator `EIDETIC_ACCELERATOR` selects.
+///
+/// The face models (ADR-0010) go through here so they inherit the same CPU /
+/// CUDA / CoreML handling as SigLIP, including the fail-loudly behaviour when
+/// an explicitly requested provider cannot be registered.
+pub(crate) fn session_for_current_accelerator(
+    model_path: &Path,
+    models_dir: &Path,
+) -> Result<Session> {
+    let mode = parse_accelerator(std::env::var("EIDETIC_ACCELERATOR").ok().as_deref())?;
+    build_session(model_path, mode, &models_dir.join("coreml-cache"))
+}
+
 /// Build an ort `Session` from a model file, registering the execution
 /// provider implied by `mode`. CoreML is only registered on macOS; on
 /// other targets, `Mode::Default` and `Mode::Cpu` both fall through to
@@ -213,49 +270,87 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
 
     #[cfg(target_os = "macos")]
     {
-        if matches!(mode, Mode::CoreML) {
-            std::fs::create_dir_all(coreml_cache_dir).map_err(|e| {
-                Error::ModelLoad(format!(
-                    "cannot create CoreML cache dir {}: {e}",
-                    coreml_cache_dir.display()
-                ))
-            })?;
-            tracing::info!(
-                accelerator = "coreml",
-                model = %model_path.display(),
-                cache = %coreml_cache_dir.display(),
-                "registering CoreML EP (NeuralNetwork, ComputeUnits::All)"
-            );
-            builder = builder
-                .with_execution_providers([CoreML::default()
-                    .with_compute_units(ComputeUnits::All)
-                    .with_model_cache_dir(coreml_cache_dir.display().to_string())
-                    .build()])
-                .map_err(|e| Error::ModelLoad(e.to_string()))?;
-        } else {
-            tracing::info!(
-                accelerator = "cpu",
-                model = %model_path.display(),
-                "using CPU EP"
-            );
+        match mode {
+            Mode::Cuda => {
+                return Err(Error::ModelLoad(
+                    "EIDETIC_ACCELERATOR=cuda requested on macOS host (CUDA is non-macOS only)"
+                        .into(),
+                ));
+            }
+            Mode::CoreML => {
+                std::fs::create_dir_all(coreml_cache_dir).map_err(|e| {
+                    Error::ModelLoad(format!(
+                        "cannot create CoreML cache dir {}: {e}",
+                        coreml_cache_dir.display()
+                    ))
+                })?;
+                tracing::info!(
+                    accelerator = "coreml",
+                    model = %model_path.display(),
+                    cache = %coreml_cache_dir.display(),
+                    "registering CoreML EP (NeuralNetwork, ComputeUnits::All)"
+                );
+                builder = builder
+                    .with_execution_providers([CoreML::default()
+                        .with_compute_units(ComputeUnits::All)
+                        .with_model_cache_dir(coreml_cache_dir.display().to_string())
+                        .build()])
+                    .map_err(|e| Error::ModelLoad(e.to_string()))?;
+            }
+            Mode::Default | Mode::Cpu => {
+                tracing::info!(
+                    accelerator = "cpu",
+                    model = %model_path.display(),
+                    "using CPU EP"
+                );
+            }
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        if matches!(mode, Mode::CoreML) {
-            return Err(Error::ModelLoad(
-                "EIDETIC_ACCELERATOR=coreml requested on non-macOS host".into(),
-            ));
+        let _ = coreml_cache_dir;
+        match mode {
+            Mode::CoreML => {
+                return Err(Error::ModelLoad(
+                    "EIDETIC_ACCELERATOR=coreml requested on non-macOS host".into(),
+                ));
+            }
+            Mode::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    tracing::info!(
+                        accelerator = "cuda",
+                        model = %model_path.display(),
+                        "registering CUDA EP (device 0)"
+                    );
+                    // error_on_failure: the user explicitly asked for CUDA, so
+                    // a registration failure (missing cuDNN, wrong ORT build,
+                    // no kernels for this GPU) must be an error, not ort's
+                    // default silent fall-back to CPU. Same fail-loudly rule
+                    // as parse_accelerator and EIDETIC_MODEL.
+                    builder = builder
+                        .with_execution_providers([CUDA::default().build().error_on_failure()])
+                        .map_err(|e| Error::ModelLoad(e.to_string()))?;
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(Error::ModelLoad(
+                        "EIDETIC_ACCELERATOR=cuda requested but this binary was built without \
+                         the `cuda` feature (rebuild with --features cuda)"
+                            .into(),
+                    ));
+                }
+            }
+            Mode::Default | Mode::Cpu => {
+                // ort always builds in the CPU EP; nothing to register.
+                tracing::info!(
+                    accelerator = "cpu",
+                    model = %model_path.display(),
+                    "using CPU EP"
+                );
+            }
         }
-        // Default and Cpu both mean CPU EP on non-macOS; no registration needed
-        // because ort always builds in the CPU EP.
-        let _ = (mode, coreml_cache_dir);
-        tracing::info!(
-            accelerator = "cpu",
-            model = %model_path.display(),
-            "using CPU EP"
-        );
     }
 
     builder
@@ -263,51 +358,8 @@ fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Resu
         .map_err(|e| Error::ModelLoad(format!("{}: {e}", model_path.display())))
 }
 
-fn apply_limits_and_decode<R: Read + Seek + std::io::BufRead>(
-    mut reader: image::ImageReader<R>,
-) -> Result<image::DynamicImage> {
-    // Cap allocation + dimensions before decode so a decompression-bomb file
-    // (crafted PNG/JPEG/WEBP/HEIC) can't OOM-kill the embed loop. 512 MB /
-    // 16384 px is well above any real photo and well below "exhaust process
-    // memory".
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    limits.max_image_width = Some(16384);
-    limits.max_image_height = Some(16384);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map_err(|e| Error::Inference(format!("cannot decode image: {e}")))
-}
-
 fn preprocess_image(path: &Path, image_size: u32) -> Result<Vec<f32>> {
-    crate::ensure_heic_registered();
-
-    let mut img = if eidetic_core::dng::is_dng_path(path) {
-        let bytes = eidetic_core::dng::extract_largest_jpeg_preview(path)
-            .map_err(|e| Error::Inference(format!("dng preview extraction failed: {e}")))?;
-        let reader = image::ImageReader::new(Cursor::new(bytes))
-            .with_guessed_format()
-            .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
-        apply_limits_and_decode(reader)?
-    } else {
-        let reader = image::ImageReader::open(path)
-            .map_err(|e| Error::Inference(format!("cannot open image: {e}")))?
-            .with_guessed_format()
-            .map_err(|e| Error::Inference(format!("cannot detect image format: {e}")))?;
-        apply_limits_and_decode(reader)?
-    };
-
-    // Same rotation logic as ingest::thumbnail::load_image_with_limits.
-    // HEIC: libheif rotated already, skip. Everything else: apply the EXIF
-    // Orientation transform so SigLIP sees the photo right-side-up.
-    if !eidetic_core::exif::is_heic_path(path)
-        && let Some(orient) = eidetic_core::exif::read_orientation(path)
-        && let Some(transform) = image::metadata::Orientation::from_exif(orient)
-        && transform != image::metadata::Orientation::NoTransforms
-    {
-        img.apply_orientation(transform);
-    }
+    let img = crate::image_io::load_oriented_image(path)?;
 
     let rgb = img
         .resize_exact(
@@ -361,6 +413,7 @@ fn l2_normalize(v: &mut [f32]) {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "heic")]
     fn make_synthetic_heic(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
         use libheif_rs::{
             Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif,
@@ -472,6 +525,7 @@ mod tests {
     fn parse_accelerator_happy_paths() {
         assert_eq!(parse_accelerator(None).unwrap(), Mode::Default);
         assert_eq!(parse_accelerator(Some("coreml")).unwrap(), Mode::CoreML);
+        assert_eq!(parse_accelerator(Some("cuda")).unwrap(), Mode::Cuda);
         assert_eq!(parse_accelerator(Some("cpu")).unwrap(), Mode::Cpu);
     }
 
@@ -488,9 +542,39 @@ mod tests {
             "expected error to list valid values, got: {msg}"
         );
         assert!(
+            msg.contains("cuda"),
+            "expected error to list valid values, got: {msg}"
+        );
+        assert!(
             msg.contains("cpu"),
             "expected error to list valid values, got: {msg}"
         );
+    }
+
+    #[test]
+    fn variant_for_known_values() {
+        assert_eq!(variant_for(None).unwrap().embed_dim, 768);
+        assert_eq!(variant_for(Some("base")).unwrap().embed_dim, 768);
+        assert_eq!(variant_for(Some("large")).unwrap().embed_dim, 1024);
+        assert_eq!(variant_for(Some("so400m")).unwrap().embed_dim, 1152);
+    }
+
+    #[test]
+    fn variant_for_so400m_pulls_external_text_weights() {
+        // The text model ships its weights in a companion file; forgetting to
+        // download it makes ort fail at session load.
+        let v = variant_for(Some("so400m")).unwrap();
+        assert_eq!(v.text_model_data, Some("onnx/text_model.onnx_data"));
+        assert_eq!(v.image_size, 384);
+    }
+
+    #[test]
+    fn variant_for_unknown_value_errors() {
+        // A silent fallback would embed the whole library at the wrong
+        // dimension before anyone noticed.
+        let err = variant_for(Some("so400")).unwrap_err().to_string();
+        assert!(err.contains("so400"), "should echo the bad value: {err}");
+        assert!(err.contains("so400m"), "should list valid values: {err}");
     }
 
     #[test]
@@ -501,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "heic")]
     fn preprocess_image_accepts_heic_source() {
         crate::ensure_heic_registered();
         let tmp = tempfile::tempdir().expect("tmpdir");

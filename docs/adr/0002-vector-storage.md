@@ -1,7 +1,13 @@
 # ADR-0002: Vector storage = Postgres + pgvector + VectorChord
 
 Date: 2026-04-26
-Status: accepted
+Status: superseded by ADR-0005 (2026-07-23)
+
+> **Superseded.** The move to a self-contained, no-server, cross-platform binary
+> (see ADR-0009) made the Postgres server the single biggest deployment cost, and
+> the anti-goals in `goals.md` (strictly personal, single-machine, never SaaS)
+> removed the scale justification. Vector storage is now unified SQLite with a
+> pluggable index — see **ADR-0005**. This ADR is kept for the rationale trail.
 
 ## Context
 

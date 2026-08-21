@@ -1,7 +1,12 @@
 # ADR-0004: Image embedding model = SigLIP 2 base (768-dim)
 
 Date: 2026-04-26
-Status: accepted
+Status: superseded by ADR-0007 (2026-07-23)
+
+> **Superseded.** The arrival of a dedicated GPU (RTX 5070 Ti, see ADR-0006)
+> removed the CPU-latency reason for defaulting to `base`. The default is now the
+> `so400m/384` variant this ADR itself named as the future upgrade path — see
+> **ADR-0007**. This ADR is kept for the rationale trail.
 
 ## Context
 
