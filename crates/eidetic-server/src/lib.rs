@@ -4,7 +4,7 @@
 use axum::Router;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use eidetic_db::AssetsRepo;
+use eidetic_db::{AssetsRepo, FacesRepo};
 use eidetic_ml::SiglipEmbedder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ mod views;
 
 pub struct ServerDeps {
     pub repo: AssetsRepo,
+    pub faces: FacesRepo,
     pub library_dir: PathBuf,
     pub models_cache: PathBuf,
 }
@@ -28,6 +29,7 @@ pub(crate) type EmbedJob = (String, oneshot::Sender<eidetic_ml::Result<Vec<f32>>
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) repo: Arc<AssetsRepo>,
+    pub(crate) faces: Arc<FacesRepo>,
     pub(crate) library_dir: Arc<PathBuf>,
     #[allow(dead_code)]
     pub(crate) embed_tx: mpsc::Sender<EmbedJob>,
@@ -47,6 +49,8 @@ pub(crate) enum ServerError {
     DbFailed(#[source] eidetic_db::Error),
     #[error("io error: {0}")]
     Io(#[source] std::io::Error),
+    #[error("face crop failed: {0}")]
+    CropFailed(String),
 }
 
 impl IntoResponse for ServerError {
@@ -78,6 +82,13 @@ impl IntoResponse for ServerError {
                     "Internal error.".to_string(),
                 )
             }
+            ServerError::CropFailed(_) => {
+                tracing::error!(error = %self, "face crop failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to render face crop.".to_string(),
+                )
+            }
         };
         (status, Html(format!("<!doctype html><pre>{body}</pre>"))).into_response()
     }
@@ -103,6 +114,7 @@ pub async fn serve(addr: SocketAddr, deps: ServerDeps) -> anyhow::Result<()> {
 
     let state = AppState {
         repo: Arc::new(deps.repo),
+        faces: Arc::new(deps.faces),
         library_dir: Arc::new(deps.library_dir),
         embed_tx,
     };
@@ -126,21 +138,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/assets/{id}", get(handlers::asset_detail))
         .route("/assets/{id}/raw", get(handlers::asset_raw))
         .route("/thumbs/{size}/{hash}", get(handlers::thumb))
+        .route("/persons", get(handlers::persons_index))
+        .route("/persons/{id}", get(handlers::person_detail))
+        .route("/faces/{id}/crop", get(handlers::face_crop))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 pub type TestRouter = Router;
 
-/// Build a router wired to `repo` and `library_dir`, with a dead-end embedder
-/// channel. For tests only; searches with a non-empty `q` will fail because no
-/// embedder worker reads the channel. The empty-redirect path still works.
-pub fn test_router(repo: AssetsRepo, library_dir: PathBuf) -> Router {
+/// Build a router wired to `repo`, `faces` and `library_dir`, with a dead-end
+/// embedder channel. For tests only; searches with a non-empty `q` will fail
+/// because no embedder worker reads the channel. The empty-redirect path
+/// still works.
+pub fn test_router(repo: AssetsRepo, faces: FacesRepo, library_dir: PathBuf) -> Router {
     let (embed_tx, _embed_rx) = mpsc::channel::<EmbedJob>(1);
     // _embed_rx drops at end of scope; embed_tx.send() in tests will fail.
     // That's fine: handler tests for /search use the empty-q redirect path.
     let state = AppState {
         repo: Arc::new(repo),
+        faces: Arc::new(faces),
         library_dir: Arc::new(library_dir),
         embed_tx,
     };
