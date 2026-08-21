@@ -10,24 +10,20 @@
 //! an ANN index and fast enough — a few hundred thousand 1152-dim vectors is
 //! tens of milliseconds of SIMD-friendly dot products.
 
-use eidetic_core::AssetId;
-
 /// Ranking strategy over stored embeddings.
 ///
-/// An approximate implementation would keep its own persistent index and use
-/// `stored` only to resolve ids; the exact implementation below reads it
-/// directly.
+/// Results are indices into `stored` rather than asset ids: since video
+/// support (ADR-0011) one asset can own several frame vectors, and the
+/// caller needs to know *which row* matched (it carries the timestamp). An
+/// approximate implementation would keep its own persistent index and use
+/// `stored` only for dimensions; the exact implementation reads it directly.
 pub trait VectorIndex: Send + Sync {
-    /// Return up to `limit` `(asset, score)` pairs, highest score first.
+    /// Return up to `limit` `(index_into_stored, score)` pairs, highest
+    /// score first.
     ///
     /// `query` and every stored vector are expected to be L2-normalised, so
     /// the score is a cosine similarity in `[-1.0, 1.0]`.
-    fn top_k(
-        &self,
-        query: &[f32],
-        stored: &[(AssetId, Vec<f32>)],
-        limit: usize,
-    ) -> Vec<(AssetId, f32)>;
+    fn top_k(&self, query: &[f32], stored: &[Vec<f32>], limit: usize) -> Vec<(usize, f32)>;
 }
 
 /// Exact nearest-neighbour search by full scan.
@@ -35,23 +31,19 @@ pub trait VectorIndex: Send + Sync {
 pub struct BruteForce;
 
 impl VectorIndex for BruteForce {
-    fn top_k(
-        &self,
-        query: &[f32],
-        stored: &[(AssetId, Vec<f32>)],
-        limit: usize,
-    ) -> Vec<(AssetId, f32)> {
+    fn top_k(&self, query: &[f32], stored: &[Vec<f32>], limit: usize) -> Vec<(usize, f32)> {
         if limit == 0 {
             return Vec::new();
         }
 
-        let mut scored: Vec<(AssetId, f32)> = stored
+        let mut scored: Vec<(usize, f32)> = stored
             .iter()
+            .enumerate()
             // Skip rows whose dimension doesn't match the query. That happens
             // only mid-migration between embedding models (ADR-0007); ranking
             // them against a different-width query would be meaningless.
             .filter(|(_, v)| v.len() == query.len())
-            .map(|(id, v)| (*id, dot(query, v)))
+            .map(|(i, v)| (i, dot(query, v)))
             .collect();
 
         // Descending by score. `total_cmp` avoids the NaN panic that
@@ -95,10 +87,6 @@ pub fn decode(blob: &[u8]) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
 
-    fn id() -> AssetId {
-        AssetId::new()
-    }
-
     #[test]
     fn encode_decode_round_trips() {
         let v = vec![0.0f32, 1.0, -0.5, 0.125];
@@ -115,35 +103,33 @@ mod tests {
     fn top_k_ranks_by_similarity_and_truncates() {
         // A unit vector at 45 degrees: equidistant from both axes.
         let diag = std::f32::consts::FRAC_1_SQRT_2;
-        let (near, mid, far) = (id(), id(), id());
         let stored = vec![
-            (far, vec![0.0, 1.0]),
-            (near, vec![1.0, 0.0]),
-            (mid, vec![diag, diag]),
+            vec![0.0, 1.0],     // far
+            vec![1.0, 0.0],     // exact
+            vec![diag, diag],   // middle
         ];
 
         let hits = BruteForce.top_k(&[1.0, 0.0], &stored, 2);
 
         assert_eq!(hits.len(), 2, "limit must truncate");
-        assert_eq!(hits[0].0, near);
-        assert_eq!(hits[1].0, mid);
+        assert_eq!(hits[0].0, 1, "index of the exact match");
+        assert_eq!(hits[1].0, 2, "index of the diagonal");
         assert!((hits[0].1 - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn top_k_skips_mismatched_dimensions() {
-        let (ok, wrong) = (id(), id());
-        let stored = vec![(wrong, vec![1.0, 0.0, 0.0]), (ok, vec![1.0, 0.0])];
+        let stored = vec![vec![1.0, 0.0, 0.0], vec![1.0, 0.0]];
 
         let hits = BruteForce.top_k(&[1.0, 0.0], &stored, 10);
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, ok);
+        assert_eq!(hits[0].0, 1, "only the dimension-matched row survives");
     }
 
     #[test]
     fn top_k_zero_limit_is_empty() {
-        let stored = vec![(id(), vec![1.0, 0.0])];
+        let stored = vec![vec![1.0, 0.0]];
         assert!(BruteForce.top_k(&[1.0, 0.0], &stored, 0).is_empty());
     }
 }

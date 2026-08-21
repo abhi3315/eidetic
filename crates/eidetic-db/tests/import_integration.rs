@@ -102,6 +102,10 @@ async fn known_hash_returns_duplicate() {
             place: None,
             place_distance_m: None,
             thumbnails_generated: false,
+            duration_secs: None,
+            video_codec: None,
+            pixel_width: None,
+            pixel_height: None,
         })
         .await
         .expect("seed insert")
@@ -202,6 +206,10 @@ async fn dir_counts_duplicates_separately() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     })
     .await
     .expect("seed");
@@ -303,6 +311,10 @@ async fn duplicate_import_does_not_touch_library_dir() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     })
     .await
     .expect("seed");

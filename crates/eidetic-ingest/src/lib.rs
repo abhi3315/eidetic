@@ -4,6 +4,7 @@ mod import;
 mod meta;
 mod store;
 pub mod thumbnail;
+pub mod video;
 
 pub use error::{Error, Result};
 pub use hasher::hash_file;

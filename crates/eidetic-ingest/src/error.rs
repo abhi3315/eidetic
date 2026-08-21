@@ -25,6 +25,14 @@ pub enum Error {
     Db(#[from] eidetic_db::Error),
     #[error("dng preview extraction failed: {0}")]
     Dng(#[source] eidetic_core::dng::Error),
+    #[error("ffprobe failed for {path}: {detail}")]
+    VideoProbe { path: PathBuf, detail: String },
+    #[error("frame extraction failed for {path} at {ts_secs:.1}s: {detail}")]
+    FrameExtract {
+        path: PathBuf,
+        ts_secs: f64,
+        detail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

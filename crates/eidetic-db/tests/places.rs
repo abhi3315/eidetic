@@ -49,6 +49,10 @@ async fn update_place_columns_writes_all_five_fields() {
             place: None,
             place_distance_m: None,
             thumbnails_generated: false,
+            duration_secs: None,
+            video_codec: None,
+            pixel_width: None,
+            pixel_height: None,
         })
         .await
         .unwrap()

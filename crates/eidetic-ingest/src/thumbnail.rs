@@ -55,7 +55,37 @@ pub fn thumbnail_path(library_dir: &Path, hash: &Sha256, size: ThumbSize) -> Pat
 /// future run to overwrite.
 pub fn generate_thumbnails(src: &Path, hash: &Sha256, library_dir: &Path) -> Result<()> {
     let img = load_image_with_limits(src)?;
+    generate_thumbnails_from_image(&img, hash, library_dir)
+}
 
+/// Generate both thumbnail sizes for a video by extracting one representative
+/// frame (10% in — see [`crate::video::thumbnail_ts`]) and feeding it through
+/// the same resize/encode loop as photos, so `.thumbs/` stays uniform.
+///
+/// Errors when ffmpeg is missing — callers gate on [`crate::video::ffmpeg`]
+/// first so they can warn once instead of once per file.
+pub fn generate_video_thumbnails(
+    src: &Path,
+    hash: &Sha256,
+    library_dir: &Path,
+    duration_secs: Option<f64>,
+) -> Result<()> {
+    let ts = crate::video::thumbnail_ts(duration_secs);
+    let frame = crate::video::extract_frame(src, ts)?.ok_or_else(|| Error::FrameExtract {
+        path: src.to_path_buf(),
+        ts_secs: ts,
+        detail: "ffmpeg is not installed".to_string(),
+    })?;
+    generate_thumbnails_from_image(&frame, hash, library_dir)
+}
+
+/// The shared resize/encode half of thumbnail generation: photos arrive via
+/// [`generate_thumbnails`]'s decoder, video frames via ffmpeg.
+pub fn generate_thumbnails_from_image(
+    img: &image::DynamicImage,
+    hash: &Sha256,
+    library_dir: &Path,
+) -> Result<()> {
     for size in [ThumbSize::Small, ThumbSize::Medium] {
         let dest = thumbnail_path(library_dir, hash, size);
         if let Some(parent) = dest.parent() {

@@ -79,6 +79,29 @@ async fn try_import_file(
         crate::meta::ExifData::default()
     };
 
+    // Videos get their metadata from ffprobe instead of EXIF (ADR-0011). A
+    // probe failure downgrades to "imported without video metadata": the
+    // bytes still land, and the thumbnail/embed backfills re-probe later.
+    let video = if mime_type.starts_with("video/") {
+        match crate::video::probe(stage.path()) {
+            Ok(Some(p)) => Some(p),
+            Ok(None) => {
+                warn_ffmpeg_missing_once();
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ffprobe failed; importing video without metadata"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let storage_path = commit_staged(stage, &hash, ext.as_deref(), &config.library_dir)?;
 
     let thumbnails_generated = if mime_type.starts_with("image/") {
@@ -101,11 +124,47 @@ async fn try_import_file(
                 false
             }
         }
+    } else if mime_type.starts_with("video/") && crate::video::ffmpeg().is_some() {
+        let src = storage_path.clone();
+        let hash_clone = hash.clone();
+        let lib = config.library_dir.clone();
+        let duration = video.as_ref().and_then(|v| v.duration_secs);
+        let result = tokio::task::spawn_blocking(move || {
+            crate::thumbnail::generate_video_thumbnails(&src, &hash_clone, &lib, duration)
+        })
+        .await
+        .expect("thumbnail thread panicked");
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::info!(
+                    path = %path.display(),
+                    error = %e,
+                    "video thumbnail failed; asset stored without thumbnails (eidetic thumbnail will retry)"
+                );
+                false
+            }
+        }
     } else {
+        if mime_type.starts_with("video/") {
+            warn_ffmpeg_missing_once();
+        }
         false
     };
 
-    let place = match (geocoder, exif.latitude, exif.longitude) {
+    // Photos carry GPS in EXIF, iPhone videos in the QuickTime location tag;
+    // either way the coordinates geocode identically.
+    let date_taken = exif
+        .date_taken
+        .or_else(|| video.as_ref().and_then(|v| v.date_taken));
+    let latitude = exif
+        .latitude
+        .or_else(|| video.as_ref().and_then(|v| v.latitude));
+    let longitude = exif
+        .longitude
+        .or_else(|| video.as_ref().and_then(|v| v.longitude));
+
+    let place = match (geocoder, latitude, longitude) {
         (Some(g), Some(lat), Some(lon)) => g.lookup(lat, lon),
         _ => None,
     };
@@ -116,9 +175,9 @@ async fn try_import_file(
         storage_path: storage_path.clone(),
         file_size,
         mime_type: Some(mime_type),
-        date_taken: exif.date_taken,
-        latitude: exif.latitude,
-        longitude: exif.longitude,
+        date_taken,
+        latitude,
+        longitude,
         camera_make: exif.camera_make,
         camera_model: exif.camera_model,
         lens_make: exif.lens_make,
@@ -138,6 +197,10 @@ async fn try_import_file(
         place: place.as_ref().map(|p| p.place.clone()),
         place_distance_m: place.as_ref().map(|p| p.distance_m),
         thumbnails_generated,
+        duration_secs: video.as_ref().and_then(|v| v.duration_secs),
+        video_codec: video.as_ref().and_then(|v| v.video_codec.clone()),
+        pixel_width: video.as_ref().and_then(|v| v.width),
+        pixel_height: video.as_ref().and_then(|v| v.height),
     };
 
     match repo.insert_asset(new_asset).await? {
@@ -150,6 +213,20 @@ async fn try_import_file(
             Ok(ImportOutcome::Duplicate(id))
         }
     }
+}
+
+/// Missing ffmpeg is one situation, not one situation per file: warn once
+/// per process, then stay quiet.
+fn warn_ffmpeg_missing_once() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "ffmpeg/ffprobe not found; videos import without metadata or thumbnails. \
+             Install ffmpeg (or set EIDETIC_FFMPEG_PATH / EIDETIC_FFPROBE_PATH) and run \
+             `eidetic thumbnail` + `eidetic embed` to backfill."
+        );
+    });
 }
 
 pub struct ImportSummary {

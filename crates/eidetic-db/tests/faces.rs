@@ -54,6 +54,10 @@ async fn insert_asset(repo: &AssetsRepo, n: u8) -> eidetic_core::AssetId {
             place: None,
             place_distance_m: None,
             thumbnails_generated: false,
+            duration_secs: None,
+            video_codec: None,
+            pixel_width: None,
+            pixel_height: None,
         })
         .await
         .expect("insert asset");
