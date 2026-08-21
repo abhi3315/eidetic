@@ -1,6 +1,6 @@
 # Eidetic
 
-Self-hosted media intelligence system. A personal photo and video library with semantic search, deduplication, and (eventually) face grouping and prompt-driven reel generation.
+Self-hosted media intelligence system. A personal photo and video library with semantic search over photos *and* video moments, deduplication, face grouping, and prompt-driven reel generation.
 
 Written in Rust.
 
@@ -12,12 +12,17 @@ Written in Rust.
   - Extracts EXIF: date taken, GPS, camera make/model, lens, focal length, aperture, shutter, ISO, orientation, altitude, plus a JSONB tail with every other tag kamadak-exif can parse
   - Reverse-geocodes GPS coordinates to country, state, and nearest-place name using an offline GeoNames cities500 dataset (~13 MB, auto-downloaded into `~/.cache/eidetic/geonames/` on first import; photo coordinates never leave the machine)
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
-  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif, on by default — see [Build features](#build-features)), and DNG/Apple ProRAW (via embedded JPEG preview)
-- `eidetic embed`: generate SigLIP 2 embeddings for all imported images (~1.4 GiB model download on first run)
-- `eidetic search "dog on beach"`: find photos by natural-language description
+  - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif, on by default — see [Build features](#build-features)), DNG/Apple ProRAW (via embedded JPEG preview), and videos (MP4/MOV/MKV/WebM and friends)
+  - Videos are probed with ffprobe ([ADR-0011](docs/adr/0011-video-pipeline.md)): duration, codec, rotation-aware dimensions, creation date, and the QuickTime GPS tag iPhones write — which geocodes offline exactly like photo EXIF. A representative frame becomes the thumbnail. ffmpeg is a *runtime* dependency: without it videos still import, and one warning tells you what to install.
+- `eidetic embed`: generate SigLIP 2 embeddings for all imported images and videos (~1.4 GiB model download on first run). Videos get up to 5 sampled frames across the middle 80% of their duration, each stored with its timestamp.
+- `eidetic search "dog on beach"`: find photos *and video moments* by natural-language description
+  - Video results carry the timestamp of the best-matching frame (`@7.0s` on default output, `ts` as a field)
   - `--limit N`: number of results (default 10)
-  - `--fields score,date,path`: tab-separated column output
+  - `--fields score,ts,date,path`: tab-separated column output
   - `--json`: full JSON array
+- `eidetic reel "sunset at the beach"`: cut a short mp4 from the best-matching photos and video moments (needs ffmpeg)
+  - Video hits become ~4s clips around the matched frame; photos hold 3s with a Ken Burns push-in
+  - `--duration N` target seconds (default 30), `--size WxH` (default 1920x1080), `--output file`, `--dry-run` to print the cut list
 - `eidetic faces`: detect faces in imported images, then group them into people
   - Detection is YuNet, embedding is AuraFace (512-dim) by default — both permissively licensed, see [ADR-0010](docs/adr/0010-face-stack.md)
   - `EIDETIC_FACE_MODEL`: `auraface` (default), `sface` (smaller/faster, 128-dim), or `buffalo_l` (InsightFace; better accuracy but **non-commercial weights** you download yourself)
@@ -26,6 +31,7 @@ Written in Rust.
   - Your corrections are durable: naming, merges and splits are stored as constraints, so re-running clustering never discards them
 - `eidetic persons`: list grouped people with face counts
 - `eidetic name-person <id> <name>`: name a person
+- `eidetic serve`: localhost web viewer — thumbnail grid (videos play inline with seeking), semantic search, per-asset detail, and a People section with face-crop grids per person (naming stays in the CLI)
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>`: SHA-256 a file, no setup needed
 - `eidetic eval --coco-csv <path> --coco-images <dir> [--limit N]`: text-to-image retrieval eval on the COCO 5K Karpathy split. Reports R@1/5/10 + MRR; bypasses the database.
@@ -116,6 +122,8 @@ Eidetic uses `libheif` to decode HEIC/HEIF photos (the format iPhones produce by
 The x265 plugin is only needed if you run the test suite (which encodes synthetic HEIC fixtures at setup). The libde265 plugin is needed any time you decode an existing HEIC file. macOS Homebrew's `libheif` bundles both directly, so no extra step there.
 
 If `libheif` isn't installed, Eidetic builds fine but fails at runtime with a dynamic-linker error when a HEIC file is encountered.
+
+Video features (thumbnails, frame embeddings, reels) shell out to **ffmpeg/ffprobe** at runtime — no build dependency at all ([ADR-0011](docs/adr/0011-video-pipeline.md)). Install with `brew install ffmpeg` / `sudo apt install ffmpeg`, or point `EIDETIC_FFMPEG_PATH` / `EIDETIC_FFPROBE_PATH` at binaries elsewhere. Without ffmpeg everything else works; videos import but stay un-thumbnailed and un-searchable until you install it and run `eidetic thumbnail` + `eidetic embed`.
 
 ## Build
 

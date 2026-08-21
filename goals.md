@@ -4,10 +4,10 @@
 
 A self-hosted media intelligence system. Local Google Photos-style management for a personal photo and video library, with:
 
-- Automatic ingestion and deduplication
-- Semantic search ("dog on beach", "Kashmir trip 2025")
-- Face grouping (later phase)
-- Prompt-driven reel generation (stretch)
+- Automatic ingestion and deduplication — done
+- Semantic search ("dog on beach", "Kashmir trip 2025") — done, photos and video moments
+- Face grouping — done (v0.3)
+- Prompt-driven reel generation — done (v0.4)
 
 ## Who it's for
 

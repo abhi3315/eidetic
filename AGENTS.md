@@ -8,7 +8,7 @@ This file works for any agent that supports the `AGENTS.md` convention (Claude C
 
 ## What this project is
 
-Eidetic is a self-hosted personal media intelligence system. It ingests photos and videos, deduplicates them, extracts EXIF + visual embeddings, and (eventually) groups faces and generates prompt-driven reels. CLI-first; written in Rust; built primarily with AI assistance.
+Eidetic is a self-hosted personal media intelligence system. It ingests photos and videos, deduplicates them, extracts EXIF/ffprobe metadata + visual embeddings (per-frame for videos), groups faces into people, and cuts prompt-driven reels with ffmpeg. CLI-first; written in Rust; built primarily with AI assistance.
 
 This is one person's photo library on one person's hardware. Not a SaaS, not multi-user. See `goals.md` for product scope and anti-goals.
 
