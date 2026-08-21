@@ -2,6 +2,45 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.3.0 — 2026-08-21
+
+The "faces and no more Docker" release. v0.2 could browse and search a library; v0.3 groups the people in it — and drops the database server entirely. Postgres + VectorChord is gone, replaced by a single SQLite file, so the whole system is now one binary plus one file, no container, no daemon.
+
+### Added
+
+- **Face grouping (`eidetic faces`)** — detects faces with YuNet, aligns each one onto the ArcFace 5-point template, embeds it with AuraFace (512-dim, Apache-2.0), then groups faces into people. New faces join an existing person when they sit close enough to one of that person's exemplars; leftovers are clustered with Chinese Whispers and proposed as new people once at least 3 agree. `--cluster-only` re-groups already-detected faces without rescanning. See ADR-0010.
+- **`eidetic persons` and `eidetic name-person <id> <name>`** — list grouped people with face counts, give them names.
+- **Durable corrections** — names, merges and splits are stored as constraints, so re-running clustering never discards them. User-assigned faces are frozen; the clusterer must never reassign them.
+- **`EIDETIC_FACE_MODEL`** — `auraface` (default), `sface` (smaller/faster, 128-dim), or `buffalo_l` (InsightFace; better accuracy, but non-commercial weights you download yourself).
+- **CUDA execution provider** behind a `cuda` build feature (`EIDETIC_ACCELERATOR=cuda`). Needs an ONNX Runtime ≥ 1.27 CUDA build via `ORT_DYLIB_PATH` on Blackwell (sm_120) GPUs — the bundled 1.23.x can't drive them (ADR-0006). An explicit accelerator request that can't be honored now fails loudly instead of silently running on CPU.
+- **SigLIP 2 so400m variant** (`EIDETIC_MODEL=so400m`, 1152-dim) — the quality option, same variant Immich ships. Default stays `base` until `eidetic eval` measures otherwise (ADR-0007). Unknown `EIDETIC_MODEL` values are rejected instead of silently falling back.
+- **Release CI** — build matrix producing binaries per platform, plus a guard that the `--no-default-features` build stays free of C system dependencies (ADR-0009).
+
+### Changed
+
+- **Postgres + VectorChord → embedded SQLite** (ADR-0005). No server process, no Docker, no connection string: the database is one file (`EIDETIC_DATABASE_PATH`, default `~/.cache/eidetic/eidetic.db`), created and migrated on first connect. Vector search is an exact in-process cosine scan — 100% recall, nothing to tune; usearch is the documented escalation past ~1M vectors. Integration tests went from container-per-test to ~1s total.
+- **libheif is optional** behind a default-on `heic` feature (ADR-0008). `--no-default-features` builds with zero C system dependencies.
+
+### Fixed
+
+- **Dependency advisories cleared** — anyhow, crossbeam-epoch and spin bumped.
+
+### Verified against LFW (Labeled Faces in the Wild)
+
+- 65-image subset: 6 identities × 10 photos each plus 5 single-photo people, including George HW Bush as a deliberate near-match to George W Bush. Result: exactly six 100%-pure clusters (10/10 faces each after one incremental pass), all singletons correctly left unassigned, and a person's name survives `faces --cluster-only` re-runs.
+- Embedding separation: same-person cosine similarity 0.67 mean vs 0.08 different-person; minimum same-person 0.34 stays above maximum different-person 0.29.
+- This verification caught a real bug before release: the eye/mouth landmark order was mirrored going into alignment, which collapsed crops to ~0.24× scale and dragged same-person similarity down to 0.39. Geometry-only checks passed the whole time — an ignored LFW discrimination test (`EIDETIC_FACE_LFW_DIR`) now guards the metric that actually matters.
+
+### Migration note
+
+There is no automated Postgres → SQLite migration. Reset and reimport: point `EIDETIC_DATABASE_PATH` wherever you want the file (or accept the default), then rerun `eidetic import` and `eidetic embed`. The old `database_url` config is gone.
+
+### Internals
+
+- New crate modules: `eidetic-ml::face` (detect / align / analyzer), `eidetic-db::{faces, cluster, vector}`, `eidetic-ml::image_io`.
+- New tables: `persons`, `faces`, `face_detection_runs`, `face_person_rejections`, `face_links`. Six Postgres migrations collapsed into three SQLite ones.
+- Ignored end-to-end tests need real inputs: `EIDETIC_FACE_TEST_IMAGE` (geometry on one portrait) and `EIDETIC_FACE_LFW_DIR` (identity discrimination over an LFW-style directory).
+
 ## v0.2.1 — 2026-05-24
 
 Patch release. One user-visible bugfix, one internal refactor.
