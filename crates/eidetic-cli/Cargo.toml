@@ -34,5 +34,6 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+tempfile = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

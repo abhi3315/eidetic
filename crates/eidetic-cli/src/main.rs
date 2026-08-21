@@ -1,4 +1,5 @@
 mod eval;
+mod reel;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -94,6 +95,27 @@ enum Command {
         /// Output results as a JSON array with all fields.
         #[arg(long)]
         json: bool,
+    },
+    /// Cut a short reel from the library for a prompt (needs ffmpeg).
+    Reel {
+        /// What the reel is about, e.g. "sunset at the beach".
+        prompt: String,
+
+        /// Target length in seconds.
+        #[arg(long, default_value = "30")]
+        duration: f64,
+
+        /// Output file. Refuses to overwrite an existing file.
+        #[arg(long, short, default_value = "reel.mp4")]
+        output: PathBuf,
+
+        /// Output frame size, WIDTHxHEIGHT.
+        #[arg(long, default_value = "1920x1080")]
+        size: String,
+
+        /// Print the cut list without rendering.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -792,6 +814,76 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Loading model (downloads ~1.4 GiB on first run)…");
             eidetic_server::serve(addr, deps).await?;
+        }
+
+        Command::Reel {
+            prompt,
+            duration,
+            output,
+            size,
+            dry_run,
+        } => {
+            let (w, h) = size
+                .split_once('x')
+                .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
+            if !dry_run && output.exists() {
+                anyhow::bail!(
+                    "{} already exists; pass a different --output",
+                    output.display()
+                );
+            }
+
+            let config = Config::from_env();
+            let models_dir = config.paths.models_cache.clone();
+            let prompt_clone = prompt.clone();
+            let query_emb = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
+                let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                embedder.embed_text(&prompt_clone)
+            })
+            .await
+            .context("embedder thread panicked")?
+            .context("text embedding failed")?;
+
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::AssetsRepo::new(pool);
+
+            // Over-fetch: the plan trims to the target duration and drops the
+            // weak tail, so more candidates only ever improve the cut.
+            let candidates = (duration / 2.0).ceil() as u32 + 10;
+            let results = repo
+                .search_similar(query_emb.as_slice(), candidates)
+                .await
+                .context("search failed")?;
+
+            let plan = reel::plan(&results, duration);
+            if plan.segments.is_empty() {
+                anyhow::bail!(
+                    "nothing in the library matches {prompt:?} confidently enough for a reel"
+                );
+            }
+
+            println!(
+                "Cut list for {prompt:?} ({:.1}s from {} segment(s)):",
+                plan.total_secs,
+                plan.segments.len()
+            );
+            for (i, seg) in plan.segments.iter().enumerate() {
+                println!("  {:>2}. {}", i + 1, seg.describe());
+            }
+            if dry_run {
+                return Ok(());
+            }
+
+            println!("Rendering {w}x{h} @ 30fps…");
+            let render_output = output.clone();
+            tokio::task::spawn_blocking(move || reel::render(&plan, &render_output, w, h))
+                .await
+                .context("render thread panicked")??;
+            println!("Wrote {}", output.display());
         }
 
         Command::Search {

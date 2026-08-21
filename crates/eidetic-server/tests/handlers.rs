@@ -181,6 +181,10 @@ async fn raw_streams_original_with_mime_and_disposition() {
         place: None,
         place_distance_m: None,
         thumbnails_generated: false,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
     };
     let id = match repo.insert_asset(asset).await.expect("insert") {
         eidetic_db::InsertOutcome::Inserted(id) => id,

@@ -75,6 +75,8 @@ pub struct SearchResult {
     /// frame — the moment to jump to, and the reel generator's cut point.
     /// None for images.
     pub frame_ts: Option<f64>,
+    /// Video duration in seconds (probe metadata); None for images.
+    pub duration_secs: Option<f64>,
     pub mime_type: Option<String>,
     pub file_size: i64,
     pub thumbnails_generated: bool,
@@ -518,7 +520,7 @@ impl AssetsRepo {
             .join(",");
         let sql = format!(
             "SELECT id, storage_path, mime_type, file_size, thumbnails_generated, date_taken, \
-                    camera_make, camera_model, latitude, longitude \
+                    camera_make, camera_model, latitude, longitude, duration_secs \
              FROM assets WHERE id IN ({placeholders})"
         );
 
@@ -534,6 +536,7 @@ impl AssetsRepo {
             camera_model: Option<String>,
             latitude: Option<f64>,
             longitude: Option<f64>,
+            duration_secs: Option<f64>,
         }
 
         let mut q = sqlx::query_as::<_, MetaRow>(&sql);
@@ -562,6 +565,7 @@ impl AssetsRepo {
                     camera_model: m.camera_model,
                     latitude: m.latitude,
                     longitude: m.longitude,
+                    duration_secs: m.duration_secs,
                 })
             })
             .collect())
