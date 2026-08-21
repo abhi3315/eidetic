@@ -387,6 +387,110 @@ mod tests {
         assert!(v.iter().all(|&x| x == 0.0));
     }
 
+    /// Discrimination check against a directory of LFW-style images.
+    ///
+    /// The real-portrait test below validates geometry on one face; this one
+    /// validates what actually matters for clustering — that two photos of
+    /// the same person embed closer than photos of different people. The
+    /// landmark-order bug this guards against (eyes and mouths swapped into a
+    /// mirrored correspondence the similarity transform cannot fit) passed
+    /// every geometry assertion while collapsing same-person cosine
+    /// similarity from ~0.67 to ~0.39 against different-person ~0.32.
+    ///
+    /// Point `EIDETIC_FACE_LFW_DIR` at a flat directory of `Name_NNNN.jpg`
+    /// files (LFW naming), several identities with several photos each. The
+    /// largest face per image is taken as the named person.
+    #[test]
+    #[ignore = "requires face models + LFW images; set EIDETIC_MODELS_CACHE and EIDETIC_FACE_LFW_DIR"]
+    fn lfw_same_person_similarity_beats_different_person() {
+        let models_dir = std::env::var("EIDETIC_MODELS_CACHE")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_MODELS_CACHE");
+        let lfw_dir = std::env::var("EIDETIC_FACE_LFW_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set EIDETIC_FACE_LFW_DIR=/path/to/flat/lfw/images");
+
+        let mut analyzer = FaceAnalyzer::load(&models_dir).expect("load face models");
+
+        // identity -> main-face embeddings, one per image.
+        let mut by_identity: std::collections::HashMap<String, Vec<Vec<f32>>> =
+            std::collections::HashMap::new();
+        for entry in std::fs::read_dir(&lfw_dir).expect("read LFW dir") {
+            let path = entry.expect("dir entry").path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // `George_W_Bush_0001` -> `George_W_Bush`.
+            let Some((identity, _)) = stem.rsplit_once('_') else {
+                continue;
+            };
+            let Ok(faces) = analyzer.analyze_path(&path) else {
+                continue;
+            };
+            let Some(main) = faces.iter().max_by(|a, b| {
+                (a.detection.bbox.width * a.detection.bbox.height)
+                    .total_cmp(&(b.detection.bbox.width * b.detection.bbox.height))
+            }) else {
+                continue;
+            };
+            by_identity
+                .entry(identity.to_string())
+                .or_default()
+                .push(main.embedding.clone());
+        }
+
+        let multi: Vec<_> = by_identity.values().filter(|v| v.len() >= 2).collect();
+        assert!(
+            multi.len() >= 2,
+            "need at least two identities with two or more photos each; got {}",
+            multi.len()
+        );
+
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+
+        let mut intra = Vec::new();
+        for vs in by_identity.values() {
+            for i in 0..vs.len() {
+                for j in i + 1..vs.len() {
+                    intra.push(cos(&vs[i], &vs[j]));
+                }
+            }
+        }
+        let ids: Vec<_> = by_identity.values().collect();
+        let mut inter = Vec::new();
+        for i in 0..ids.len() {
+            for j in i + 1..ids.len() {
+                for a in ids[i] {
+                    for b in ids[j] {
+                        inter.push(cos(a, b));
+                    }
+                }
+            }
+        }
+
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (intra_mean, inter_mean) = (mean(&intra), mean(&inter));
+        println!(
+            "intra n={} mean={intra_mean:.3}; inter n={} mean={inter_mean:.3}",
+            intra.len(),
+            inter.len()
+        );
+
+        // Healthy ArcFace-family separation is ~0.6 vs ~0.1. The mirrored-
+        // alignment bug produced 0.39 vs 0.32, so a 0.25 margin cleanly splits
+        // working from broken without being brittle to the exact image subset.
+        assert!(
+            intra_mean > 0.5,
+            "same-person similarity too low ({intra_mean:.3}) — alignment or \
+             preprocessing is likely degrading the crops"
+        );
+        assert!(
+            intra_mean - inter_mean > 0.25,
+            "same-person ({intra_mean:.3}) barely beats different-person \
+             ({inter_mean:.3}) — embeddings are not discriminating identities"
+        );
+    }
+
     /// End-to-end check against a real photograph.
     ///
     /// This is the test that validates the two assumptions unit tests cannot:

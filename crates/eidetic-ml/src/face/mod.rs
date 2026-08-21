@@ -33,12 +33,18 @@ impl BoundingBox {
 /// The detector's five keypoints, stored by anatomical meaning rather than by
 /// wire order.
 ///
-/// This matters: YuNet emits **right** eye first, while the ArcFace alignment
-/// template expects **left** eye first. Naming the fields means the swap
-/// happens exactly once, at [`Landmarks::from_yunet_order`], instead of being
-/// an index convention every call site has to remember. Getting it wrong
-/// mirrors every aligned crop, which silently degrades embeddings without
-/// raising any error.
+/// Naming traps, learned the hard way: YuNet's wire order leads with the
+/// **subject's** right eye, while the ArcFace template's first point
+/// `(38.29, 51.69)` is the **image-left** eye — which is the *same* eye,
+/// because a frontal subject's right eye appears on the viewer's left. The
+/// InsightFace convention names template points in image space, so its
+/// "left eye first" and YuNet's "right eye first" agree, and the two orders
+/// compose to the identity. An earlier version swapped eyes and mouths here;
+/// a similarity transform cannot represent that mirrored correspondence, so
+/// every crop came out scale-collapsed (~0.24x instead of ~0.85x on a real
+/// portrait) and same-person cosine similarity dropped from ~0.6 to ~0.39 —
+/// no error raised anywhere. Verified against LFW: see the
+/// `lfw_same_person_similarity_beats_different_person` test.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Landmarks {
     pub left_eye: (f32, f32),
@@ -66,13 +72,17 @@ impl Landmarks {
     }
 
     /// In the order the ArcFace/SFace alignment template expects.
+    ///
+    /// The template is named in **image space**: its first point sits at
+    /// image-left, which for a frontal face is the subject's *right* eye.
+    /// Anatomically-named fields therefore emit right-before-left here.
     pub fn as_template_order(&self) -> [(f32, f32); 5] {
         [
-            self.left_eye,
             self.right_eye,
+            self.left_eye,
             self.nose,
-            self.left_mouth,
             self.right_mouth,
+            self.left_mouth,
         ]
     }
 }
@@ -82,26 +92,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn yunet_order_is_swapped_into_template_order() {
+    fn yunet_wire_order_passes_through_to_template_order() {
         let raw = [
-            (1.0, 1.0), // right eye on the wire
-            (2.0, 2.0), // left eye on the wire
+            (1.0, 1.0), // subject's right eye on the wire — image-left
+            (2.0, 2.0), // subject's left eye on the wire — image-right
             (3.0, 3.0), // nose
-            (4.0, 4.0), // right mouth on the wire
-            (5.0, 5.0), // left mouth on the wire
+            (4.0, 4.0), // subject's right mouth corner — image-left
+            (5.0, 5.0), // subject's left mouth corner — image-right
         ];
         let lm = Landmarks::from_yunet_order(raw);
 
         assert_eq!(lm.right_eye, (1.0, 1.0));
         assert_eq!(lm.left_eye, (2.0, 2.0));
 
-        // Template order must lead with the LEFT eye, i.e. the second wire point.
+        // Both the wire and the template lead with the image-left point (the
+        // subject's RIGHT eye), so composing the two mappings is the identity.
+        // Swapping here mirrors the correspondence, which a similarity
+        // transform cannot fit — crops come out scale-collapsed.
         let t = lm.as_template_order();
-        assert_eq!(t[0], (2.0, 2.0), "template must start with left eye");
-        assert_eq!(t[1], (1.0, 1.0));
+        assert_eq!(t[0], (1.0, 1.0), "template leads with the image-left eye");
+        assert_eq!(t[1], (2.0, 2.0));
         assert_eq!(t[2], (3.0, 3.0));
-        assert_eq!(t[3], (5.0, 5.0), "left mouth before right");
-        assert_eq!(t[4], (4.0, 4.0));
+        assert_eq!(t[3], (4.0, 4.0), "image-left mouth corner before right");
+        assert_eq!(t[4], (5.0, 5.0));
     }
 
     #[test]

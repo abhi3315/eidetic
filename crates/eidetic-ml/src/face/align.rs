@@ -21,8 +21,12 @@ use image::{DynamicImage, Rgb, RgbImage};
 /// Side length the recognition models expect.
 pub const ALIGNED_SIZE: u32 = 112;
 
-/// Canonical ArcFace 5-point destination template, in 112x112 space, in
-/// `[left_eye, right_eye, nose, left_mouth, right_mouth]` order.
+/// Canonical ArcFace 5-point destination template, in 112x112 space.
+///
+/// Point order is named in **image space**: `[image-left eye, image-right
+/// eye, nose, image-left mouth corner, image-right mouth corner]`. For a
+/// frontal face the image-left eye is the subject's anatomical *right* eye —
+/// see [`super::Landmarks::as_template_order`].
 ///
 /// These constants are the de-facto standard shared by the whole ArcFace
 /// lineage; SFace uses the same convention.
@@ -195,14 +199,15 @@ pub(super) fn to_input_tensor(aligned: &RgbImage) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// Landmarks that already sit exactly on the template.
+    /// Landmarks that already sit exactly on the template. TEMPLATE[0] is the
+    /// image-left point, i.e. the subject's anatomical RIGHT eye.
     fn template_landmarks() -> Landmarks {
         Landmarks {
-            left_eye: TEMPLATE[0],
-            right_eye: TEMPLATE[1],
+            right_eye: TEMPLATE[0],
+            left_eye: TEMPLATE[1],
             nose: TEMPLATE[2],
-            left_mouth: TEMPLATE[3],
-            right_mouth: TEMPLATE[4],
+            right_mouth: TEMPLATE[3],
+            left_mouth: TEMPLATE[4],
         }
     }
 
@@ -315,11 +320,11 @@ mod tests {
         }
         // Landmarks = template shifted into that square (scale 1, offset +120).
         let lm = Landmarks {
-            left_eye: (TEMPLATE[0].0 + 120.0, TEMPLATE[0].1 + 120.0),
-            right_eye: (TEMPLATE[1].0 + 120.0, TEMPLATE[1].1 + 120.0),
+            right_eye: (TEMPLATE[0].0 + 120.0, TEMPLATE[0].1 + 120.0),
+            left_eye: (TEMPLATE[1].0 + 120.0, TEMPLATE[1].1 + 120.0),
             nose: (TEMPLATE[2].0 + 120.0, TEMPLATE[2].1 + 120.0),
-            left_mouth: (TEMPLATE[3].0 + 120.0, TEMPLATE[3].1 + 120.0),
-            right_mouth: (TEMPLATE[4].0 + 120.0, TEMPLATE[4].1 + 120.0),
+            right_mouth: (TEMPLATE[3].0 + 120.0, TEMPLATE[3].1 + 120.0),
+            left_mouth: (TEMPLATE[4].0 + 120.0, TEMPLATE[4].1 + 120.0),
         };
 
         let out = align_face(&DynamicImage::ImageRgb8(img), &lm).expect("aligns");
