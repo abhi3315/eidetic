@@ -315,13 +315,16 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to fetch unembedded videos")?;
 
-            // Videos need ffmpeg for frame extraction (ADR-0011); without it
-            // they are skipped loudly, not failed.
-            let ffmpeg_ok = eidetic_ingest::video::ffmpeg().is_some();
+            // Videos need ffmpeg for frame extraction AND ffprobe for
+            // durations (ADR-0011) — sampling without a duration would store
+            // a lone t=0 frame and never revisit. Without either binary they
+            // are skipped loudly, not failed.
+            let ffmpeg_ok = eidetic_ingest::video::ffmpeg().is_some()
+                && eidetic_ingest::video::ffprobe().is_some();
             if !videos_unembedded.is_empty() && !ffmpeg_ok {
                 eprintln!(
-                    "Skipping {} video(s): ffmpeg not found. Install ffmpeg (or set \
-                     EIDETIC_FFMPEG_PATH) and re-run `eidetic embed`.",
+                    "Skipping {} video(s): ffmpeg/ffprobe not found. Install ffmpeg (or set \
+                     EIDETIC_FFMPEG_PATH / EIDETIC_FFPROBE_PATH) and re-run `eidetic embed`.",
                     videos_unembedded.len()
                 );
             }
@@ -365,8 +368,13 @@ async fn main() -> anyhow::Result<()> {
                             let _ = reply.send(embedder.embed(&path));
                         }
                         EmbedJob::Video(path, timestamps, reply) => {
+                            // Frames that embedded stay embedded: a container
+                            // whose tail is unreadable (truncated file, audio
+                            // outlasting video) still contributes its good
+                            // frames. Only a video with NO usable frame is
+                            // reported as an error, and retried next run.
                             let mut frames = Vec::with_capacity(timestamps.len());
-                            let mut err = None;
+                            let mut first_err = None;
                             for ts in timestamps {
                                 let result = eidetic_ingest::video::extract_frame(&path, ts)
                                     .map_err(|e| e.to_string())
@@ -378,15 +386,12 @@ async fn main() -> anyhow::Result<()> {
                                     });
                                 match result {
                                     Ok(v) => frames.push((ts, v)),
-                                    Err(e) => {
-                                        err = Some(e);
-                                        break;
-                                    }
+                                    Err(e) => first_err = first_err.or(Some(e)),
                                 }
                             }
-                            let _ = reply.send(match err {
-                                None => Ok(frames),
-                                Some(e) => Err(e),
+                            let _ = reply.send(match (frames.is_empty(), first_err) {
+                                (true, Some(e)) => Err(e),
+                                (_, _) => Ok(frames),
                             });
                         }
                     }
@@ -438,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let image_count = embedded;
+            let images_attempted = total - videos_unembedded.len();
             for (i, (id, path, duration)) in videos_unembedded.into_iter().enumerate() {
                 // A video imported without ffprobe has no stored duration;
                 // re-probe now and backfill the metadata while we are here.
@@ -492,7 +497,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(()) => {
                             println!(
                                 "[{}/{}] {} ({} frame(s))",
-                                image_count as usize + i + 1,
+                                images_attempted + i + 1,
                                 total,
                                 path.display(),
                                 frames.len()
@@ -579,7 +584,31 @@ async fn main() -> anyhow::Result<()> {
                 let hash_clone = asset.hash.clone();
                 let id = asset.id;
                 let is_video = asset.mime_type.starts_with("video/");
-                let duration = asset.duration_secs;
+
+                // A video imported while ffprobe was absent has no stored
+                // duration; re-probe and backfill so the representative frame
+                // lands at 10% instead of an opening black frame.
+                let mut duration = asset.duration_secs;
+                if is_video && duration.is_none() {
+                    let probe_path = storage_path.clone();
+                    if let Ok(Some(p)) = tokio::task::spawn_blocking(move || {
+                        eidetic_ingest::video::probe(&probe_path)
+                    })
+                    .await
+                    .context("probe thread panicked")?
+                    {
+                        repo.update_video_probe(
+                            id,
+                            p.duration_secs,
+                            p.video_codec.as_deref(),
+                            p.width,
+                            p.height,
+                        )
+                        .await
+                        .context("failed to store probe metadata")?;
+                        duration = p.duration_secs;
+                    }
+                }
 
                 let result = tokio::task::spawn_blocking(move || {
                     if is_video {
@@ -865,7 +894,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("search failed")?;
 
-            let plan = reel::plan(&results, duration);
+            let plan = reel::plan(&results, duration, &config.paths.library_dir);
             if plan.segments.is_empty() {
                 anyhow::bail!(
                     "nothing in the library matches {prompt:?} confidently enough for a reel"

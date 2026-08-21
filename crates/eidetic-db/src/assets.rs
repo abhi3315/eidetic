@@ -492,22 +492,31 @@ impl AssetsRepo {
             vectors.push(decoded);
         }
 
-        // A video contributes up to 5 frame rows, so over-fetch and collapse
-        // to the best row per asset. limit*5 + limit guarantees `limit`
-        // distinct assets whenever that many exist.
-        let over_fetch = (limit as usize) * 6;
-        let ranked_rows = self.index.top_k(query_vec, &vectors, over_fetch);
+        // A video contributes several frame rows, so over-fetch and collapse
+        // to the best row per asset. The start guess assumes few frames per
+        // asset; if heavy per-asset duplication starves the result, escalate
+        // by doubling rather than hard-coding the sampler's frame cap here.
+        let mut over_fetch = (limit as usize).saturating_mul(6);
+        let mut ranked: Vec<(AssetId, f32, Option<f64>)>;
+        loop {
+            let ranked_rows = self.index.top_k(query_vec, &vectors, over_fetch);
+            let exhausted = ranked_rows.len() < over_fetch;
 
-        let mut seen = std::collections::HashSet::new();
-        let mut ranked: Vec<(AssetId, f32, Option<f64>)> = Vec::new();
-        for (row_idx, score) in ranked_rows {
-            let (asset_id, ts) = keys[row_idx];
-            if seen.insert(asset_id) {
-                ranked.push((asset_id, score, ts));
-                if ranked.len() == limit as usize {
-                    break;
+            let mut seen = std::collections::HashSet::new();
+            ranked = Vec::new();
+            for (row_idx, score) in ranked_rows {
+                let (asset_id, ts) = keys[row_idx];
+                if seen.insert(asset_id) {
+                    ranked.push((asset_id, score, ts));
+                    if ranked.len() == limit as usize {
+                        break;
+                    }
                 }
             }
+            if ranked.len() == limit as usize || exhausted {
+                break;
+            }
+            over_fetch = over_fetch.saturating_mul(2);
         }
         if ranked.is_empty() {
             return Ok(Vec::new());

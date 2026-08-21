@@ -60,7 +60,9 @@ impl Segment {
 /// Results are consumed in score order. Weak tails are dropped: anything
 /// scoring below zero, or below [`RELATIVE_SCORE_FLOOR`] of the top hit,
 /// never enters the reel even if there is room.
-pub fn plan(results: &[SearchResult], target_secs: f64) -> ReelPlan {
+///
+/// `library_dir` locates photo thumbnails — see [`photo_source`].
+pub fn plan(results: &[SearchResult], target_secs: f64, library_dir: &Path) -> ReelPlan {
     let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
     let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
 
@@ -77,7 +79,7 @@ pub fn plan(results: &[SearchResult], target_secs: f64) -> ReelPlan {
                 let len = VIDEO_CLIP_SECS.min(duration - start).max(1.0);
                 Segment::VideoClip(r.storage_path.clone(), start, len)
             }
-            None => Segment::Photo(r.storage_path.clone()),
+            None => Segment::Photo(photo_source(r, library_dir)),
         };
         if total + seg.secs() > target_secs && !segments.is_empty() {
             break;
@@ -153,6 +155,29 @@ pub fn render(plan: &ReelPlan, output: &Path, width: u32, height: u32) -> Result
     Ok(())
 }
 
+/// The file ffmpeg should read for a photo segment.
+///
+/// The original can be HEIC or DNG (which ffmpeg does not decode) and its
+/// EXIF orientation would be ignored even for JPEG. The medium thumbnail is
+/// an upright 1024px JPEG, so prefer it whenever it exists; fall back to the
+/// original for the rare un-thumbnailed photo.
+fn photo_source(r: &SearchResult, library_dir: &Path) -> PathBuf {
+    if r.thumbnails_generated
+        && let Some(hash) = r
+            .storage_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(eidetic_core::Sha256::from_hex)
+    {
+        return eidetic_ingest::thumbnail::thumbnail_path(
+            library_dir,
+            &hash,
+            eidetic_ingest::thumbnail::ThumbSize::Medium,
+        );
+    }
+    r.storage_path.clone()
+}
+
 /// Fit any input inside the frame, pad to exact size, normalise fps/pixfmt so
 /// concat's `-c copy` join is legal across segments.
 fn normalize_filter(w: u32, h: u32) -> String {
@@ -179,6 +204,10 @@ mod tests {
     use super::*;
     use eidetic_core::AssetId;
 
+    fn lib() -> PathBuf {
+        PathBuf::from("/lib")
+    }
+
     fn hit(score: f32, frame_ts: Option<f64>, duration: Option<f64>) -> SearchResult {
         SearchResult {
             id: AssetId::new(),
@@ -201,7 +230,7 @@ mod tests {
     fn plan_respects_target_duration() {
         // Ten strong photo hits at 3s each against a 10s target: 3 fit.
         let results: Vec<_> = (0..10).map(|_| hit(0.5, None, None)).collect();
-        let p = plan(&results, 10.0);
+        let p = plan(&results, 10.0, &lib());
         assert_eq!(p.segments.len(), 3);
         assert!((p.total_secs - 9.0).abs() < 1e-9);
     }
@@ -209,21 +238,21 @@ mod tests {
     #[test]
     fn plan_drops_weak_tail_even_with_room() {
         let results = vec![hit(0.5, None, None), hit(0.1, None, None)];
-        let p = plan(&results, 60.0);
+        let p = plan(&results, 60.0, &lib());
         assert_eq!(p.segments.len(), 1, "0.1 < 35% of 0.5 is padding");
     }
 
     #[test]
     fn plan_drops_non_positive_scores() {
         let results = vec![hit(0.0, None, None), hit(-0.2, None, None)];
-        assert!(plan(&results, 30.0).segments.is_empty());
+        assert!(plan(&results, 30.0, &lib()).segments.is_empty());
     }
 
     #[test]
     fn video_clip_leads_into_the_moment_and_respects_bounds() {
         // Moment at 9s of a 10s video: start = 7.5, len clamped to 2.5.
         let results = vec![hit(0.5, Some(9.0), Some(10.0))];
-        let p = plan(&results, 30.0);
+        let p = plan(&results, 30.0, &lib());
         match &p.segments[0] {
             Segment::VideoClip(_, start, len) => {
                 assert!((start - 7.5).abs() < 1e-9);
@@ -234,7 +263,7 @@ mod tests {
 
         // Moment at 0.5s: lead-in clamps to the file start.
         let results = vec![hit(0.5, Some(0.5), Some(10.0))];
-        match &plan(&results, 30.0).segments[0] {
+        match &plan(&results, 30.0, &lib()).segments[0] {
             Segment::VideoClip(_, start, len) => {
                 assert_eq!(*start, 0.0);
                 assert!((len - 4.0).abs() < 1e-9);
@@ -244,9 +273,33 @@ mod tests {
     }
 
     #[test]
+    fn photos_render_from_the_medium_thumbnail_when_present() {
+        let hash = "ab".repeat(32);
+        let mut thumbed = hit(0.5, None, None);
+        thumbed.storage_path = PathBuf::from(format!("/lib/ab/ab/{hash}.heic"));
+        thumbed.thumbnails_generated = true;
+        let p = plan(&[thumbed], 30.0, &lib());
+        match &p.segments[0] {
+            Segment::Photo(src) => {
+                let s = src.to_str().unwrap();
+                assert!(s.contains(".thumbs/m/"), "expected thumb path, got {s}");
+                assert!(s.ends_with(".jpg"));
+            }
+            _ => panic!("expected a photo"),
+        }
+
+        // No thumbnail -> the original is used as-is.
+        let raw = hit(0.5, None, None);
+        match &plan(&[raw], 30.0, &lib()).segments[0] {
+            Segment::Photo(src) => assert_eq!(src, &PathBuf::from("/x")),
+            _ => panic!("expected a photo"),
+        }
+    }
+
+    #[test]
     fn plan_always_takes_at_least_one_strong_hit() {
         // Target shorter than the first segment still yields that segment.
         let results = vec![hit(0.5, Some(5.0), Some(60.0))];
-        assert_eq!(plan(&results, 1.0).segments.len(), 1);
+        assert_eq!(plan(&results, 1.0, &lib()).segments.len(), 1);
     }
 }

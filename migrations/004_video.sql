@@ -27,6 +27,6 @@ CREATE TABLE frame_embeddings (
     vector   BLOB    NOT NULL,
     PRIMARY KEY (asset_id, ts_secs)
 ) WITHOUT ROWID;
-
--- "which videos still need frame embeddings" is an anti-join on asset_id.
-CREATE INDEX frame_embeddings_asset_idx ON frame_embeddings(asset_id);
+-- No secondary index: WITHOUT ROWID clusters rows on the (asset_id, ts_secs)
+-- primary key, so per-asset lookups and the needs-embedding anti-join are
+-- already index-served.

@@ -356,23 +356,6 @@ fn jpeg_crop_response(bytes: Vec<u8>) -> axum::response::Response {
         .expect("static headers should build")
 }
 
-/// Rebuild [`eidetic_ml::Landmarks`] from the DB's template-order array.
-///
-/// The write site stores `Landmarks::as_template_order()`, which is
-/// `[right_eye, left_eye, nose, right_mouth, left_mouth]` — the template is
-/// named in image space, so the columns called `lm_left_eye_*` hold the
-/// image-left point, i.e. the subject's anatomical RIGHT eye. This is the
-/// exact inverse of `as_template_order`; the round-trip test below pins it.
-pub(crate) fn landmarks_from_template_order(lm: [(f32, f32); 5]) -> eidetic_ml::Landmarks {
-    eidetic_ml::Landmarks {
-        right_eye: lm[0],
-        left_eye: lm[1],
-        nose: lm[2],
-        right_mouth: lm[3],
-        left_mouth: lm[4],
-    }
-}
-
 /// Decode the original image, align the face to 112x112, JPEG-encode it.
 ///
 /// Runs on a blocking thread. When the stored landmarks are degenerate
@@ -382,7 +365,7 @@ fn render_face_crop(face: &eidetic_db::PersonFace) -> Result<Vec<u8>, ServerErro
     let img = eidetic_ml::image_io::load_oriented_image(&face.storage_path)
         .map_err(|e| ServerError::CropFailed(format!("{}: {e}", face.storage_path.display())))?;
 
-    let landmarks = landmarks_from_template_order(face.landmarks);
+    let landmarks = eidetic_ml::Landmarks::from_template_order(face.landmarks);
     let crop = eidetic_ml::face::align_face(&img, &landmarks)
         .unwrap_or_else(|| bbox_fallback_crop(&img, face.bbox));
 
@@ -465,7 +448,7 @@ pub(crate) async fn thumb(
 
 #[cfg(test)]
 mod tests {
-    use super::{bbox_fallback_crop, landmarks_from_template_order};
+    use super::bbox_fallback_crop;
     use eidetic_ml::Landmarks;
 
     #[test]
@@ -477,7 +460,7 @@ mod tests {
             right_mouth: (7.0, 8.0),
             left_mouth: (9.0, 10.0),
         };
-        let rebuilt = landmarks_from_template_order(original.as_template_order());
+        let rebuilt = Landmarks::from_template_order(original.as_template_order());
         assert_eq!(rebuilt, original);
     }
 
@@ -566,7 +549,7 @@ mod tests {
             .await
             .expect("fetch")
             .expect("exists");
-        let rebuilt = landmarks_from_template_order(stored.landmarks);
+        let rebuilt = Landmarks::from_template_order(stored.landmarks);
         assert_eq!(
             rebuilt, original,
             "Landmarks -> DB -> Landmarks must be the identity"
