@@ -804,10 +804,12 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
-            let repo = eidetic_db::AssetsRepo::new(pool);
+            let repo = eidetic_db::AssetsRepo::new(pool.clone());
+            let faces = eidetic_db::FacesRepo::new(pool);
 
             let deps = eidetic_server::ServerDeps {
                 repo,
+                faces,
                 library_dir: config.paths.library_dir.clone(),
                 models_cache: config.paths.models_cache.clone(),
             };

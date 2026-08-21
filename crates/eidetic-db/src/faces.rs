@@ -39,6 +39,91 @@ pub struct Person {
     pub id: PersonId,
     pub name: Option<String>,
     pub face_count: i64,
+    /// The person's highest-score face, used as the cover crop in the web UI.
+    /// `None` only when the person currently has no faces at all.
+    pub cover_face: Option<FaceId>,
+}
+
+/// One stored face with everything a viewer needs to crop it back out of its
+/// photo. The asset's storage path is joined in so callers don't pay one
+/// asset lookup per face.
+#[derive(Debug, Clone)]
+pub struct PersonFace {
+    pub face_id: FaceId,
+    pub asset_id: AssetId,
+    pub storage_path: std::path::PathBuf,
+    pub score: f32,
+    /// `(x, y, width, height)` in original-image pixels.
+    pub bbox: (f32, f32, f32, f32),
+    /// Landmarks exactly as stored: template order (image-left eye,
+    /// image-right eye, nose, image-left mouth corner, image-right mouth
+    /// corner) — the order `eidetic_ml::Landmarks::as_template_order`
+    /// produces at the write site.
+    pub landmarks: [(f32, f32); 5],
+    /// True when the user set the person attribution by hand.
+    pub pinned: bool,
+}
+
+/// A face in one asset together with the person it is attributed to. Faces
+/// with no person are filtered out at the query: "who is in this photo?"
+/// callers have no use for them.
+#[derive(Debug, Clone)]
+pub struct AssetFace {
+    pub face_id: FaceId,
+    pub person_id: PersonId,
+    pub person_name: Option<String>,
+}
+
+/// Shared SELECT for [`PersonFace`]. 19 columns is past sqlx's tuple
+/// implementations, hence the derived row struct below.
+const PERSON_FACE_SELECT: &str = "SELECT f.id, f.asset_id, a.storage_path, f.score, \
+     f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h, \
+     f.lm_left_eye_x, f.lm_left_eye_y, f.lm_right_eye_x, f.lm_right_eye_y, \
+     f.lm_nose_x, f.lm_nose_y, f.lm_left_mouth_x, f.lm_left_mouth_y, \
+     f.lm_right_mouth_x, f.lm_right_mouth_y, f.assignment_source \
+     FROM faces f JOIN assets a ON a.id = f.asset_id";
+
+#[derive(sqlx::FromRow)]
+struct PersonFaceRow {
+    id: String,
+    asset_id: String,
+    storage_path: String,
+    score: f32,
+    bbox_x: f32,
+    bbox_y: f32,
+    bbox_w: f32,
+    bbox_h: f32,
+    lm_left_eye_x: f32,
+    lm_left_eye_y: f32,
+    lm_right_eye_x: f32,
+    lm_right_eye_y: f32,
+    lm_nose_x: f32,
+    lm_nose_y: f32,
+    lm_left_mouth_x: f32,
+    lm_left_mouth_y: f32,
+    lm_right_mouth_x: f32,
+    lm_right_mouth_y: f32,
+    assignment_source: String,
+}
+
+impl From<PersonFaceRow> for PersonFace {
+    fn from(r: PersonFaceRow) -> Self {
+        PersonFace {
+            face_id: FaceId::from(parse_uuid(&r.id)),
+            asset_id: AssetId::from(parse_uuid(&r.asset_id)),
+            storage_path: std::path::PathBuf::from(r.storage_path),
+            score: r.score,
+            bbox: (r.bbox_x, r.bbox_y, r.bbox_w, r.bbox_h),
+            landmarks: [
+                (r.lm_left_eye_x, r.lm_left_eye_y),
+                (r.lm_right_eye_x, r.lm_right_eye_y),
+                (r.lm_nose_x, r.lm_nose_y),
+                (r.lm_left_mouth_x, r.lm_left_mouth_y),
+                (r.lm_right_mouth_x, r.lm_right_mouth_y),
+            ],
+            pinned: r.assignment_source == "user",
+        }
+    }
 }
 
 pub struct FacesRepo {
@@ -321,8 +406,10 @@ impl FacesRepo {
 
     /// People with at least one face, most faces first.
     pub async fn list_persons(&self) -> crate::Result<Vec<Person>> {
-        let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-            "SELECT p.id, p.name, COUNT(f.id) AS face_count \
+        let rows: Vec<(String, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT p.id, p.name, COUNT(f.id) AS face_count, \
+               (SELECT f2.id FROM faces f2 WHERE f2.person_id = p.id \
+                  ORDER BY f2.score DESC, f2.id LIMIT 1) AS cover_face \
              FROM persons p LEFT JOIN faces f ON f.person_id = p.id \
              WHERE p.merged_into IS NULL \
              GROUP BY p.id \
@@ -335,10 +422,79 @@ impl FacesRepo {
 
         Ok(rows
             .into_iter()
-            .map(|(id, name, face_count)| Person {
+            .map(|(id, name, face_count, cover)| Person {
                 id: PersonId::from(parse_uuid(&id)),
                 name,
                 face_count,
+                cover_face: cover.as_deref().map(|c| FaceId::from(parse_uuid(c))),
+            })
+            .collect())
+    }
+
+    /// One person by id. `None` for unknown people and for people that were
+    /// merged away — their faces live under the merge target now.
+    pub async fn fetch_person(&self, id: PersonId) -> crate::Result<Option<Person>> {
+        let row: Option<(String, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT p.id, p.name, \
+               (SELECT COUNT(*) FROM faces f WHERE f.person_id = p.id) AS face_count, \
+               (SELECT f2.id FROM faces f2 WHERE f2.person_id = p.id \
+                  ORDER BY f2.score DESC, f2.id LIMIT 1) AS cover_face \
+             FROM persons p WHERE p.id = ? AND p.merged_into IS NULL",
+        )
+        .bind(id_text(id))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(row.map(|(id, name, face_count, cover)| Person {
+            id: PersonId::from(parse_uuid(&id)),
+            name,
+            face_count,
+            cover_face: cover.as_deref().map(|c| FaceId::from(parse_uuid(c))),
+        }))
+    }
+
+    /// Every face attributed to `person`, best (highest score) first.
+    pub async fn fetch_faces_for_person(&self, person: PersonId) -> crate::Result<Vec<PersonFace>> {
+        let sql = format!("{PERSON_FACE_SELECT} WHERE f.person_id = ? ORDER BY f.score DESC, f.id");
+        let rows: Vec<PersonFaceRow> = sqlx::query_as(&sql)
+            .bind(id_text(person))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// One face by id, with the crop-relevant geometry and its asset's path.
+    pub async fn fetch_face(&self, face: FaceId) -> crate::Result<Option<PersonFace>> {
+        let sql = format!("{PERSON_FACE_SELECT} WHERE f.id = ?");
+        let row: Option<PersonFaceRow> = sqlx::query_as(&sql)
+            .bind(id_text(face))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(row.map(Into::into))
+    }
+
+    /// Faces in `asset` that are attributed to a person, best first — the
+    /// "people in this photo" query.
+    pub async fn fetch_faces_for_asset(&self, asset: AssetId) -> crate::Result<Vec<AssetFace>> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT f.id, f.person_id, p.name FROM faces f \
+             JOIN persons p ON p.id = f.person_id \
+             WHERE f.asset_id = ? ORDER BY f.score DESC, f.id",
+        )
+        .bind(id_text(asset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(face, person, name)| AssetFace {
+                face_id: FaceId::from(parse_uuid(&face)),
+                person_id: PersonId::from(parse_uuid(&person)),
+                person_name: name,
             })
             .collect())
     }

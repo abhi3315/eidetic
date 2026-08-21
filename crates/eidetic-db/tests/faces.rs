@@ -400,3 +400,205 @@ async fn faces_are_removed_with_their_asset() {
         "ON DELETE CASCADE should have removed the face"
     );
 }
+
+/// Like `face()`, but with a chosen detector score, for cover-face ordering.
+fn scored_face(asset_id: eidetic_core::AssetId, score: f32) -> NewFace {
+    NewFace {
+        score,
+        ..face(asset_id, vec![1.0, 0.0])
+    }
+}
+
+#[tokio::test]
+async fn list_persons_picks_highest_score_face_as_cover() {
+    let (_tmp, assets, faces) = setup().await;
+    let asset = insert_asset(&assets, 14).await;
+    let ids = faces
+        .record_detection(asset, &[scored_face(asset, 0.60), scored_face(asset, 0.99)])
+        .await
+        .expect("record");
+
+    let person = faces.create_person().await.expect("person");
+    faces.assign_face(ids[0], person, false).await.expect("a");
+    faces.assign_face(ids[1], person, false).await.expect("b");
+
+    let people = faces.list_persons().await.expect("list");
+    assert_eq!(people.len(), 1);
+    assert_eq!(
+        people[0].cover_face,
+        Some(ids[1]),
+        "cover must be the highest-score face"
+    );
+}
+
+#[tokio::test]
+async fn fetch_person_returns_person_with_cover_and_count() {
+    let (_tmp, assets, faces) = setup().await;
+    let asset = insert_asset(&assets, 15).await;
+    let ids = faces
+        .record_detection(asset, &[scored_face(asset, 0.70), scored_face(asset, 0.90)])
+        .await
+        .expect("record");
+
+    let person = faces.create_person().await.expect("person");
+    faces.assign_face(ids[0], person, false).await.expect("a");
+    faces.assign_face(ids[1], person, false).await.expect("b");
+    faces.name_person(person, "Asha").await.expect("name");
+
+    let found = faces
+        .fetch_person(person)
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(found.id, person);
+    assert_eq!(found.name.as_deref(), Some("Asha"));
+    assert_eq!(found.face_count, 2);
+    assert_eq!(found.cover_face, Some(ids[1]));
+}
+
+#[tokio::test]
+async fn fetch_person_unknown_and_merged_return_none() {
+    let (_tmp, assets, faces) = setup().await;
+    let asset = insert_asset(&assets, 16).await;
+    let ids = faces
+        .record_detection(asset, &[scored_face(asset, 0.9)])
+        .await
+        .expect("record");
+
+    assert!(
+        faces
+            .fetch_person(eidetic_core::PersonId::new())
+            .await
+            .expect("fetch")
+            .is_none(),
+        "unknown person must be None"
+    );
+
+    let keep = faces.create_person().await.expect("person");
+    let gone = faces.create_person().await.expect("person");
+    faces.assign_face(ids[0], gone, false).await.expect("a");
+    faces.merge_persons(gone, keep).await.expect("merge");
+
+    assert!(
+        faces.fetch_person(gone).await.expect("fetch").is_none(),
+        "merged-away person must be None"
+    );
+}
+
+#[tokio::test]
+async fn fetch_faces_for_person_joins_paths_and_orders_by_score() {
+    let (_tmp, assets, faces) = setup().await;
+    let a = insert_asset(&assets, 17).await;
+    let b = insert_asset(&assets, 18).await;
+
+    let low = faces
+        .record_detection(a, &[scored_face(a, 0.60)])
+        .await
+        .expect("record a")[0];
+    let high = faces
+        .record_detection(b, &[scored_face(b, 0.95)])
+        .await
+        .expect("record b")[0];
+
+    let person = faces.create_person().await.expect("person");
+    faces.assign_face(low, person, false).await.expect("a");
+    faces.assign_face(high, person, true).await.expect("b");
+
+    let list = faces
+        .fetch_faces_for_person(person)
+        .await
+        .expect("fetch faces");
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].face_id, high, "highest score first");
+    assert_eq!(list[0].asset_id, b);
+    assert_eq!(list[0].storage_path, PathBuf::from("/lib/img18.jpg"));
+    assert!(list[0].pinned, "user-assigned face is pinned");
+    assert_eq!(list[1].face_id, low);
+    assert!(!list[1].pinned);
+
+    let other = faces.create_person().await.expect("person");
+    assert!(
+        faces
+            .fetch_faces_for_person(other)
+            .await
+            .expect("empty")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn fetch_face_round_trips_geometry() {
+    let (_tmp, assets, faces) = setup().await;
+    let asset = insert_asset(&assets, 19).await;
+
+    let new_face = NewFace {
+        asset_id: asset,
+        bbox: (11.5, 22.25, 133.0, 144.75),
+        landmarks: [
+            (31.0, 51.5),
+            (71.25, 50.0),
+            (52.0, 72.5),
+            (36.75, 91.0),
+            (66.0, 90.25),
+        ],
+        score: 0.87,
+        embedding: vec![1.0, 0.0],
+    };
+    let id = faces
+        .record_detection(asset, std::slice::from_ref(&new_face))
+        .await
+        .expect("record")[0];
+
+    let stored = faces.fetch_face(id).await.expect("fetch").expect("exists");
+    assert_eq!(stored.face_id, id);
+    assert_eq!(stored.asset_id, asset);
+    assert_eq!(stored.bbox, new_face.bbox, "bbox must round-trip exactly");
+    assert_eq!(
+        stored.landmarks, new_face.landmarks,
+        "landmarks must round-trip in template order"
+    );
+    assert_eq!(stored.score, new_face.score);
+    assert_eq!(stored.storage_path, PathBuf::from("/lib/img19.jpg"));
+
+    assert!(
+        faces
+            .fetch_face(eidetic_core::FaceId::new())
+            .await
+            .expect("fetch")
+            .is_none(),
+        "unknown face must be None"
+    );
+}
+
+#[tokio::test]
+async fn fetch_faces_for_asset_lists_only_attributed_faces() {
+    let (_tmp, assets, faces) = setup().await;
+    let asset = insert_asset(&assets, 20).await;
+    let ids = faces
+        .record_detection(
+            asset,
+            &[
+                scored_face(asset, 0.90),
+                scored_face(asset, 0.80),
+                scored_face(asset, 0.70),
+            ],
+        )
+        .await
+        .expect("record");
+
+    let named = faces.create_person().await.expect("person");
+    let unnamed = faces.create_person().await.expect("person");
+    faces.name_person(named, "Asha").await.expect("name");
+    faces.assign_face(ids[1], unnamed, false).await.expect("a");
+    faces.assign_face(ids[0], named, false).await.expect("b");
+    // ids[2] stays unattributed and must not appear.
+
+    let people = faces.fetch_faces_for_asset(asset).await.expect("fetch");
+    assert_eq!(people.len(), 2, "unattributed face is excluded");
+    assert_eq!(people[0].face_id, ids[0], "highest score first");
+    assert_eq!(people[0].person_id, named);
+    assert_eq!(people[0].person_name.as_deref(), Some("Asha"));
+    assert_eq!(people[1].face_id, ids[1]);
+    assert_eq!(people[1].person_id, unnamed);
+    assert!(people[1].person_name.is_none());
+}

@@ -21,7 +21,7 @@ pub mod cluster;
 pub use cluster::{ClusterParams, Constraints, Face, PersonExemplars, ProposedPerson};
 
 pub mod faces;
-pub use faces::{FaceEmbedding, FacesRepo, NewFace, Person};
+pub use faces::{AssetFace, FaceEmbedding, FacesRepo, NewFace, Person, PersonFace};
 
 pub mod vector;
 pub use vector::{BruteForce, VectorIndex};

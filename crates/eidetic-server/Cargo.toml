@@ -21,7 +21,9 @@ eidetic-ml = { path = "../eidetic-ml", default-features = false }
 anyhow = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
+image = { workspace = true }
 maud = { workspace = true }
+mime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
