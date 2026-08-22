@@ -21,6 +21,7 @@ heic = ["eidetic-ingest/heic", "eidetic-ml/heic", "eidetic-server/heic"]
 cuda = ["eidetic-ml/cuda", "eidetic-server/cuda"]
 # Speech transcription + spoken-word search (whisper.cpp via cmake).
 speech = ["eidetic-ml/speech"]
+speech-cuda = ["eidetic-ml/speech-cuda"]
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }

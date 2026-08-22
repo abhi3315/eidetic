@@ -148,6 +148,7 @@ cargo test --workspace
 | `heic` | **on** | HEIC/HEIF decoding via libheif. Needs the libheif C library installed at build time (`libheif-dev` / `libheif-devel`). |
 | `cuda` | off | NVIDIA GPU inference via the ONNX Runtime CUDA execution provider. Requires an ONNX Runtime ≥ 1.27 CUDA build supplied at runtime through `ORT_DYLIB_PATH`, plus CUDA 13 + cuDNN 9 on the host. See [ADR-0006](docs/adr/0006-gpu-execution-provider.md). |
 | `speech` | off | Speech-to-text over video audio via whisper.cpp (`eidetic transcribe` + spoken-word search). Off by default because whisper-rs compiles C through cmake — the default build keeps its no-native-build-deps guarantee. Model (~466 MB, `EIDETIC_SPEECH_MODEL`: `base`, `small` default, `large-v3-turbo`) downloads on first run. |
+| `speech-cuda` | off | `speech` with whisper.cpp's CUDA kernels — GPU transcription. Needs nvcc at build time with a host compiler your CUDA toolkit supports: nvcc 12.9 cannot parse gcc 16 headers (Fedora 44+), so install a compat gcc (`sudo dnf install gcc14-c++`) and build with `CUDAHOSTCXX=$(which g++-14)`, or use a CUDA 13 toolkit. |
 
 ```bash
 # Default: HEIC support, CPU inference. Needs libheif installed.

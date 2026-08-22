@@ -22,6 +22,9 @@ cuda = ["ort/cuda", "ort/load-dynamic"]
 # compiles C with cmake, which would break the no-native-deps guarantee of
 # default builds (ADR-0009).
 speech = ["dep:whisper-rs"]
+# GPU speech decode: whisper.cpp compiled with CUDA kernels. Needs the CUDA
+# toolkit (nvcc) at build time on top of the speech feature's cmake.
+speech-cuda = ["speech", "whisper-rs/cuda"]
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
