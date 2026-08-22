@@ -49,3 +49,27 @@ Default the image embedding model to **SigLIP 2 so400m/384**, producing **1152-d
 - SigLIP 2: https://huggingface.co/blog/siglip2
 - so400m ONNX export: https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX
 - Immich model list: https://huggingface.co/immich-app/ViT-SO400M-16-SigLIP2-384__webli
+
+## Amendment: the eval ran — `base` stays the default (2026-08-22)
+
+The measurement this ADR required before flipping any default now exists.
+`eidetic eval` on the first 1000 images of the COCO Karpathy test split
+(5001 captions, text→image retrieval, both models on the CUDA EP):
+
+| metric | base 256px/768d | so400m 384px/1152d | gain |
+|---|---|---|---|
+| Recall@1  | 68.61% | 70.53% | +1.9 pts |
+| Recall@5  | 89.80% | 91.10% | +1.3 pts |
+| Recall@10 | 94.54% | 95.20% | +0.7 pts |
+| MRR       | 0.7802 | 0.7953 | +0.015 |
+
+(Absolute numbers run higher than the paper's full-5K figures because a 1K
+gallery has 5× fewer distractors; the *relative* comparison is the decision
+input, and both models saw the identical subset.)
+
+**Decision: `base` remains the default.** A ~2-point Recall@1 gain does not
+pay for a 4.2 GB model download (vs 1.4 GB), ~3.5× the per-image compute, a
+1.5× wider vector (storage + scan cost on every search), and a mandatory
+full-library re-embed on switch. so400m stays exactly what it is today: the
+`EIDETIC_MODEL=so400m` opt-in for someone who wants the last two points and
+accepts the cost.
