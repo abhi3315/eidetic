@@ -9,6 +9,8 @@ A self-hosted media intelligence system. Local Google Photos-style management fo
 - Face grouping — done (v0.3)
 - Prompt-driven reel generation — done (v0.4)
 
+Everything above shipped in v0.4.0. The next phase is scoped in [goals-v0.5.md](goals-v0.5.md): video intelligence (playback transcoding, faces in videos, scene-aware sampling/reels, speech search).
+
 ## Who it's for
 
 One person: me. My personal photo library, on my own hardware.
