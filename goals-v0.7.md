@@ -18,6 +18,14 @@ The one-line research summary: **hand-roll the beat tracker (the algorithm is sm
 - **Audio**: the track is laid under the cut, trimmed to the reel length with a fade-out. Reel length defaults to `min(--duration, audio length)`. No bundled/generated music ever — the user supplies the file (and adding trending audio inside Instagram is better for reach anyway, so silent remains the default without `--audio`).
 - **Transitions**: hard cuts on beats (the native grammar of reels); a short crossfade only across energy-section boundaries. Nothing fancier — transition zoos read as template spam.
 
+## Phase 1b — framing styles and voiceover mode (user feedback, 2026-08-22)
+
+Field feedback after phase 1: face-centred cover-crop is wrong for scenic footage — a Ladakh panorama must stay cinematic, not zoom into a face — and the driving audio isn't always music: it can be a vlog narration or a voiceover, in which case *what is said* should pick the clips.
+
+- **Per-clip auto framing** (`--frame auto`, the default): clips with detected faces get the face-following cover-crop; clips without faces render **fit-inside over a blurred, darkened cover background** — the standard cinematic treatment for landscape footage in a vertical frame, no black bars, no butchered panoramas. `--frame cover|blur|pad` forces one style.
+- **Voiceover mode** (needs a `speech` build): when `--audio` has no stable tempo but Whisper finds speech, the reel becomes narration-driven — each spoken span (merged to ≥2.5 s, split at ~8 s) is embedded as a search query, the best-matching un-recently-used shot fills exactly that span, and the narration itself is the soundtrack. "Here we reached Pangong" puts the Pangong clip on screen while you say it.
+- Mode selection is automatic from the audio: beats → music-synced; speech → voiceover; neither → fixed windows.
+
 ## Phase 2 — reel projects and AI follow-ups
 
 - Every render persists a **project file** (JSON: ordered clips with asset ids + in/out, audio, beat grid, prompt) instead of being one-shot.
