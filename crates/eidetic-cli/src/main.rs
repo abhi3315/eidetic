@@ -197,7 +197,13 @@ async fn main() -> anyhow::Result<()> {
         // load) and CoreML logs its graph partitioning. Neither is actionable
         // by the user. Real ort failures are logged at error and still show.
         .unwrap_or_else(|| EnvFilter::new("info,ort=error"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Logs go to stderr: stdout is the data channel (search --json, --fields,
+    // reel cut lists) and must stay pipeable into jq/awk without EIDETIC_LOG
+    // gymnastics.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     let cli = Cli::parse();
 
