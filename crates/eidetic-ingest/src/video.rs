@@ -285,6 +285,50 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
     Ok(Some(()))
 }
 
+/// Decode a video's audio track to 16 kHz mono f32 PCM — whisper's input
+/// format. `Ok(Some(vec![]))` for a video with no (or empty) audio stream;
+/// `Ok(None)` when ffmpeg is missing.
+pub fn extract_audio_pcm(path: &Path) -> Result<Option<Vec<f32>>> {
+    let Some(ffmpeg) = ffmpeg() else {
+        return Ok(None);
+    };
+    let output = Command::new(ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-f", "f32le", "-ac", "1", "-ar", "16000", "-"])
+        .output()
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // "no audio stream" is a normal outcome, not an error: ffmpeg fails the
+    // map when -vn leaves nothing, so treat failure-with-empty-stdout as
+    // silence and only real decode errors as errors.
+    if !output.status.success() && !output.stdout.is_empty() {
+        return Err(Error::VideoProbe {
+            path: path.to_path_buf(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let pcm = output
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok(Some(pcm))
+}
+
+/// Cheap voice-activity proxy: is there enough energy to be worth running
+/// speech recognition? Filters out silent tracks so whisper never sees them
+/// (it hallucinates text on silence).
+pub fn has_audible_content(pcm: &[f32]) -> bool {
+    if pcm.len() < 16_000 {
+        return false; // under a second of audio
+    }
+    let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
+    rms > 0.01
+}
+
 /// Scene-change threshold for ffmpeg's `scene` score. 0.3 catches soft cuts
 /// (matches PySceneDetect's default sensitivity); hard cuts score far above.
 const SCENE_THRESHOLD: f64 = 0.3;
@@ -554,6 +598,15 @@ mod tests {
         std::fs::write(&bad, b"not a video").unwrap();
         assert!(probe(&bad).is_err());
         assert!(extract_frame(&bad, 0.0).is_err());
+    }
+
+    #[test]
+    fn audible_content_gate() {
+        assert!(!has_audible_content(&[]), "empty");
+        assert!(!has_audible_content(&vec![0.0f32; 32_000]), "silence");
+        assert!(!has_audible_content(&vec![0.5f32; 8_000]), "under a second");
+        let loudish: Vec<f32> = (0..32_000).map(|i| (i as f32 * 0.1).sin() * 0.3).collect();
+        assert!(has_audible_content(&loudish));
     }
 
     #[test]

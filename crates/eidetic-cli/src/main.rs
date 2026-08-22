@@ -120,6 +120,9 @@ enum Command {
     /// Generate browser-playable copies of videos whose codec or container
     /// a browser can't stream (needs ffmpeg). Originals are never modified.
     Transcode,
+    /// Transcribe speech in videos so search can find spoken words
+    /// (needs a build with --features speech, plus ffmpeg).
+    Transcribe,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -158,7 +161,7 @@ fn open_geocoder() -> Option<eidetic_core::geocoder::Geocoder> {
 }
 
 const VALID_FIELDS: &[&str] = &[
-    "path", "score", "date", "make", "model", "lat", "lon", "mime", "ts",
+    "path", "score", "date", "make", "model", "lat", "lon", "mime", "ts", "speech",
 ];
 
 fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> String {
@@ -178,6 +181,7 @@ fn format_result(r: &eidetic_db::SearchResult, fields: &[String]) -> String {
             "mime" => r.mime_type.clone().unwrap_or_default(),
             // For videos: the second offset of the best-matching moment.
             "ts" => r.frame_ts.map(|ts| format!("{ts:.1}")).unwrap_or_default(),
+            "speech" => r.speech.clone().unwrap_or_default(),
             other => unreachable!(
                 "unknown field {other:?} should have been rejected by VALID_FIELDS check"
             ),
@@ -1016,7 +1020,7 @@ async fn main() -> anyhow::Result<()> {
             // weak tail, so more candidates only ever improve the cut.
             let candidates = (duration / 2.0).ceil() as u32 + 10;
             let results = repo
-                .search_similar(query_emb.as_slice(), candidates)
+                .search(&prompt, query_emb.as_slice(), candidates)
                 .await
                 .context("search failed")?;
 
@@ -1173,6 +1177,146 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Command::Transcribe => {
+            #[cfg(not(feature = "speech"))]
+            {
+                anyhow::bail!(
+                    "this build has no speech support; rebuild with \
+                     `cargo install --path crates/eidetic-cli --features speech` \
+                     (needs cmake and a C compiler for whisper.cpp)"
+                );
+            }
+            #[cfg(feature = "speech")]
+            {
+                let config = Config::from_env();
+                let models_dir = config.paths.models_cache.clone();
+                let pool = eidetic_db::connect(&config)
+                    .await
+                    .context("failed to connect to database")?;
+                let repo = eidetic_db::AssetsRepo::new(pool);
+
+                if eidetic_ingest::video::ffmpeg().is_none() {
+                    anyhow::bail!(
+                        "ffmpeg not found. Install it (or set EIDETIC_FFMPEG_PATH) and re-run."
+                    );
+                }
+
+                let pending = repo
+                    .fetch_videos_untranscribed()
+                    .await
+                    .context("failed to fetch videos")?;
+                if pending.is_empty() {
+                    println!("Nothing to do.");
+                    return Ok(());
+                }
+
+                let total = pending.len();
+                println!(
+                    "Transcribing {total} video(s) (downloads the whisper model on first run)…"
+                );
+
+                // Worker owns the whisper model; jobs carry decoded PCM.
+                type SpeechReply =
+                    oneshot::Sender<eidetic_ml::Result<Vec<eidetic_ml::speech::SpeechSegment>>>;
+                let (job_tx, mut job_rx) = mpsc::channel::<(Vec<f32>, SpeechReply)>(1);
+                let worker = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<()> {
+                    let transcriber = eidetic_ml::speech::SpeechTranscriber::load(&models_dir)?;
+                    while let Some((pcm, reply)) = job_rx.blocking_recv() {
+                        let _ = reply.send(transcriber.transcribe(&pcm));
+                    }
+                    Ok(())
+                });
+
+                let (mut done, mut silent, mut failed) = (0u32, 0u32, 0u32);
+                for (i, (id, path)) in pending.into_iter().enumerate() {
+                    let audio_path = path.clone();
+                    let pcm = tokio::task::spawn_blocking(move || {
+                        eidetic_ingest::video::extract_audio_pcm(&audio_path)
+                    })
+                    .await
+                    .context("audio thread panicked")?;
+
+                    let pcm = match pcm {
+                        Ok(Some(pcm)) => pcm,
+                        Ok(None) => anyhow::bail!("ffmpeg disappeared mid-run"),
+                        Err(e) => {
+                            eprintln!("  [{}/{}] audio decode failed: {e}", i + 1, total);
+                            failed += 1;
+                            continue;
+                        }
+                    };
+
+                    // Silent or speechless tracks are a completed run with
+                    // zero segments — whisper hallucinates on silence, so it
+                    // never sees them.
+                    if !eidetic_ingest::video::has_audible_content(&pcm) {
+                        repo.store_transcript(id, &[])
+                            .await
+                            .context("failed to record silent run")?;
+                        println!(
+                            "[{}/{}] {} (no audible audio)",
+                            i + 1,
+                            total,
+                            path.display()
+                        );
+                        silent += 1;
+                        continue;
+                    }
+
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if job_tx.send((pcm, reply_tx)).await.is_err() {
+                        break;
+                    }
+                    let result = reply_rx
+                        .await
+                        .context("speech worker panicked or died mid-job")?;
+                    match result {
+                        Ok(segments) => {
+                            let rows: Vec<(f64, f64, String)> = segments
+                                .into_iter()
+                                .map(|s| (s.start_secs, s.end_secs, s.text))
+                                .collect();
+                            match repo.store_transcript(id, &rows).await {
+                                Ok(()) => {
+                                    println!(
+                                        "[{}/{}] {} ({} segment(s))",
+                                        i + 1,
+                                        total,
+                                        path.display(),
+                                        rows.len()
+                                    );
+                                    done += 1;
+                                }
+                                Err(e) => {
+                                    eprintln!("  failed to store {}: {e}", path.display());
+                                    failed += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  skipped {}: {e}", path.display());
+                            failed += 1;
+                        }
+                    }
+                }
+
+                drop(job_tx);
+                worker
+                    .await
+                    .context("speech worker thread panicked")?
+                    .context("failed to load the whisper model")?;
+
+                if failed > 0 {
+                    println!(
+                        "Done. Transcribed {done}, silent {silent}, failed {failed}. Re-run to retry."
+                    );
+                    std::process::exit(1);
+                } else {
+                    println!("Done. Transcribed {done}, silent {silent}.");
+                }
+            }
+        }
+
         Command::Search {
             query,
             limit,
@@ -1209,7 +1353,7 @@ async fn main() -> anyhow::Result<()> {
             let repo = eidetic_db::AssetsRepo::new(pool);
 
             let results = repo
-                .search_similar(query_emb.as_slice(), limit)
+                .search(&query, query_emb.as_slice(), limit)
                 .await
                 .context("search failed")?;
 
@@ -1232,6 +1376,7 @@ async fn main() -> anyhow::Result<()> {
                             "lon": r.longitude,
                             "mime": r.mime_type,
                             "ts": r.frame_ts,
+                            "speech": r.speech,
                         })
                     })
                     .collect();
@@ -1242,9 +1387,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 for r in &results {
-                    match r.frame_ts {
-                        Some(ts) => println!("{}\t@{ts:.1}s", r.storage_path.display()),
-                        None => println!("{}", r.storage_path.display()),
+                    match (&r.speech, r.frame_ts) {
+                        (Some(said), Some(ts)) => {
+                            println!("{}\t@{ts:.1}s\tsaid: {said:?}", r.storage_path.display())
+                        }
+                        (_, Some(ts)) => println!("{}\t@{ts:.1}s", r.storage_path.display()),
+                        _ => println!("{}", r.storage_path.display()),
                     }
                 }
             }

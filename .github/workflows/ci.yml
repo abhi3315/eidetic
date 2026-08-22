@@ -51,6 +51,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libheif-dev libheif-plugin-x265 libheif-plugin-libde265 ffmpeg
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - run: cargo test --workspace --all-targets
+      # The speech feature compiles whisper.cpp (cmake + libclang, both in
+      # the runner image); check it builds so the feature can't rot.
+      - run: cargo check -p eidetic-cli --features speech
 
   # Guards the portable build path (ADR-0008): deliberately does NOT install
   # libheif, so it fails if anything makes the C library non-optional again.

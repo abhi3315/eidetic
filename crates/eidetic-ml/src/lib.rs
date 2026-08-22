@@ -2,6 +2,8 @@ mod error;
 pub mod face;
 pub mod image_io;
 mod siglip;
+#[cfg(feature = "speech")]
+pub mod speech;
 
 pub use error::{Error, Result};
 pub use face::{AnalyzedFace, BoundingBox, Detection, FaceAnalyzer, Landmarks};

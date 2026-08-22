@@ -18,12 +18,17 @@ heic = ["dep:libheif-rs"]
 # host. The bundled ORT (download-binaries) is 1.23.x and lacks Blackwell/sm_120
 # kernels. See docs/adr/0006-gpu-execution-provider.md.
 cuda = ["ort/cuda", "ort/load-dynamic"]
+# Speech transcription via whisper.cpp. Off by default: whisper-rs-sys
+# compiles C with cmake, which would break the no-native-deps guarantee of
+# default builds (ADR-0009).
+speech = ["dep:whisper-rs"]
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ort = { workspace = true }
+whisper-rs = { workspace = true, optional = true }
 hf-hub = { workspace = true }
 image = { workspace = true }
 libheif-rs = { workspace = true, optional = true }

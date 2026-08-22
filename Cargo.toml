@@ -29,6 +29,9 @@ serde_json = "1"
 
 # ONNX Runtime (ML inference, downloads prebuilt native library at build time)
 ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"] }
+# Speech-to-text (whisper.cpp bindings). Optional: builds C via cmake, so it
+# lives behind the off-by-default `speech` feature (see goals-v0.5.md #4).
+whisper-rs = "0.16"
 
 # HuggingFace Hub (model file download)
 hf-hub = "0.5"

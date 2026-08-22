@@ -32,6 +32,7 @@ Written in Rust.
   - Your corrections are durable: naming, merges and splits are stored as constraints, so re-running clustering never discards them
 - `eidetic persons`: list grouped people with face counts
 - `eidetic name-person <id> <name>`: name a person
+- `eidetic transcribe`: transcribe speech in videos with Whisper (needs a `--features speech` build), so search finds spoken words — "ask not what your country" returns the video where it's said, at the moment it's said, ranked above visual matches. Transcripts are recall fuel, never displayed as subtitles: casual home audio transcribes too roughly to show. Silent tracks are skipped by an energy gate
 - `eidetic transcode`: generate browser-playable H.264 copies of videos whose codec or container browsers can't stream (HEVC iPhone footage, MKV). Cheap remux when only the container is wrong; originals never touched; the web player picks the copy automatically
 - `eidetic serve`: localhost web viewer — thumbnail grid (videos play inline with seeking), semantic search, per-asset detail, and a People section with face-crop grids per person (naming stays in the CLI)
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
@@ -146,6 +147,7 @@ cargo test --workspace
 |---|---|---|
 | `heic` | **on** | HEIC/HEIF decoding via libheif. Needs the libheif C library installed at build time (`libheif-dev` / `libheif-devel`). |
 | `cuda` | off | NVIDIA GPU inference via the ONNX Runtime CUDA execution provider. Requires an ONNX Runtime ≥ 1.27 CUDA build supplied at runtime through `ORT_DYLIB_PATH`, plus CUDA 13 + cuDNN 9 on the host. See [ADR-0006](docs/adr/0006-gpu-execution-provider.md). |
+| `speech` | off | Speech-to-text over video audio via whisper.cpp (`eidetic transcribe` + spoken-word search). Off by default because whisper-rs compiles C through cmake — the default build keeps its no-native-build-deps guarantee. Model (~466 MB, `EIDETIC_SPEECH_MODEL`: `base`, `small` default, `large-v3-turbo`) downloads on first run. |
 
 ```bash
 # Default: HEIC support, CPU inference. Needs libheif installed.

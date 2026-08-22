@@ -80,7 +80,7 @@ pub(crate) async fn search(
 
     let results = state
         .repo
-        .search_similar(&query_vec, limit)
+        .search(&query_text, &query_vec, limit)
         .await
         .map_err(ServerError::DbFailed)?;
 

@@ -77,6 +77,10 @@ pub struct SearchResult {
     pub frame_ts: Option<f64>,
     /// Video duration in seconds (probe metadata); None for images.
     pub duration_secs: Option<f64>,
+    /// The matching spoken snippet when this hit came from a transcript
+    /// (goals-v0.5.md #4). Recall fuel, not display text — shown as
+    /// context, never as subtitles.
+    pub speech: Option<String>,
     pub mime_type: Option<String>,
     pub file_size: i64,
     pub thumbnails_generated: bool,
@@ -554,6 +558,172 @@ impl AssetsRepo {
         ))
     }
 
+    /// Videos never transcribed (anti-join on `transcript_runs`).
+    pub async fn fetch_videos_untranscribed(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.id, a.storage_path FROM assets a \
+             LEFT JOIN transcript_runs r ON r.asset_id = a.id \
+             WHERE r.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
+             ORDER BY a.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, path)| (parse_id(&id), PathBuf::from(path)))
+            .collect())
+    }
+
+    /// Store a video's transcript segments and mark the run, replacing any
+    /// previous transcript (FTS shadow rows follow via triggers).
+    pub async fn store_transcript(
+        &self,
+        id: AssetId,
+        segments: &[(f64, f64, String)],
+    ) -> crate::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
+        sqlx::query("DELETE FROM transcripts WHERE asset_id = ?")
+            .bind(id_text(id))
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::Error::Query)?;
+        for (start, end, text) in segments {
+            sqlx::query(
+                "INSERT INTO transcripts (asset_id, ts_secs, end_secs, text) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(id_text(id))
+            .bind(start)
+            .bind(end)
+            .bind(text)
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::Error::Query)?;
+        }
+        sqlx::query(
+            "INSERT INTO transcript_runs (asset_id, segment_count) VALUES (?, ?) \
+             ON CONFLICT(asset_id) DO UPDATE SET segment_count = excluded.segment_count",
+        )
+        .bind(id_text(id))
+        .bind(segments.len() as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::Error::Query)?;
+        tx.commit().await.map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
+    /// Full-text search over spoken words. Query tokens are OR-combined and
+    /// bm25-ranked, so hits matching more of the query float up. Returns the
+    /// best segment per asset: (asset, segment start, snippet).
+    pub async fn search_transcripts(
+        &self,
+        query_text: &str,
+        limit: u32,
+    ) -> crate::Result<Vec<(AssetId, f64, String)>> {
+        // FTS5 has its own query syntax; quoting each token neutralises it.
+        let fts_query = query_text
+            .split_whitespace()
+            .map(|tok| format!("\"{}\"", tok.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(String, f64, String)> = sqlx::query_as(
+            "SELECT t.asset_id, t.ts_secs, t.text \
+             FROM transcripts_fts f \
+             JOIN transcripts t ON t.rowid = f.rowid \
+             WHERE transcripts_fts MATCH ? \
+             ORDER BY bm25(transcripts_fts) \
+             LIMIT ?",
+        )
+        .bind(&fts_query)
+        .bind((limit * 5) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (id, ts, text) in rows {
+            let asset = parse_id(&id);
+            if seen.insert(asset) {
+                out.push((asset, ts, text));
+                if out.len() == limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Semantic + spoken-word search in one ranking (goals-v0.5.md #4).
+    ///
+    /// Transcript hits carry a fixed score of 0.35 — deliberately above the
+    /// SigLIP range (~0.1–0.2): someone literally saying the words is
+    /// stronger evidence than visual similarity. An asset found both ways
+    /// keeps the transcript's timestamp and snippet.
+    pub async fn search(
+        &self,
+        query_text: &str,
+        query_vec: &[f32],
+        limit: u32,
+    ) -> crate::Result<Vec<SearchResult>> {
+        const SPEECH_SCORE: f32 = 0.35;
+
+        let semantic = self.search_similar(query_vec, limit).await?;
+        let spoken = self.search_transcripts(query_text, limit).await?;
+        if spoken.is_empty() {
+            return Ok(semantic);
+        }
+
+        let mut by_id: std::collections::HashMap<AssetId, SearchResult> =
+            semantic.into_iter().map(|r| (r.id, r)).collect();
+
+        let mut merged: Vec<SearchResult> = Vec::new();
+        for (asset, ts, text) in spoken {
+            let hit = match by_id.remove(&asset) {
+                Some(hit) => Some(hit),
+                None => self.hydrate_one(asset).await?,
+            };
+            if let Some(mut hit) = hit {
+                hit.score = SPEECH_SCORE;
+                hit.frame_ts = Some(ts);
+                hit.speech = Some(text);
+                merged.push(hit);
+            }
+        }
+        let mut rest: Vec<SearchResult> = by_id.into_values().collect();
+        rest.sort_by(|a, b| b.score.total_cmp(&a.score));
+        merged.extend(rest);
+        merged.truncate(limit as usize);
+        Ok(merged)
+    }
+
+    /// Metadata for a single asset in SearchResult shape (transcript hits
+    /// that the semantic pass didn't already surface).
+    async fn hydrate_one(&self, id: AssetId) -> crate::Result<Option<SearchResult>> {
+        Ok(self.fetch_by_id(id).await?.map(|d| SearchResult {
+            id: d.id,
+            storage_path: d.storage_path,
+            score: 0.0,
+            frame_ts: None,
+            duration_secs: d.duration_secs,
+            speech: None,
+            mime_type: d.mime_type,
+            file_size: d.file_size,
+            thumbnails_generated: d.thumbnails_generated,
+            date_taken: d.date_taken,
+            camera_make: d.camera_make,
+            camera_model: d.camera_model,
+            latitude: d.latitude,
+            longitude: d.longitude,
+        }))
+    }
+
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.
@@ -679,6 +849,7 @@ impl AssetsRepo {
                     latitude: m.latitude,
                     longitude: m.longitude,
                     duration_secs: m.duration_secs,
+                    speech: None,
                 })
             })
             .collect())

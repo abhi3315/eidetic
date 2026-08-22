@@ -19,6 +19,8 @@ heic = ["eidetic-ingest/heic", "eidetic-ml/heic", "eidetic-server/heic"]
 # NVIDIA GPU acceleration (ADR-0006). Needs an ONNX Runtime >= 1.27 CUDA
 # build at runtime via ORT_DYLIB_PATH.
 cuda = ["eidetic-ml/cuda", "eidetic-server/cuda"]
+# Speech transcription + spoken-word search (whisper.cpp via cmake).
+speech = ["eidetic-ml/speech"]
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }

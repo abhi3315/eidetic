@@ -249,6 +249,7 @@ mod tests {
             score,
             frame_ts,
             duration_secs: duration,
+            speech: None,
             mime_type: None,
             file_size: 0,
             thumbnails_generated: false,
