@@ -19,6 +19,9 @@ pub struct NewFace {
     pub landmarks: [(f32, f32); 5],
     pub score: f32,
     pub embedding: Vec<f32>,
+    /// For faces found in video frames: the sampled timestamp (seconds).
+    /// None for photos.
+    pub ts_secs: Option<f64>,
 }
 
 /// A stored face with just what clustering needs.
@@ -32,6 +35,9 @@ pub struct FaceEmbedding {
     /// True when the user set this attribution by hand. Such faces are frozen:
     /// clustering must never reassign them.
     pub pinned: bool,
+    /// Video-frame timestamp; None for photo faces. Video faces may match
+    /// existing people but never seed clusters or act as exemplars.
+    pub ts_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +68,9 @@ pub struct PersonFace {
     pub landmarks: [(f32, f32); 5],
     /// True when the user set the person attribution by hand.
     pub pinned: bool,
+    /// Video-frame timestamp when this face came from a video; None for
+    /// photos. Drives the person page's deep link into the moment.
+    pub ts_secs: Option<f64>,
 }
 
 /// A face in one asset together with the person it is attributed to. Faces
@@ -80,7 +89,7 @@ const PERSON_FACE_SELECT: &str = "SELECT f.id, f.asset_id, a.storage_path, f.sco
      f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h, \
      f.lm_left_eye_x, f.lm_left_eye_y, f.lm_right_eye_x, f.lm_right_eye_y, \
      f.lm_nose_x, f.lm_nose_y, f.lm_left_mouth_x, f.lm_left_mouth_y, \
-     f.lm_right_mouth_x, f.lm_right_mouth_y, f.assignment_source \
+     f.lm_right_mouth_x, f.lm_right_mouth_y, f.assignment_source, f.ts_secs \
      FROM faces f JOIN assets a ON a.id = f.asset_id";
 
 #[derive(sqlx::FromRow)]
@@ -104,6 +113,7 @@ struct PersonFaceRow {
     lm_right_mouth_x: f32,
     lm_right_mouth_y: f32,
     assignment_source: String,
+    ts_secs: Option<f64>,
 }
 
 impl From<PersonFaceRow> for PersonFace {
@@ -122,6 +132,7 @@ impl From<PersonFaceRow> for PersonFace {
                 (r.lm_right_mouth_x, r.lm_right_mouth_y),
             ],
             pinned: r.assignment_source == "user",
+            ts_secs: r.ts_secs,
         }
     }
 }
@@ -164,8 +175,8 @@ impl FacesRepo {
                    id, asset_id, bbox_x, bbox_y, bbox_w, bbox_h, \
                    lm_left_eye_x, lm_left_eye_y, lm_right_eye_x, lm_right_eye_y, \
                    lm_nose_x, lm_nose_y, lm_left_mouth_x, lm_left_mouth_y, \
-                   lm_right_mouth_x, lm_right_mouth_y, score, embedding, dim\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   lm_right_mouth_x, lm_right_mouth_y, score, embedding, dim, ts_secs\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id_text(id))
             .bind(id_text(face.asset_id))
@@ -186,6 +197,7 @@ impl FacesRepo {
             .bind(face.score)
             .bind(vector::encode(&face.embedding))
             .bind(face.embedding.len() as i64)
+            .bind(face.ts_secs)
             .execute(&mut *tx)
             .await
             .map_err(crate::Error::Query)?;
@@ -233,27 +245,63 @@ impl FacesRepo {
             .collect())
     }
 
+    /// Videos never scanned for faces (anti-join on `face_detection_runs`,
+    /// same idempotency contract as photos). Duration rides along for frame
+    /// sampling; None means imported without ffprobe.
+    pub async fn fetch_videos_undetected(
+        &self,
+    ) -> crate::Result<Vec<(AssetId, std::path::PathBuf, Option<f64>)>> {
+        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
+            "SELECT a.id, a.storage_path, a.duration_secs FROM assets a \
+             LEFT JOIN face_detection_runs r ON r.asset_id = a.id \
+             WHERE r.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
+             ORDER BY a.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, path, dur)| {
+                (
+                    AssetId::from(parse_uuid(&id)),
+                    std::path::PathBuf::from(path),
+                    dur,
+                )
+            })
+            .collect())
+    }
+
     /// Load faces for clustering, optionally only the unassigned ones.
     pub async fn fetch_embeddings(
         &self,
         unassigned_only: bool,
     ) -> crate::Result<Vec<FaceEmbedding>> {
         let sql = if unassigned_only {
-            "SELECT id, asset_id, person_id, score, embedding, assignment_source \
+            "SELECT id, asset_id, person_id, score, embedding, assignment_source, ts_secs \
              FROM faces WHERE embedding IS NOT NULL AND person_id IS NULL ORDER BY id"
         } else {
-            "SELECT id, asset_id, person_id, score, embedding, assignment_source \
+            "SELECT id, asset_id, person_id, score, embedding, assignment_source, ts_secs \
              FROM faces WHERE embedding IS NOT NULL ORDER BY id"
         };
 
-        type Row = (String, String, Option<String>, f32, Vec<u8>, String);
+        type Row = (
+            String,
+            String,
+            Option<String>,
+            f32,
+            Vec<u8>,
+            String,
+            Option<f64>,
+        );
         let rows: Vec<Row> = sqlx::query_as(sql)
             .fetch_all(&self.pool)
             .await
             .map_err(crate::Error::Query)?;
 
         rows.into_iter()
-            .map(|(id, asset_id, person_id, score, blob, source)| {
+            .map(|(id, asset_id, person_id, score, blob, source, ts_secs)| {
                 let embedding = vector::decode(&blob).ok_or_else(|| crate::Error::CorruptRow {
                     table: "faces",
                     column: "embedding",
@@ -266,6 +314,7 @@ impl FacesRepo {
                     score,
                     embedding,
                     pinned: source == "user",
+                    ts_secs,
                 })
             })
             .collect()

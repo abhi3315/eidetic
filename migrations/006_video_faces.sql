@@ -1,0 +1,11 @@
+-- Faces detected in video frames (goals-v0.5.md #2).
+--
+-- A face row from a video carries the timestamp of the sampled frame it was
+-- found in; photo faces keep NULL. The timestamp is what lets a person page
+-- deep-link into the moment of the video where someone appears.
+--
+-- Cluster policy (enforced in code, recorded here): video faces may *match*
+-- existing, photo-built people, but never seed new person candidates and
+-- never serve as matching exemplars — motion blur and compression artifacts
+-- make video crops the known cluster-poisoning failure mode.
+ALTER TABLE faces ADD COLUMN ts_secs REAL;

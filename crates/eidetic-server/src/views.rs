@@ -14,6 +14,9 @@ pub(crate) struct PersonTile {
 pub(crate) struct FaceCrop {
     pub(crate) face_id: FaceId,
     pub(crate) asset_id: AssetId,
+    /// For faces found in videos: the frame timestamp, so the tile can
+    /// deep-link into the moment the person appears.
+    pub(crate) ts_secs: Option<f64>,
 }
 
 /// One person chip in the asset detail page's "People" section.
@@ -135,6 +138,8 @@ header a.nav { font-weight: 400; color: #555; margin-left: 1rem; }
 .face-grid { display: flex; flex-wrap: wrap; gap: 0.6rem; }
 .face-grid a { display: block; }
 .face-grid img.face-crop { width: 112px; height: 112px; object-fit: cover; border-radius: 4px; background: #eee; display: block; }
+.face-link { position: relative; display: inline-block; }
+.face-link .face-play { position: absolute; right: 4px; bottom: 4px; font-size: 11px; color: #fff; background: rgba(0,0,0,.55); border-radius: 3px; padding: 0 4px; pointer-events: none; }
 .people-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.5rem; }
 .person-chip { display: flex; flex-direction: column; align-items: center; gap: 0.2rem; text-decoration: none; color: #111; font-size: 0.75rem; }
 .person-chip img { width: 56px; height: 56px; object-fit: cover; border-radius: 50%; background: #eee; display: block; }
@@ -241,11 +246,17 @@ pub(crate) fn person_page(person: &eidetic_db::Person, crops: &[FaceCrop]) -> Ma
         } @else {
             div class="face-grid" {
                 @for crop in crops {
-                    a href=(format!("/assets/{}", crop.asset_id)) {
+                    a class="face-link" href=(match crop.ts_secs {
+                        Some(ts) => format!("/assets/{}?t={ts:.1}", crop.asset_id),
+                        None => format!("/assets/{}", crop.asset_id),
+                    }) {
                         img class="face-crop"
                             src=(format!("/faces/{}/crop", crop.face_id))
                             loading="lazy"
                             alt="face crop";
+                        @if crop.ts_secs.is_some() {
+                            span class="face-play" { "▶" }
+                        }
                     }
                 }
             }
@@ -681,10 +692,12 @@ mod tests {
             FaceCrop {
                 face_id: FaceId::new(),
                 asset_id: AssetId::new(),
+                ts_secs: None,
             },
             FaceCrop {
                 face_id: FaceId::new(),
                 asset_id: AssetId::new(),
+                ts_secs: None,
             },
         ];
         let s = person_page(&person, &crops).into_string();

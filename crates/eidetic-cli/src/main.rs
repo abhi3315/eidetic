@@ -691,9 +691,23 @@ async fn main() -> anyhow::Result<()> {
                     .fetch_undetected()
                     .await
                     .context("failed to fetch undetected assets")?;
+                let videos = faces_repo
+                    .fetch_videos_undetected()
+                    .await
+                    .context("failed to fetch undetected videos")?;
+                let ffmpeg_ok = eidetic_ingest::video::ffmpeg().is_some()
+                    && eidetic_ingest::video::ffprobe().is_some();
+                if !videos.is_empty() && !ffmpeg_ok {
+                    eprintln!(
+                        "Skipping {} video(s): ffmpeg/ffprobe not found. Install ffmpeg and \
+                         re-run `eidetic faces`.",
+                        videos.len()
+                    );
+                }
+                let videos = if ffmpeg_ok { videos } else { Vec::new() };
 
-                if pending.is_empty() {
-                    println!("No new images to scan.");
+                if pending.is_empty() && videos.is_empty() {
+                    println!("No new assets to scan.");
                 } else {
                     println!("Loading face models (downloads on first run)…");
 
@@ -701,27 +715,73 @@ async fn main() -> anyhow::Result<()> {
                     // models, the async loop feeds it paths one at a time.
                     // Capacity 1 keeps the worker in lockstep with the DB
                     // writes, so no queue builds up if storage stalls.
-                    type FaceJob = (
-                        PathBuf,
-                        oneshot::Sender<eidetic_ml::Result<Vec<eidetic_ml::AnalyzedFace>>>,
-                    );
+                    type ImageReply =
+                        oneshot::Sender<eidetic_ml::Result<Vec<eidetic_ml::AnalyzedFace>>>;
+                    /// (ts, faces at that ts) per decodable sampled frame, or
+                    /// a display-ready reason the video was skipped entirely.
+                    type VideoReply =
+                        oneshot::Sender<Result<Vec<(f64, Vec<eidetic_ml::AnalyzedFace>)>, String>>;
+                    enum FaceJob {
+                        Image(PathBuf, ImageReply),
+                        Video(PathBuf, Vec<f64>, VideoReply),
+                    }
                     let (job_tx, mut job_rx) = mpsc::channel::<FaceJob>(1);
 
                     let worker = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<()> {
                         let mut analyzer = eidetic_ml::FaceAnalyzer::load(&models_dir)?;
-                        while let Some((path, reply)) = job_rx.blocking_recv() {
-                            let _ = reply.send(analyzer.analyze_path(&path));
+                        while let Some(job) = job_rx.blocking_recv() {
+                            match job {
+                                FaceJob::Image(path, reply) => {
+                                    let _ = reply.send(analyzer.analyze_path(&path));
+                                }
+                                FaceJob::Video(path, timestamps, reply) => {
+                                    // Same partial-tolerance as embed: frames
+                                    // that decode contribute; a video with no
+                                    // decodable frame reports its first error.
+                                    let mut per_ts = Vec::new();
+                                    let mut first_err = None;
+                                    for ts in timestamps {
+                                        let result =
+                                            eidetic_ingest::video::extract_frame(&path, ts)
+                                                .map_err(|e| e.to_string())
+                                                .and_then(|f| {
+                                                    f.ok_or_else(|| {
+                                                        "ffmpeg disappeared mid-run".to_string()
+                                                    })
+                                                })
+                                                .and_then(|frame| {
+                                                    analyzer
+                                                        .analyze(&frame)
+                                                        .map_err(|e| e.to_string())
+                                                });
+                                        match result {
+                                            Ok(faces) => per_ts.push((ts, faces)),
+                                            Err(e) => first_err = first_err.or(Some(e)),
+                                        }
+                                    }
+                                    let _ = reply.send(match (per_ts.is_empty(), first_err) {
+                                        (true, Some(e)) => Err(e),
+                                        (_, _) => Ok(per_ts),
+                                    });
+                                }
+                            }
                         }
                         Ok(())
                     });
 
                     let total = pending.len();
-                    println!("Scanning {total} images for faces");
+                    if total > 0 {
+                        println!("Scanning {total} images for faces");
+                    }
 
                     let (mut scanned, mut found, mut failed) = (0u32, 0u32, 0u32);
                     for (i, (asset_id, path)) in pending.into_iter().enumerate() {
                         let (reply_tx, reply_rx) = oneshot::channel();
-                        if job_tx.send((path.clone(), reply_tx)).await.is_err() {
+                        if job_tx
+                            .send(FaceJob::Image(path.clone(), reply_tx))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         let result = reply_rx
@@ -743,6 +803,7 @@ async fn main() -> anyhow::Result<()> {
                                         landmarks: f.detection.landmarks.as_template_order(),
                                         score: f.detection.score,
                                         embedding: f.embedding.clone(),
+                                        ts_secs: None,
                                     })
                                     .collect();
 
@@ -773,13 +834,67 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
+                    // ---- video pass (goals-v0.5.md #2) ----
+                    // Video faces may MATCH existing people but never seed
+                    // clusters (enforced in cluster_faces); on top of that a
+                    // stricter quality gate keeps blurred/compressed crops
+                    // out entirely, and near-identical detections across a
+                    // video's sampled frames collapse to the best one.
+                    let video_total = videos.len();
+                    if video_total > 0 {
+                        println!("Scanning {video_total} video(s) for faces");
+                    }
+                    let mut vid_found = 0u32;
+                    for (i, (asset_id, path, duration)) in videos.into_iter().enumerate() {
+                        let timestamps = eidetic_ingest::video::sample_timestamps(duration);
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        if job_tx
+                            .send(FaceJob::Video(path.clone(), timestamps, reply_tx))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let result = reply_rx
+                            .await
+                            .context("face worker panicked or died mid-job")?;
+
+                        match result {
+                            Ok(per_ts) => {
+                                let new_faces = video_faces_to_record(asset_id, &per_ts);
+                                match faces_repo.record_detection(asset_id, &new_faces).await {
+                                    Ok(_) => {
+                                        println!(
+                                            "[{}/{}] {} — {} face(s)",
+                                            i + 1,
+                                            video_total,
+                                            path.display(),
+                                            new_faces.len()
+                                        );
+                                        scanned += 1;
+                                        vid_found += new_faces.len() as u32;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  failed to store {}: {e}", path.display());
+                                        failed += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  skipped {}: {e}", path.display());
+                                failed += 1;
+                            }
+                        }
+                    }
+                    found += vid_found;
+
                     drop(job_tx);
                     worker
                         .await
                         .context("face worker thread panicked")?
                         .context("failed to load face models; check your connection and that the model cache is intact")?;
 
-                    println!("Scanned {scanned} images, found {found} faces, failed {failed}.");
+                    println!("Scanned {scanned} assets, found {found} faces, failed {failed}.");
                 }
             }
 
@@ -1122,6 +1237,65 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Turn per-frame video detections into rows worth storing: a stricter
+/// quality gate than photos (video crops carry motion blur and compression
+/// artifacts — the known cluster-poisoning failure mode), then near-identical
+/// embeddings across the sampled frames collapse to their best-scoring
+/// instance so one person lingering through a clip becomes one face, not
+/// five.
+fn video_faces_to_record(
+    asset_id: eidetic_core::AssetId,
+    per_ts: &[(f64, Vec<eidetic_ml::AnalyzedFace>)],
+) -> Vec<eidetic_db::NewFace> {
+    const MIN_VIDEO_FACE_SCORE: f32 = 0.7;
+    const MIN_VIDEO_FACE_PIXELS: f32 = 48.0;
+    /// Cosine similarity above which two detections are the same face.
+    const DEDUP_SIMILARITY: f32 = 0.9;
+
+    let mut candidates: Vec<(f64, &eidetic_ml::AnalyzedFace)> = per_ts
+        .iter()
+        .flat_map(|(ts, faces)| faces.iter().map(move |f| (*ts, f)))
+        .filter(|(_, f)| {
+            f.detection.score >= MIN_VIDEO_FACE_SCORE
+                && f.detection.bbox.max_side() >= MIN_VIDEO_FACE_PIXELS
+        })
+        .collect();
+    // Best score first, so the kept instance of each near-dup group is the
+    // sharpest crop of that person.
+    candidates.sort_by(|a, b| b.1.detection.score.total_cmp(&a.1.detection.score));
+
+    let mut kept: Vec<(f64, &eidetic_ml::AnalyzedFace)> = Vec::new();
+    for (ts, face) in candidates {
+        let dup = kept.iter().any(|(_, k)| {
+            face.embedding
+                .iter()
+                .zip(&k.embedding)
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                > DEDUP_SIMILARITY
+        });
+        if !dup {
+            kept.push((ts, face));
+        }
+    }
+
+    kept.into_iter()
+        .map(|(ts, f)| eidetic_db::NewFace {
+            asset_id,
+            bbox: (
+                f.detection.bbox.x,
+                f.detection.bbox.y,
+                f.detection.bbox.width,
+                f.detection.bbox.height,
+            ),
+            landmarks: f.detection.landmarks.as_template_order(),
+            score: f.detection.score,
+            embedding: f.embedding.clone(),
+            ts_secs: Some(ts),
+        })
+        .collect()
+}
+
 /// What one clustering pass did.
 struct ClusterSummary {
     attached: usize,
@@ -1165,6 +1339,12 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
     let mut by_person: std::collections::HashMap<eidetic_core::PersonId, Vec<&_>> =
         std::collections::HashMap::new();
     for face in &all {
+        // Video faces never serve as exemplars: a blurred video crop that
+        // matched correctly would still drag the person's matching set
+        // toward low quality (goals-v0.5.md #2).
+        if face.ts_secs.is_some() {
+            continue;
+        }
         if let Some(p) = face.person_id {
             by_person.entry(p).or_default().push(face);
         }
@@ -1199,8 +1379,15 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
         }
     }
 
-    // Phase 2: propose new people from what is left.
-    let proposed = cluster::propose_people(&still_unassigned, &constraints, &params);
+    // Phase 2: propose new people from what is left — photo faces only.
+    // Video faces may match existing people (phase 1) but must never seed a
+    // cluster: compression artifacts make them false bridges between people.
+    let seed_pool: Vec<_> = still_unassigned
+        .iter()
+        .filter(|f| f.ts_secs.is_none())
+        .cloned()
+        .collect();
+    let proposed = cluster::propose_people(&seed_pool, &constraints, &params);
     let mut grouped = 0usize;
     for group in &proposed {
         let person = repo

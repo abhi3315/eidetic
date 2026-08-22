@@ -400,6 +400,7 @@ fn test_face(asset_id: eidetic_core::AssetId, score: f32) -> NewFace {
         landmarks: template.map(|(x, y)| (x + 40.0, y + 40.0)),
         score,
         embedding: vec![1.0, 0.0],
+        ts_secs: None,
     }
 }
 

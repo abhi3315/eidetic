@@ -129,9 +129,17 @@ fn hash_from_path(p: &std::path::Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct DetailQuery {
+    /// Seek offset in seconds — set by person-page deep links into the
+    /// moment a face appears. Becomes a media fragment on the video source.
+    t: Option<f64>,
+}
+
 pub(crate) async fn asset_detail(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<DetailQuery>,
 ) -> Result<Html<String>, ServerError> {
     use crate::views::{DetailView, detail_page, layout};
     use eidetic_core::AssetId;
@@ -152,12 +160,18 @@ pub(crate) async fn asset_detail(
         if !mime.starts_with("video/") {
             return None;
         }
-        if eidetic_core::playback::is_browser_playable(detail.video_codec.as_deref(), mime) {
-            Some(format!("/assets/{id}/raw"))
-        } else if detail.playback_path.is_some() {
-            Some(format!("/assets/{id}/play"))
-        } else {
-            None
+        let base =
+            if eidetic_core::playback::is_browser_playable(detail.video_codec.as_deref(), mime) {
+                format!("/assets/{id}/raw")
+            } else if detail.playback_path.is_some() {
+                format!("/assets/{id}/play")
+            } else {
+                return None;
+            };
+        // Media fragment: browsers start playback at the offset natively.
+        match query.t.filter(|t| t.is_finite() && *t >= 0.0) {
+            Some(t) => Some(format!("{base}#t={t:.1}")),
+            None => Some(base),
         }
     });
 
@@ -312,6 +326,7 @@ pub(crate) async fn person_detail(
         .map(|f| FaceCrop {
             face_id: f.face_id,
             asset_id: f.asset_id,
+            ts_secs: f.ts_secs,
         })
         .collect();
 
@@ -380,8 +395,20 @@ fn jpeg_crop_response(bytes: Vec<u8>) -> axum::response::Response {
 /// (`align_face` returns `None`), falls back to a plain bbox crop resized to
 /// the same 112x112 so the tile still shows *something*.
 fn render_face_crop(face: &eidetic_db::PersonFace) -> Result<Vec<u8>, ServerError> {
-    let img = eidetic_ml::image_io::load_oriented_image(&face.storage_path)
-        .map_err(|e| ServerError::CropFailed(format!("{}: {e}", face.storage_path.display())))?;
+    // A video face's coordinates are in the frame it was detected in, so
+    // re-extract exactly that frame; photo faces decode the original.
+    let img = match face.ts_secs {
+        Some(ts) => eidetic_ingest::video::extract_frame(&face.storage_path, ts)
+            .map_err(|e| ServerError::CropFailed(format!("{}: {e}", face.storage_path.display())))?
+            .ok_or_else(|| {
+                ServerError::CropFailed(
+                    "ffmpeg is required to crop faces out of videos".to_string(),
+                )
+            })?,
+        None => eidetic_ml::image_io::load_oriented_image(&face.storage_path).map_err(|e| {
+            ServerError::CropFailed(format!("{}: {e}", face.storage_path.display()))
+        })?,
+    };
 
     let landmarks = eidetic_ml::Landmarks::from_template_order(face.landmarks);
     let crop = eidetic_ml::face::align_face(&img, &landmarks)
@@ -594,6 +621,7 @@ mod tests {
                     landmarks: original.as_template_order(),
                     score: 0.9,
                     embedding: vec![1.0, 0.0],
+                    ts_secs: None,
                 }],
             )
             .await

@@ -996,6 +996,7 @@ dependencies = [
  "chrono",
  "eidetic-core",
  "eidetic-db",
+ "eidetic-ingest",
  "eidetic-ml",
  "http-body-util",
  "image",

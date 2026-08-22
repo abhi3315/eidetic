@@ -23,7 +23,8 @@ Written in Rust.
 - `eidetic reel "sunset at the beach"`: cut a short mp4 from the best-matching photos and video moments (needs ffmpeg)
   - Video hits become ~4s clips around the matched frame; photos hold 3s with a Ken Burns push-in
   - `--duration N` target seconds (default 30), `--size WxH` (default 1920x1080), `--output file`, `--dry-run` to print the cut list
-- `eidetic faces`: detect faces in imported images, then group them into people
+- `eidetic faces`: detect faces in imported images and videos, then group them into people
+  - Video faces come from the sampled frames (needs ffmpeg), pass a stricter quality gate, and may *join* existing people but never form new ones — motion blur and compression artifacts are the classic cluster poison. A person's page deep-links to the moment they appear
   - Detection is YuNet, embedding is AuraFace (512-dim) by default — both permissively licensed, see [ADR-0010](docs/adr/0010-face-stack.md)
   - `EIDETIC_FACE_MODEL`: `auraface` (default), `sface` (smaller/faster, 128-dim), or `buffalo_l` (InsightFace; better accuracy but **non-commercial weights** you download yourself)
   - `--cluster-only`: re-run grouping over already-detected faces without scanning again

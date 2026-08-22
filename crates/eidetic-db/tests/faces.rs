@@ -79,6 +79,7 @@ fn face(asset_id: eidetic_core::AssetId, embedding: Vec<f32>) -> NewFace {
         ],
         score: 0.95,
         embedding,
+        ts_secs: None,
     }
 }
 
@@ -543,6 +544,7 @@ async fn fetch_face_round_trips_geometry() {
         ],
         score: 0.87,
         embedding: vec![1.0, 0.0],
+        ts_secs: None,
     };
     let id = faces
         .record_detection(asset, std::slice::from_ref(&new_face))
