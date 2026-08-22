@@ -185,7 +185,7 @@ fn clip_bounds(ts: f64, duration_secs: Option<f64>, scenes: &[f64]) -> (f64, f64
         .fold(duration, f64::min);
 
     let start = (ts - VIDEO_LEAD_SECS).max(shot_start);
-    let len = (shot_end - start).min(VIDEO_CLIP_SECS).max(0.5);
+    let len = (shot_end - start).clamp(0.5, VIDEO_CLIP_SECS);
     (start, len)
 }
 
