@@ -2,6 +2,21 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.6.0 — 2026-08-22
+
+The leftovers release: the three items deliberately left on the table after v0.5 — GPU speech decode, perceptual dedup, and the WebDAV interface goals.md promised from day one. With this, both goal documents are exhausted.
+
+### Added
+
+- **Read-only WebDAV** at `/dav/` on `eidetic serve` — the "(eventual) WebDAV" from goals.md, now real. A virtual `year/month/filename` tree (from `date_taken`, falling back to import time) mountable from any file manager; name collisions get deterministic short-id suffixes; file GETs have full Range support. Class 1, hand-rolled, zero new dependencies; every mutating method answers 405.
+- **`eidetic dupes`** — perceptual duplicate report: re-exported photos and re-encoded/remuxed/truncated video copies, detected by comparing the SigLIP embeddings the library already stores (a deliberate simplification over the ffmpeg-signature sketch in goals-v0.5.md: zero new deps, photos covered too). Videos compare as mean best-frame match over the smaller frame set, so a truncated copy still scores ~1.0 against its source. Reporting only — nothing is deleted.
+- **`speech-cuda` build feature** — whisper.cpp with CUDA kernels for GPU transcription, where the toolchain allows. On Fedora 44+ it doesn't yet: nvcc 12.9 cannot parse gcc 16 headers; the README documents the exact unblock (`gcc14-c++` + `CUDAHOSTCXX`, or a CUDA 13 toolkit). CPU transcription is unaffected.
+
+### Verified
+
+- WebDAV walked live over HTTP: root → year → month → file, exact original bytes, correct mimes, PUT refused.
+- `eidetic dupes` found the three planted duplicates (a video, its MKV remux, its truncated first 40%) as exactly one group, zero false positives across 74 photos, in 8 ms.
+
 ## v0.5.0 — 2026-08-22
 
 The "video intelligence" release — the four features scoped in [goals-v0.5.md](goals-v0.5.md), each validated against market research before a line was written. Highlights: videos now play in every browser, people are found *inside* videos, reels cut on shot boundaries, and search understands what was *said* — a capability no photo manager ships, Google and Apple included.
