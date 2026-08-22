@@ -201,10 +201,10 @@ fn dp_beats(env: &[f64], period: f64) -> Vec<usize> {
         let to = t - lo;
         let mut best = f64::MIN;
         let mut best_tau = usize::MAX;
-        for tau in from..=to {
+        for (tau, prev_score) in score.iter().enumerate().take(to + 1).skip(from) {
             let interval = (t - tau) as f64;
             let penalty = TIGHTNESS * (interval / p).ln().powi(2);
-            let s = score[tau] - penalty;
+            let s = prev_score - penalty;
             if s > best {
                 best = s;
                 best_tau = tau;
