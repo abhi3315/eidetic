@@ -88,6 +88,16 @@ pub struct SearchResult {
 }
 
 #[derive(Debug)]
+pub struct PlaybackCandidate {
+    pub id: AssetId,
+    pub hash: eidetic_core::Sha256,
+    pub storage_path: PathBuf,
+    pub mime_type: String,
+    pub video_codec: Option<String>,
+    pub duration_secs: Option<f64>,
+}
+
+#[derive(Debug)]
 pub struct UnthumbnailedAsset {
     pub id: AssetId,
     pub hash: eidetic_core::Sha256,
@@ -140,6 +150,10 @@ pub struct AssetDetail {
     pub video_codec: Option<String>,
     pub pixel_width: Option<i64>,
     pub pixel_height: Option<i64>,
+    /// Browser-playable MP4 copy, when one has been generated
+    /// (goals-v0.5.md #1). None = original is already playable, or the
+    /// transcode backfill hasn't run.
+    pub playback_path: Option<PathBuf>,
 }
 
 /// UUIDs are stored as lowercase hyphenated TEXT so the database stays
@@ -450,6 +464,50 @@ impl AssetsRepo {
         Ok(())
     }
 
+    /// Every video with no playback copy yet, with the fields the codec
+    /// policy (eidetic-core::playback) needs to decide whether one is
+    /// required. Policy stays in Rust so the allowlist lives in one place.
+    pub async fn fetch_videos_no_playback(&self) -> crate::Result<Vec<PlaybackCandidate>> {
+        type Row = (String, String, String, String, Option<String>, Option<f64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, hash, storage_path, mime_type, video_codec, duration_secs \
+                 FROM assets \
+                 WHERE mime_type LIKE 'video/%' AND playback_path IS NULL \
+                 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, hash_hex, path, mime_type, video_codec, duration_secs)| PlaybackCandidate {
+                    id: parse_id(&id),
+                    hash: parse_hash(&hash_hex),
+                    storage_path: PathBuf::from(path),
+                    mime_type,
+                    video_codec,
+                    duration_secs,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn set_playback_path(
+        &self,
+        id: AssetId,
+        path: &std::path::Path,
+    ) -> crate::Result<()> {
+        sqlx::query("UPDATE assets SET playback_path = ? WHERE id = ?")
+            .bind(path.to_string_lossy().as_ref())
+            .bind(id_text(id))
+            .execute(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.
@@ -670,7 +728,7 @@ const DETAIL_SELECT: &str = "SELECT id, hash, original_filename, storage_path, f
             shutter, iso, orientation, altitude, gps_direction, exif_raw, \
             country_code, country_name, admin1, place, place_distance_m, \
             thumbnails_generated, duration_secs, video_codec, \
-            pixel_width, pixel_height \
+            pixel_width, pixel_height, playback_path \
      FROM assets WHERE id = ?";
 
 #[derive(sqlx::FromRow)]
@@ -708,6 +766,7 @@ struct DetailRow {
     video_codec: Option<String>,
     pixel_width: Option<i64>,
     pixel_height: Option<i64>,
+    playback_path: Option<String>,
 }
 
 impl DetailRow {
@@ -746,6 +805,7 @@ impl DetailRow {
             video_codec: self.video_codec,
             pixel_width: self.pixel_width,
             pixel_height: self.pixel_height,
+            playback_path: self.playback_path.map(PathBuf::from),
         }
     }
 }

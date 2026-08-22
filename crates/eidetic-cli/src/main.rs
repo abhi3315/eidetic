@@ -117,6 +117,9 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Generate browser-playable copies of videos whose codec or container
+    /// a browser can't stream (needs ffmpeg). Originals are never modified.
+    Transcode,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -925,6 +928,117 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("render thread panicked")??;
             println!("Wrote {}", output.display());
+        }
+
+        Command::Transcode => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::AssetsRepo::new(pool);
+
+            if eidetic_ingest::video::ffmpeg().is_none() {
+                anyhow::bail!(
+                    "ffmpeg not found. Install it (or set EIDETIC_FFMPEG_PATH) and re-run."
+                );
+            }
+
+            let candidates = repo
+                .fetch_videos_no_playback()
+                .await
+                .context("failed to fetch videos")?;
+
+            // The codec policy lives in eidetic-core; a video whose original
+            // already plays in every browser needs no copy and is skipped
+            // permanently (playback_path stays NULL and it keeps being
+            // re-checked here, which costs one in-memory filter pass).
+            let pending: Vec<_> = candidates
+                .into_iter()
+                .filter(|c| {
+                    !eidetic_core::playback::is_browser_playable(
+                        c.video_codec.as_deref(),
+                        &c.mime_type,
+                    )
+                })
+                .collect();
+
+            if pending.is_empty() {
+                println!("Nothing to do: every video already plays in a browser.");
+                return Ok(());
+            }
+
+            let total = pending.len();
+            println!("Transcoding {total} video(s) for browser playback…");
+
+            let mut done = 0u32;
+            let mut failed = 0u32;
+            for (i, c) in pending.into_iter().enumerate() {
+                // Imported without ffprobe? Probe now so remux-vs-reencode is
+                // decided on real data, and backfill the metadata.
+                let codec = match c.video_codec {
+                    Some(codec) => Some(codec),
+                    None => {
+                        let probe_path = c.storage_path.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            eidetic_ingest::video::probe(&probe_path)
+                        })
+                        .await
+                        .context("probe thread panicked")?
+                        {
+                            Ok(Some(p)) => {
+                                repo.update_video_probe(
+                                    c.id,
+                                    p.duration_secs,
+                                    p.video_codec.as_deref(),
+                                    p.width,
+                                    p.height,
+                                )
+                                .await
+                                .context("failed to store probe metadata")?;
+                                p.video_codec
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+
+                let dest =
+                    eidetic_core::playback::playback_path(&config.paths.library_dir, &c.hash);
+                let src = c.storage_path.clone();
+                let codec_safe = eidetic_core::playback::is_safe_codec(codec.as_deref());
+                let dest_clone = dest.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    eidetic_ingest::video::transcode_to_playback(&src, &dest_clone, codec_safe)
+                })
+                .await
+                .context("transcode thread panicked")?;
+
+                match result {
+                    Ok(Some(())) => match repo.set_playback_path(c.id, &dest).await {
+                        Ok(()) => {
+                            let how = if codec_safe { "remuxed" } else { "re-encoded" };
+                            println!("[{}/{}] {} ({how})", i + 1, total, c.storage_path.display());
+                            done += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("  failed to record {}: {e}", c.storage_path.display());
+                            failed += 1;
+                        }
+                    },
+                    Ok(None) => anyhow::bail!("ffmpeg disappeared mid-run"),
+                    Err(e) => {
+                        eprintln!("  [{}/{}] {e}", i + 1, total);
+                        failed += 1;
+                    }
+                }
+            }
+
+            if failed > 0 {
+                println!("Done. Transcoded {done}, failed {failed}. Re-run to retry.");
+                std::process::exit(1);
+            } else {
+                println!("Done. Transcoded {done}.");
+            }
         }
 
         Command::Search {

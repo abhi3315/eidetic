@@ -137,6 +137,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/search", get(handlers::search))
         .route("/assets/{id}", get(handlers::asset_detail))
         .route("/assets/{id}/raw", get(handlers::asset_raw))
+        .route("/assets/{id}/play", get(handlers::asset_play))
         .route("/thumbs/{size}/{hash}", get(handlers::thumb))
         .route("/persons", get(handlers::persons_index))
         .route("/persons/{id}", get(handlers::person_detail))

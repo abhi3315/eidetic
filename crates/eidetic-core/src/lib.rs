@@ -6,6 +6,7 @@ pub mod dng;
 pub mod exif;
 pub mod geocoder;
 pub mod ids;
+pub mod playback;
 
 pub use config::{Config, Paths};
 pub use ids::{AssetId, FaceId, PersonId, Sha256};

@@ -31,6 +31,7 @@ Written in Rust.
   - Your corrections are durable: naming, merges and splits are stored as constraints, so re-running clustering never discards them
 - `eidetic persons`: list grouped people with face counts
 - `eidetic name-person <id> <name>`: name a person
+- `eidetic transcode`: generate browser-playable H.264 copies of videos whose codec or container browsers can't stream (HEVC iPhone footage, MKV). Cheap remux when only the container is wrong; originals never touched; the web player picks the copy automatically
 - `eidetic serve`: localhost web viewer — thumbnail grid (videos play inline with seeking), semantic search, per-asset detail, and a People section with face-crop grids per person (naming stays in the CLI)
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>`: SHA-256 a file, no setup needed

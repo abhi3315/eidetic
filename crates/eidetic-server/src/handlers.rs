@@ -145,11 +145,29 @@ pub(crate) async fn asset_detail(
         .map_err(ServerError::DbFailed)?
         .ok_or_else(|| ServerError::NotFound(format!("asset {id}")))?;
 
+    // Pick the <video> source by the codec policy: the original when a
+    // browser can play it, the transcoded copy when one exists, else none
+    // (the page explains how to generate one).
+    let video_src = detail.mime_type.as_deref().and_then(|mime| {
+        if !mime.starts_with("video/") {
+            return None;
+        }
+        if eidetic_core::playback::is_browser_playable(detail.video_codec.as_deref(), mime) {
+            Some(format!("/assets/{id}/raw"))
+        } else if detail.playback_path.is_some() {
+            Some(format!("/assets/{id}/play"))
+        } else {
+            None
+        }
+    });
+
     let view = DetailView {
         id: detail.id,
         hash: detail.hash,
         original_filename: detail.original_filename.clone(),
         mime_type: detail.mime_type,
+        video_src,
+        video_codec: detail.video_codec,
         file_size: detail.file_size,
         imported_at: detail.imported_at,
         date_taken: detail.date_taken,
@@ -394,6 +412,43 @@ fn bbox_fallback_crop(
         eidetic_ml::face::ALIGNED_SIZE,
         image::imageops::FilterType::Triangle,
     )
+}
+
+/// Serve the browser-playable transcode copy (goals-v0.5.md #1). Always MP4;
+/// ServeFile supplies the Range semantics `<video>` seeking needs. 404 when
+/// no copy has been generated (`eidetic transcode` makes them).
+pub(crate) async fn asset_play(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, ServerError> {
+    use eidetic_core::AssetId;
+    use tower::ServiceExt;
+    use tower_http::services::ServeFile;
+
+    let detail = state
+        .repo
+        .fetch_by_id(AssetId::from(id))
+        .await
+        .map_err(ServerError::DbFailed)?
+        .ok_or_else(|| ServerError::NotFound(format!("asset {id}")))?;
+    let playback = detail
+        .playback_path
+        .ok_or_else(|| ServerError::NotFound(format!("no playback copy for asset {id}")))?;
+
+    let response = match ServeFile::new_with_mime(&playback, &mime::APPLICATION_OCTET_STREAM)
+        .oneshot(req)
+        .await
+    {
+        Ok(response) => response,
+        Err(infallible) => match infallible {},
+    };
+    let mut response = response.map(axum::body::Body::new);
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("video/mp4"),
+    );
+    Ok(response)
 }
 
 pub(crate) async fn thumb(

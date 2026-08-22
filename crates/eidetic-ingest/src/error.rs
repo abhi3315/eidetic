@@ -33,6 +33,8 @@ pub enum Error {
         ts_secs: f64,
         detail: String,
     },
+    #[error("transcode failed for {path}: {detail}")]
+    Transcode { path: PathBuf, detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

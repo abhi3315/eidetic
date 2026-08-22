@@ -218,6 +218,73 @@ pub fn extract_frame(path: &Path, ts_secs: f64) -> Result<Option<DynamicImage>> 
     Ok(Some(img))
 }
 
+/// Produce a browser-playable MP4 copy of `src` at `dest` (goals-v0.5.md).
+///
+/// When the video codec is already browser-safe (`codec_is_safe`) only the
+/// container is the problem (MKV/AVI), so the video stream is *remuxed*
+/// (`-c:v copy`, near-instant). Otherwise it is re-encoded to H.264. Audio
+/// is normalised to AAC either way — a remuxed MP4 with PCM audio would
+/// play silently. `+faststart` moves the index up front so playback starts
+/// before the file finishes downloading.
+///
+/// Known limit, accepted for now: HDR sources re-encode without tone
+/// mapping, so HDR10 HEVC comes out washed. Fixing that needs a tonemap
+/// filter chain and per-source colour probing.
+///
+/// Writes to a temp name in `dest`'s directory and renames, so a killed
+/// transcode never leaves a half-written file where the server would find
+/// it. `Ok(None)` when ffmpeg is not installed.
+pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Result<Option<()>> {
+    let Some(ffmpeg) = ffmpeg() else {
+        return Ok(None);
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let tmp = dest.with_extension("mp4.part");
+
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-v", "error"]).arg("-i").arg(src);
+    if codec_is_safe {
+        cmd.args(["-c:v", "copy"]);
+    } else {
+        cmd.args([
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+        ]);
+    }
+    // `-f mp4` because the temp name ends in `.part`, which ffmpeg can't
+    // infer a muxer from.
+    cmd.args([
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+    ]);
+    let output = cmd.arg(&tmp).output().map_err(|source| Error::Io {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Transcode {
+            path: src.to_path_buf(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    std::fs::rename(&tmp, dest).map_err(|source| Error::Io {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(()))
+}
+
 /// The timestamp the single representative thumbnail frame is taken at:
 /// 10% in, but at least half a second (skipping fade-from-black openings),
 /// and never past the end.
@@ -392,5 +459,88 @@ mod tests {
         std::fs::write(&bad, b"not a video").unwrap();
         assert!(probe(&bad).is_err());
         assert!(extract_frame(&bad, 0.0).is_err());
+    }
+
+    /// Playback transcode paths: an unsafe codec re-encodes to H.264; a safe
+    /// codec in an unsafe container remuxes (stream copy). Skips where
+    /// ffmpeg is missing; CI installs it.
+    #[test]
+    fn transcode_reencodes_hevc_and_remuxes_mkv() {
+        let Some(ffmpeg_bin) = ffmpeg() else {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // HEVC source (skip quietly if this ffmpeg lacks libx265).
+        let hevc = dir.path().join("clip_hevc.mp4");
+        let made_hevc = Command::new(ffmpeg_bin)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=64x48:rate=10",
+            ])
+            .args(["-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p"])
+            .arg(&hevc)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        if made_hevc {
+            let out = dir.path().join("play_hevc.mp4");
+            transcode_to_playback(&hevc, &out, false)
+                .expect("transcode")
+                .expect("ffmpeg present");
+            let p = probe(&out).expect("probe output").expect("ffprobe present");
+            assert_eq!(
+                p.video_codec.as_deref(),
+                Some("h264"),
+                "re-encoded to H.264"
+            );
+        } else {
+            eprintln!("skipping HEVC half: no libx265 in this ffmpeg");
+        }
+
+        // H.264 in MKV: container is the only problem, so remux.
+        let h264 = dir.path().join("clip.mp4");
+        assert!(
+            Command::new(ffmpeg_bin)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=1:size=64x48:rate=10"
+                ])
+                .args(["-pix_fmt", "yuv420p"])
+                .arg(&h264)
+                .status()
+                .expect("run ffmpeg")
+                .success()
+        );
+        let mkv = dir.path().join("clip.mkv");
+        assert!(
+            Command::new(ffmpeg_bin)
+                .args(["-v", "error"])
+                .arg("-i")
+                .arg(&h264)
+                .args(["-c", "copy"])
+                .arg(&mkv)
+                .status()
+                .expect("run ffmpeg")
+                .success()
+        );
+        let out = dir.path().join("play_mkv.mp4");
+        transcode_to_playback(&mkv, &out, true)
+            .expect("remux")
+            .expect("ffmpeg present");
+        let p = probe(&out).expect("probe output").expect("ffprobe present");
+        assert_eq!(p.video_codec.as_deref(), Some("h264"), "stream-copied");
+
+        // No half-written .part file survives either path.
+        assert!(!dir.path().join("play_mkv.mp4.part").exists());
     }
 }

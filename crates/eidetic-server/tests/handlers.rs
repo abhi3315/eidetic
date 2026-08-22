@@ -88,6 +88,22 @@ async fn seed_asset(
 }
 
 #[tokio::test]
+async fn play_without_transcode_copy_returns_404() {
+    let (router, repo, _faces, _tmp) = fixture().await;
+    let id = seed_asset(&repo, &_tmp, "clip.mp4", "video/mp4", b"stub", 0x77).await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/assets/{}/play", id.as_uuid()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn index_with_empty_db_renders_empty_grid() {
     let (router, _repo, _faces, _tmp) = fixture().await;
 

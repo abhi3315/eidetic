@@ -1,0 +1,13 @@
+-- Browser-playback copies (goals-v0.5.md #1).
+--
+-- Phones default to HEVC, which Firefox cannot decode at all, so a chunk of
+-- any iPhone library is unwatchable in `eidetic serve`. `eidetic transcode`
+-- generates an H.264/AAC MP4 copy for videos whose codec or container a
+-- browser can't play, stored under `.playback/` in the same hash-sharded
+-- layout as thumbnails. Originals are never touched; `/raw` keeps serving
+-- them, and the web player prefers the copy when one exists.
+--
+-- NULL means "no copy generated" — either not needed (codec already
+-- browser-safe), or pending. Which of the two is decided in Rust against the
+-- codec allowlist, so the list lives in exactly one place (eidetic-core).
+ALTER TABLE assets ADD COLUMN playback_path TEXT;

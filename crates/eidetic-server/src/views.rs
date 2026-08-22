@@ -71,6 +71,11 @@ fn ext_badge(filename: &str) -> String {
 
 pub(crate) struct DetailView {
     pub(crate) id: AssetId,
+    /// Where the <video> element should point for a video asset: `/raw` when
+    /// the original is browser-playable, the `/play` transcode copy when one
+    /// exists, and None when neither (message + download link instead).
+    pub(crate) video_src: Option<String>,
+    pub(crate) video_codec: Option<String>,
     pub(crate) hash: Sha256,
     pub(crate) original_filename: String,
     pub(crate) mime_type: Option<String>,
@@ -261,10 +266,19 @@ pub(crate) fn detail_page(view: &DetailView, people: &[PersonChip]) -> Markup {
         div class="detail" {
             div {
                 @if is_video {
-                    // Range support on /raw makes seeking work; Safari won't
-                    // play at all without it.
-                    video class="preview" controls preload="metadata"
-                        src=(format!("/assets/{}/raw", view.id)) {}
+                    @if let Some(src) = &view.video_src {
+                        // Range support on the source makes seeking work;
+                        // Safari won't play at all without it.
+                        video class="preview" controls preload="metadata"
+                            src=(src) {}
+                    } @else {
+                        p class="empty" {
+                            "This video's codec ("
+                            (view.video_codec.as_deref().unwrap_or("unknown"))
+                            ") doesn't play in browsers. Run \u{60}eidetic transcode\u{60} \
+                             to generate a playable copy, or use the download link below."
+                        }
+                    }
                 } @else if view.thumbnails_generated {
                     img class="preview"
                         src=(format!("/thumbs/m/{}", view.hash))
@@ -504,6 +518,8 @@ mod tests {
             place: None,
             place_distance_m: None,
             thumbnails_generated: true,
+            video_src: None,
+            video_codec: None,
         };
         let s = detail_page(&view, &[]).into_string();
         assert!(s.contains("class=\"preview\""));
@@ -537,6 +553,12 @@ mod tests {
             place: None,
             place_distance_m: None,
             thumbnails_generated: thumbs,
+            video_src: if mime.is_some_and(|m| m.starts_with("video/")) {
+                Some(format!("/assets/{}/raw", AssetId::new()))
+            } else {
+                None
+            },
+            video_codec: None,
         }
     }
 
@@ -547,6 +569,18 @@ mod tests {
         assert!(s.contains("class=\"preview\""));
         assert!(s.contains("/raw"));
         assert!(!s.contains("No preview available"));
+    }
+
+    #[test]
+    fn detail_page_without_playable_source_explains_transcode() {
+        let mut view = detail_view(Some("video/mp4"), false, 1024);
+        view.video_src = None;
+        view.video_codec = Some("hevc".into());
+        let s = detail_page(&view, &[]).into_string();
+        assert!(!s.contains("<video"), "no player without a playable source");
+        assert!(s.contains("hevc"), "names the codec");
+        assert!(s.contains("eidetic transcode"), "tells the user the fix");
+        assert!(s.contains("Download original"));
     }
 
     #[test]
