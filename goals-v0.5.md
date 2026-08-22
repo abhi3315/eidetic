@@ -1,6 +1,6 @@
 # Goals: v0.5 — video intelligence
 
-Status: proposed (2026-08-22)
+Status: shipped in v0.5.0, same day (2026-08-22) — except #5, deferred by design
 
 v0.4 completed everything [goals.md](goals.md) set out to build. This document scopes the next phase from the video gaps found while dogfooding v0.4, each validated against market evidence (three research passes over Google/Apple/Immich/PhotoPrism/Ente/LibrePhotos behavior, their issue trackers, and implementation prior art — August 2026).
 
