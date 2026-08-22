@@ -30,5 +30,6 @@ infer = { workspace = true }
 kamadak-exif = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+rustfft = { workspace = true }
 
 [dev-dependencies]

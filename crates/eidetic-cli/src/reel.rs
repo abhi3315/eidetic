@@ -14,6 +14,7 @@
 use anyhow::{Context, Result, bail};
 use eidetic_core::AssetId;
 use eidetic_db::SearchResult;
+use eidetic_ingest::beats::BeatGrid;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,15 +36,15 @@ pub struct ReelPlan {
 pub enum Segment {
     /// (source, clip start seconds, clip length seconds)
     VideoClip(PathBuf, f64, f64),
-    /// (source photo)
-    Photo(PathBuf),
+    /// (source photo, hold seconds)
+    Photo(PathBuf, f64),
 }
 
 impl Segment {
     fn secs(&self) -> f64 {
         match self {
             Segment::VideoClip(_, _, len) => *len,
-            Segment::Photo(_) => PHOTO_CLIP_SECS,
+            Segment::Photo(_, secs) => *secs,
         }
     }
 
@@ -52,7 +53,7 @@ impl Segment {
             Segment::VideoClip(p, start, len) => {
                 format!("{} [{start:.1}s +{len:.1}s]", p.display())
             }
-            Segment::Photo(p) => format!("{} [photo, {PHOTO_CLIP_SECS:.0}s]", p.display()),
+            Segment::Photo(p, secs) => format!("{} [photo, {secs:.1}s]", p.display()),
         }
     }
 }
@@ -88,7 +89,7 @@ pub fn plan(
                 let (start, len) = clip_bounds(ts, r.duration_secs, bounds);
                 Segment::VideoClip(r.storage_path.clone(), start, len)
             }
-            None => Segment::Photo(photo_source(r, library_dir)),
+            None => Segment::Photo(photo_source(r, library_dir), PHOTO_CLIP_SECS),
         };
         if total + seg.secs() > target_secs && !segments.is_empty() {
             break;
@@ -102,8 +103,27 @@ pub fn plan(
     }
 }
 
-/// Render the plan to `output` at `width`x`height`, 30fps, H.264.
-pub fn render(plan: &ReelPlan, output: &Path, width: u32, height: u32) -> Result<()> {
+/// How segments are fitted to the frame.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Fit {
+    /// Fit inside, pad with black (the landscape default).
+    Pad,
+    /// Fill the frame, crop the overflow — what vertical/Instagram output
+    /// wants; black side bars are the loudest auto-generated tell.
+    Cover,
+}
+
+/// Render the plan to `output` at `width`x`height`, 30fps, H.264. With
+/// `audio`, the track is laid under the cut, trimmed to the reel length
+/// with a one-second fade-out.
+pub fn render(
+    plan: &ReelPlan,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fit: Fit,
+    audio: Option<&Path>,
+) -> Result<()> {
     let Some(ffmpeg) = eidetic_ingest::video::ffmpeg() else {
         bail!("ffmpeg not found; install it (or set EIDETIC_FFMPEG_PATH) to render reels");
     };
@@ -122,16 +142,16 @@ pub fn render(plan: &ReelPlan, output: &Path, width: u32, height: u32) -> Result
                 .arg("-i")
                 .arg(src)
                 .args(["-t", &format!("{len:.3}")])
-                .args(["-vf", &normalize_filter(width, height)])
+                .args(["-vf", &normalize_filter(width, height, fit)])
                 .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
                 .arg(&seg_path)
                 .status(),
-            Segment::Photo(src) => Command::new(ffmpeg)
+            Segment::Photo(src, secs) => Command::new(ffmpeg)
                 .args(["-y", "-v", "error", "-loop", "1"])
                 .arg("-i")
                 .arg(src)
-                .args(["-t", &format!("{PHOTO_CLIP_SECS:.1}")])
-                .args(["-vf", &ken_burns_filter(width, height)])
+                .args(["-t", &format!("{secs:.3}")])
+                .args(["-vf", &ken_burns_filter(width, height, *secs)])
                 .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
                 .arg(&seg_path)
                 .status(),
@@ -150,18 +170,145 @@ pub fn render(plan: &ReelPlan, output: &Path, width: u32, height: u32) -> Result
     let list_path = workdir.path().join("concat.txt");
     std::fs::write(&list_path, list).context("write concat list")?;
 
+    let silent = match audio {
+        None => output.to_path_buf(),
+        Some(_) => workdir.path().join("silent.mp4"),
+    };
     let status = Command::new(ffmpeg)
         .args(["-y", "-v", "error", "-f", "concat", "-safe", "0"])
         .arg("-i")
         .arg(&list_path)
         .args(["-c", "copy"])
-        .arg(output)
+        .arg(&silent)
         .status()
         .context("run ffmpeg concat")?;
     if !status.success() {
         bail!("ffmpeg concat failed");
     }
+
+    if let Some(track) = audio {
+        let fade_start = (plan.total_secs - 1.0).max(0.0);
+        let status = Command::new(ffmpeg)
+            .args(["-y", "-v", "error"])
+            .arg("-i")
+            .arg(&silent)
+            .arg("-i")
+            .arg(track)
+            .args(["-map", "0:v", "-map", "1:a", "-c:v", "copy"])
+            .args(["-c:a", "aac", "-b:a", "192k"])
+            .args([
+                "-af",
+                &format!("afade=t=out:st={fade_start:.3}:d=1"),
+                "-t",
+                &format!("{:.3}", plan.total_secs),
+            ])
+            .arg(output)
+            .status()
+            .context("run ffmpeg audio mux")?;
+        if !status.success() {
+            bail!("ffmpeg audio mux failed");
+        }
+    }
     Ok(())
+}
+
+/// Cut spans from a beat grid (goals-v0.7.md phase 1): each span starts on
+/// a beat and runs 4 beats in normal sections, 2 in high-energy ones —
+/// the convention auto-editors converge on — with a 0.6 s floor absorbing
+/// very fast tempi. Spans stop at `total_secs`.
+pub fn beat_spans(grid: &BeatGrid, total_secs: f64) -> Vec<(f64, f64)> {
+    const MIN_SPAN: f64 = 0.6;
+    let mut spans = Vec::new();
+    let beats = &grid.beats;
+    if beats.is_empty() {
+        return spans;
+    }
+    let mut i = 0usize;
+    while i < beats.len() {
+        let start = beats[i];
+        if start >= total_secs {
+            break;
+        }
+        let step = if grid.is_high_energy(start) { 2 } else { 4 };
+        let mut j = (i + step).min(beats.len());
+        // Absorb beats until the span clears the floor (very fast tempi).
+        while j < beats.len() && beats[j] - start < MIN_SPAN {
+            j += 1;
+        }
+        let end = if j < beats.len() {
+            beats[j]
+        } else {
+            total_secs
+        };
+        let end = end.min(total_secs);
+        if end - start >= MIN_SPAN || spans.is_empty() {
+            spans.push((start, end));
+        }
+        if j == i {
+            break;
+        }
+        i = j;
+    }
+    // Lead-in before the first beat merges into the first span.
+    if let Some(first) = spans.first_mut() {
+        first.0 = 0.0;
+    }
+    spans
+}
+
+/// Beat-synced plan: each music span gets one shot, taken in score order
+/// with the same weak-tail rules as [`plan`]. A video hit fills its span
+/// exactly (sync beats scene purity: if the shot's scene is shorter than
+/// the span, the clip crosses the boundary rather than breaking the grid);
+/// photos hold for the span. The reel ends early if strong shots run out.
+pub fn plan_synced(
+    results: &[SearchResult],
+    grid: &BeatGrid,
+    total_secs: f64,
+    library_dir: &Path,
+    scenes: &HashMap<AssetId, Vec<f64>>,
+) -> ReelPlan {
+    let spans = beat_spans(grid, total_secs);
+    let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
+    let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
+    let strong: Vec<&SearchResult> = results
+        .iter()
+        .take_while(|r| r.score > 0.0 && (r.score as f64) >= floor)
+        .collect();
+
+    let mut segments = Vec::new();
+    let mut total = 0.0;
+    for ((_, end), r) in spans.iter().zip(&strong) {
+        let span = end - total;
+        let seg = match r.frame_ts {
+            Some(ts) => {
+                let duration = r.duration_secs.unwrap_or(f64::MAX);
+                let span = span.min(duration);
+                let empty = Vec::new();
+                let bounds = scenes.get(&r.id).unwrap_or(&empty);
+                let shot_start = bounds
+                    .iter()
+                    .copied()
+                    .filter(|s| *s <= ts)
+                    .fold(0.0, f64::max);
+                // Start at the shot boundary when the span fits after it;
+                // otherwise center on the moment and clamp to the file.
+                let start = if duration - shot_start >= span && ts - shot_start <= span {
+                    shot_start
+                } else {
+                    (ts - span / 2.0).clamp(0.0, (duration - span).max(0.0))
+                };
+                Segment::VideoClip(r.storage_path.clone(), start, span)
+            }
+            None => Segment::Photo(photo_source(r, library_dir), span),
+        };
+        total += seg.secs();
+        segments.push(seg);
+    }
+    ReelPlan {
+        segments,
+        total_secs: total,
+    }
 }
 
 /// Where to cut a video segment around the matched moment `ts`.
@@ -212,24 +359,33 @@ fn photo_source(r: &SearchResult, library_dir: &Path) -> PathBuf {
     r.storage_path.clone()
 }
 
-/// Fit any input inside the frame, pad to exact size, normalise fps/pixfmt so
-/// concat's `-c copy` join is legal across segments.
-fn normalize_filter(w: u32, h: u32) -> String {
-    format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease,\
-         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p"
-    )
+/// Fit the input to the frame per `fit`, normalise fps/pixfmt so concat's
+/// `-c copy` join is legal across segments.
+fn normalize_filter(w: u32, h: u32, fit: Fit) -> String {
+    match fit {
+        Fit::Pad => format!(
+            "scale={w}:{h}:force_original_aspect_ratio=decrease,\
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p"
+        ),
+        Fit::Cover => format!(
+            "scale={w}:{h}:force_original_aspect_ratio=increase,\
+             crop={w}:{h},fps=30,format=yuv420p"
+        ),
+    }
 }
 
 /// Ken Burns for stills: cover-crop to the frame, then a slow centred
 /// push-in. `d` is in *output frames* (30fps x 3s).
-fn ken_burns_filter(w: u32, h: u32) -> String {
+fn ken_burns_filter(w: u32, h: u32, secs: f64) -> String {
+    let frames = (secs * 30.0).round().max(1.0) as u32;
+    // Zoom rate scales so the push-in always lands at ~1.15x regardless of
+    // how long the beat span holds the photo.
+    let rate = 0.15 / frames as f64;
     format!(
         "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},\
-         zoompan=z='min(zoom+0.0016,1.15)':\
+         zoompan=z='min(zoom+{rate:.6},1.15)':\
          x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':\
-         d={frames}:s={w}x{h}:fps=30,format=yuv420p",
-        frames = (PHOTO_CLIP_SECS * 30.0) as u32
+         d={frames}:s={w}x{h}:fps=30,format=yuv420p"
     )
 }
 
@@ -319,7 +475,7 @@ mod tests {
         thumbed.thumbnails_generated = true;
         let p = plan(&[thumbed], 30.0, &lib(), &HashMap::new());
         match &p.segments[0] {
-            Segment::Photo(src) => {
+            Segment::Photo(src, _) => {
                 let s = src.to_str().unwrap();
                 assert!(s.contains(".thumbs/m/"), "expected thumb path, got {s}");
                 assert!(s.ends_with(".jpg"));
@@ -330,7 +486,7 @@ mod tests {
         // No thumbnail -> the original is used as-is.
         let raw = hit(0.5, None, None);
         match &plan(&[raw], 30.0, &lib(), &HashMap::new()).segments[0] {
-            Segment::Photo(src) => assert_eq!(src, &PathBuf::from("/x")),
+            Segment::Photo(src, _) => assert_eq!(src, &PathBuf::from("/x")),
             _ => panic!("expected a photo"),
         }
     }
@@ -351,6 +507,60 @@ mod tests {
         let (start, len) = clip_bounds(10.0, Some(60.0), &[9.8, 10.4]);
         assert!((start - 9.8).abs() < 1e-9);
         assert!((len - 0.6).abs() < 1e-9);
+    }
+
+    fn grid_120bpm(secs: f64) -> BeatGrid {
+        let beats: Vec<f64> = (0..)
+            .map(|i| i as f64 * 0.5)
+            .take_while(|b| *b < secs)
+            .collect();
+        BeatGrid {
+            bpm: 120.0,
+            downbeats: (0..beats.len()).step_by(4).collect(),
+            beats,
+            high_energy: vec![],
+        }
+    }
+
+    #[test]
+    fn beat_spans_cut_every_four_beats_normally() {
+        let spans = beat_spans(&grid_120bpm(20.0), 10.0);
+        // 4 beats at 120 BPM = 2 s per span, 5 spans in 10 s.
+        assert_eq!(spans.len(), 5, "{spans:?}");
+        assert!((spans[0].1 - spans[0].0 - 2.0).abs() < 1e-9);
+        assert_eq!(spans[0].0, 0.0, "lead-in merges into the first span");
+    }
+
+    #[test]
+    fn beat_spans_densify_in_high_energy_sections() {
+        let mut grid = grid_120bpm(20.0);
+        grid.high_energy = vec![(4.0, 8.0)];
+        let spans = beat_spans(&grid, 12.0);
+        let in_hot: Vec<f64> = spans
+            .iter()
+            .filter(|(a, _)| *a >= 4.0 && *a < 8.0)
+            .map(|(a, b)| b - a)
+            .collect();
+        assert!(!in_hot.is_empty());
+        assert!(
+            in_hot.iter().all(|d| (*d - 1.0).abs() < 1e-9),
+            "2-beat cuts in the hot section: {in_hot:?}"
+        );
+    }
+
+    #[test]
+    fn plan_synced_fills_spans_and_ends_when_shots_run_out() {
+        let grid = grid_120bpm(30.0);
+        // Two strong hits for many spans: reel ends after two spans.
+        let results = vec![hit(0.5, Some(5.0), Some(60.0)), hit(0.5, None, None)];
+        let p = plan_synced(&results, &grid, 20.0, &lib(), &HashMap::new());
+        assert_eq!(p.segments.len(), 2);
+        assert!((p.segments[0].secs() - 2.0).abs() < 1e-9, "span-sized clip");
+        assert!((p.total_secs - 4.0).abs() < 1e-9);
+        match &p.segments[1] {
+            Segment::Photo(_, secs) => assert!((*secs - 2.0).abs() < 1e-9),
+            _ => panic!("expected photo"),
+        }
     }
 
     #[test]

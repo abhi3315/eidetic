@@ -21,6 +21,8 @@ Written in Rust.
   - `--fields score,ts,date,path`: tab-separated column output
   - `--json`: full JSON array
 - `eidetic reel "sunset at the beach"`: cut a short mp4 from the best-matching photos and video moments (needs ffmpeg)
+  - `--audio track.mp3`: detect the track's beats (pure-Rust Ellis tracker) and land every cut on the grid — 4 beats per shot normally, 2 in high-energy sections — with the music laid underneath and faded out. Tracks with no stable tempo fall back to fixed-length cuts
+  - `--portrait`: 1080x1920 with cover-crop (no black bars) — the Instagram/Shorts format
   - Video hits become ~4s clips around the matched frame, snapped inside the shot's scene boundaries so cuts never splice across shots; photos hold 3s with a Ken Burns push-in
   - `--duration N` target seconds (default 30), `--size WxH` (default 1920x1080), `--output file`, `--dry-run` to print the cut list
 - `eidetic faces`: detect faces in imported images and videos, then group them into people

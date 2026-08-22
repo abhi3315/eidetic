@@ -1,3 +1,4 @@
+pub mod beats;
 mod error;
 mod hasher;
 mod import;

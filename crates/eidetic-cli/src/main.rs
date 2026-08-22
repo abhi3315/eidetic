@@ -114,6 +114,16 @@ enum Command {
         #[arg(long, default_value = "1920x1080")]
         size: String,
 
+        /// Music track to cut to: beats are detected and cuts land on them;
+        /// the audio is laid under the reel with a fade-out.
+        #[arg(long)]
+        audio: Option<PathBuf>,
+
+        /// Vertical 1080x1920 with cover-crop (no black bars) — the
+        /// Instagram/Shorts format. Overrides --size.
+        #[arg(long)]
+        portrait: bool,
+
         /// Print the cut list without rendering.
         #[arg(long)]
         dry_run: bool,
@@ -994,6 +1004,8 @@ async fn main() -> anyhow::Result<()> {
             duration,
             output,
             size,
+            audio,
+            portrait,
             dry_run,
         } => {
             let (w, h) = size
@@ -1001,6 +1013,12 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
                 .filter(|(w, h)| *w > 0 && *h > 0)
                 .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
+            let (w, h) = if portrait { (1080, 1920) } else { (w, h) };
+            let fit = if portrait {
+                reel::Fit::Cover
+            } else {
+                reel::Fit::Pad
+            };
             if !dry_run && output.exists() {
                 anyhow::bail!(
                     "{} already exists; pass a different --output",
@@ -1047,7 +1065,49 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let plan = reel::plan(&results, duration, &config.paths.library_dir, &scenes);
+            // With --audio: detect beats and sync cuts to them; the reel
+            // runs at most as long as the track. A track with no stable
+            // tempo (or missing ffmpeg) falls back to the fixed-window plan.
+            let mut grid = None;
+            let mut total = duration;
+            if let Some(track) = &audio {
+                if !track.exists() {
+                    anyhow::bail!("audio file not found: {}", track.display());
+                }
+                let track_clone = track.clone();
+                let pcm = tokio::task::spawn_blocking(move || {
+                    eidetic_ingest::video::extract_audio_pcm(&track_clone)
+                })
+                .await
+                .context("audio thread panicked")?
+                .context("failed to decode the audio track")?
+                .ok_or_else(|| anyhow::anyhow!("ffmpeg is required for --audio"))?;
+                let audio_len = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
+                total = duration.min(audio_len);
+                grid =
+                    tokio::task::spawn_blocking(move || eidetic_ingest::beats::track_beats(&pcm))
+                        .await
+                        .context("beat thread panicked")?;
+                match &grid {
+                    Some(g) => println!(
+                        "Beat grid: {:.1} BPM, {} beats, {} high-energy section(s)",
+                        g.bpm,
+                        g.beats.len(),
+                        g.high_energy.len()
+                    ),
+                    None => eprintln!(
+                        "No stable tempo found in {}; using fixed-length cuts.",
+                        track.display()
+                    ),
+                }
+            }
+
+            let plan = match &grid {
+                Some(g) => {
+                    reel::plan_synced(&results, g, total, &config.paths.library_dir, &scenes)
+                }
+                None => reel::plan(&results, total, &config.paths.library_dir, &scenes),
+            };
             if plan.segments.is_empty() {
                 anyhow::bail!(
                     "nothing in the library matches {prompt:?} confidently enough for a reel"
@@ -1068,9 +1128,12 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Rendering {w}x{h} @ 30fps…");
             let render_output = output.clone();
-            tokio::task::spawn_blocking(move || reel::render(&plan, &render_output, w, h))
-                .await
-                .context("render thread panicked")??;
+            let audio_clone = audio.clone();
+            tokio::task::spawn_blocking(move || {
+                reel::render(&plan, &render_output, w, h, fit, audio_clone.as_deref())
+            })
+            .await
+            .context("render thread panicked")??;
             println!("Wrote {}", output.display());
         }
 
