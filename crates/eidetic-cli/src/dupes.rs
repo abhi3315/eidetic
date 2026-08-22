@@ -28,6 +28,9 @@ pub const VIDEO_THRESHOLD: f32 = 0.97;
 pub struct DupePair {
     pub a: (AssetId, PathBuf),
     pub b: (AssetId, PathBuf),
+    /// Kept for tests and future "show confidence" output; the group
+    /// listing itself doesn't print it yet.
+    #[allow(dead_code)]
     pub similarity: f32,
 }
 
@@ -38,10 +41,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// All photo pairs above `threshold`. Quadratic scan — fine at personal
 /// scale (10k photos ≈ seconds); an ANN prefilter is the escalation if a
 /// library ever makes this slow.
-pub fn photo_pairs(
-    photos: &[(AssetId, PathBuf, Vec<f32>)],
-    threshold: f32,
-) -> Vec<DupePair> {
+pub fn photo_pairs(photos: &[(AssetId, PathBuf, Vec<f32>)], threshold: f32) -> Vec<DupePair> {
     let mut out = Vec::new();
     for i in 0..photos.len() {
         for j in i + 1..photos.len() {
@@ -87,10 +87,7 @@ fn video_similarity(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 }
 
 /// All video pairs above `threshold`.
-pub fn video_pairs(
-    videos: &[(AssetId, PathBuf, Vec<Vec<f32>>)],
-    threshold: f32,
-) -> Vec<DupePair> {
+pub fn video_pairs(videos: &[(AssetId, PathBuf, Vec<Vec<f32>>)], threshold: f32) -> Vec<DupePair> {
     let mut out = Vec::new();
     for i in 0..videos.len() {
         for j in i + 1..videos.len() {
@@ -133,7 +130,10 @@ pub fn group(pairs: &[DupePair]) -> Vec<Vec<(AssetId, PathBuf)>> {
     let members: Vec<AssetId> = paths.keys().copied().collect();
     for id in members {
         let root = find(&mut parent, id);
-        groups.entry(root).or_default().push((id, paths[&id].clone()));
+        groups
+            .entry(root)
+            .or_default()
+            .push((id, paths[&id].clone()));
     }
     let mut out: Vec<Vec<(AssetId, PathBuf)>> = groups.into_values().collect();
     for g in &mut out {
@@ -186,8 +186,16 @@ mod tests {
         let (a, b, c) = (AssetId::new(), AssetId::new(), AssetId::new());
         let p = |id, n: &str| (id, PathBuf::from(n));
         let pairs = vec![
-            DupePair { a: p(a, "a"), b: p(b, "b"), similarity: 0.99 },
-            DupePair { a: p(b, "b"), b: p(c, "c"), similarity: 0.99 },
+            DupePair {
+                a: p(a, "a"),
+                b: p(b, "b"),
+                similarity: 0.99,
+            },
+            DupePair {
+                a: p(b, "b"),
+                b: p(c, "c"),
+                similarity: 0.99,
+            },
         ];
         let groups = group(&pairs);
         assert_eq!(groups.len(), 1);

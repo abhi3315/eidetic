@@ -91,6 +91,16 @@ pub struct SearchResult {
     pub longitude: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DavAsset {
+    pub id: AssetId,
+    pub original_filename: String,
+    pub storage_path: PathBuf,
+    pub file_size: i64,
+    pub mime_type: Option<String>,
+    pub taken: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub struct PlaybackCandidate {
     pub id: AssetId,
@@ -775,6 +785,34 @@ impl AssetsRepo {
             }
         }
         Ok(out)
+    }
+
+    /// Everything the WebDAV tree needs, one row per asset. `taken` falls
+    /// back to import time so undated files still land somewhere sensible.
+    pub async fn fetch_dav_listing(&self) -> crate::Result<Vec<DavAsset>> {
+        type Row = (String, String, String, i64, Option<String>, DateTime<Utc>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, original_filename, storage_path, file_size, mime_type, \
+                    COALESCE(date_taken, imported_at) AS taken \
+             FROM assets WHERE mime_type IS NOT NULL \
+             ORDER BY taken, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, original_filename, storage_path, file_size, mime_type, taken)| DavAsset {
+                    id: parse_id(&id),
+                    original_filename,
+                    storage_path: PathBuf::from(storage_path),
+                    file_size,
+                    mime_type,
+                    taken,
+                },
+            )
+            .collect())
     }
 
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.

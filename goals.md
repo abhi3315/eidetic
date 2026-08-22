@@ -19,7 +19,7 @@ One person: me. My personal photo library, on my own hardware.
 
 - **Not a SaaS.** No multi-tenant features, ever.
 - **Not a competitor to Immich or PhotoPrism.** Different purpose: learning Rust deeply on a real systems project, plus owning a media engine end-to-end.
-- **Not a UI project.** CLI and (eventual) WebDAV are the only interfaces.
+- **Not a UI project.** CLI and WebDAV are the only interfaces (WebDAV shipped read-only in v0.6).
 
 ## Anti-goals
 

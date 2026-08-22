@@ -88,6 +88,108 @@ async fn seed_asset(
 }
 
 #[tokio::test]
+async fn dav_propfind_walks_the_virtual_tree_and_get_serves_bytes() {
+    let (router, repo, _faces, _tmp) = fixture().await;
+    let id = seed_asset(&repo, &_tmp, "clip.jpg", "image/jpeg", b"JPEGBYTES", 0x31).await;
+    let _ = id;
+
+    // Root listing: 207 with at least one year collection.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PROPFIND")
+                .uri("/dav/")
+                .header("Depth", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .into_owned();
+    assert!(body.contains("<D:collection/>"), "{body}");
+    let year = body
+        .split("/dav/")
+        .nth(2)
+        .and_then(|s| s.split('/').next())
+        .expect("a year href")
+        .to_string();
+
+    // Walk to the month, then list files.
+    let month_list = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PROPFIND")
+                .uri(format!("/dav/{year}/"))
+                .header("Depth", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(month_list.status(), StatusCode::MULTI_STATUS);
+    let body = String::from_utf8_lossy(&month_list.into_body().collect().await.unwrap().to_bytes())
+        .into_owned();
+    let month = body
+        .split(&format!("/dav/{year}/"))
+        .nth(2)
+        .and_then(|s| s.split('/').next())
+        .expect("a month href")
+        .to_string();
+
+    let files = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PROPFIND")
+                .uri(format!("/dav/{year}/{month}/"))
+                .header("Depth", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&files.into_body().collect().await.unwrap().to_bytes())
+        .into_owned();
+    assert!(body.contains("clip.jpg"), "{body}");
+    assert!(
+        body.contains("<D:getcontentlength>9</D:getcontentlength>"),
+        "{body}"
+    );
+
+    // GET the file through DAV.
+    let got = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/dav/{year}/{month}/clip.jpg"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let bytes = got.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], b"JPEGBYTES");
+
+    // Read-only: PUT is refused.
+    let put = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/dav/{year}/{month}/new.jpg"))
+                .body(Body::from("x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn play_without_transcode_copy_returns_404() {
     let (router, repo, _faces, _tmp) = fixture().await;
     let id = seed_asset(&repo, &_tmp, "clip.mp4", "video/mp4", b"stub", 0x77).await;

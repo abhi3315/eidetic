@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod dav;
 mod handlers;
 mod views;
 
@@ -142,6 +143,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/persons", get(handlers::persons_index))
         .route("/persons/{id}", get(handlers::person_detail))
         .route("/faces/{id}/crop", get(handlers::face_crop))
+        .route("/dav", axum::routing::any(dav::dav))
+        .route("/dav/", axum::routing::any(dav::dav))
+        .route("/dav/{*path}", axum::routing::any(dav::dav))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

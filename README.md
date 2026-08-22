@@ -34,7 +34,7 @@ Written in Rust.
 - `eidetic name-person <id> <name>`: name a person
 - `eidetic transcribe`: transcribe speech in videos with Whisper (needs a `--features speech` build), so search finds spoken words — "ask not what your country" returns the video where it's said, at the moment it's said, ranked above visual matches. Transcripts are recall fuel, never displayed as subtitles: casual home audio transcribes too roughly to show. Silent tracks are skipped by an energy gate
 - `eidetic transcode`: generate browser-playable H.264 copies of videos whose codec or container browsers can't stream (HEVC iPhone footage, MKV). Cheap remux when only the container is wrong; originals never touched; the web player picks the copy automatically
-- `eidetic serve`: localhost web viewer — thumbnail grid (videos play inline with seeking), semantic search, per-asset detail, and a People section with face-crop grids per person (naming stays in the CLI)
+- `eidetic serve`: localhost web viewer — thumbnail grid (videos play inline with seeking), semantic search, per-asset detail, and a People section with face-crop grids per person (naming stays in the CLI). Also exposes the library read-only over **WebDAV** at `/dav/` in a virtual `year/month/filename` tree — mount it from any file manager (`dav://127.0.0.1:8080/dav/`)
 - `eidetic dupes`: report perceptual duplicates — re-exported photos, re-encoded/remuxed/truncated copies of videos — by comparing the SigLIP embeddings the library already stores. Reporting only; nothing is deleted
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>`: SHA-256 a file, no setup needed

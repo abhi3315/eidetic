@@ -1341,7 +1341,10 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to load frame embeddings")?;
 
-            let video_threshold = (threshold - 0.015).clamp(0.5, 1.0);
+            // Videos use their own default; a custom --threshold shifts both
+            // by the same amount relative to the photo default.
+            let video_threshold =
+                (dupes::VIDEO_THRESHOLD + (threshold - dupes::PHOTO_THRESHOLD)).clamp(0.5, 1.0);
             let mut pairs = dupes::photo_pairs(&photos, threshold);
             pairs.extend(dupes::video_pairs(&videos, video_threshold));
 
