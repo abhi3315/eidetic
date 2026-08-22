@@ -2,6 +2,34 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.5.0 — 2026-08-22
+
+The "video intelligence" release — the four features scoped in [goals-v0.5.md](goals-v0.5.md), each validated against market research before a line was written. Highlights: videos now play in every browser, people are found *inside* videos, reels cut on shot boundaries, and search understands what was *said* — a capability no photo manager ships, Google and Apple included.
+
+### Added
+
+- **`eidetic transcode`** — browser-playback copies for videos whose codec/container browsers can't stream (HEVC iPhone footage, MKV). The policy is a codec×container compatibility matrix in one place (`eidetic-core::playback`); a safe codec in the wrong container remuxes near-instantly instead of re-encoding. Copies live under `.playback/`; originals are never touched; the web player picks `/raw`, the `/play` copy, or explains what to run. Range/206 on both.
+- **Faces in videos** — `eidetic faces` scans the sampled frames of each video. Video faces pass a stricter quality gate (score ≥ 0.7, ≥ 48 px), collapse near-duplicates across frames to the sharpest instance, and may *join* existing photo-built people but never seed new person candidates or serve as matching exemplars — compression artifacts are the classic cluster poison. Person pages deep-link to the moment someone appears (`?t=` → media fragment), with a ▶ badge on video face crops.
+- **Scene-aware sampling and reel cuts** — scene boundaries detected once per video (ffmpeg scene filter, persisted in `video_scenes` with a single-shot sentinel). Frame sampling takes one frame per shot (duration-scaled, up to 24) instead of five fixed offsets; `eidetic faces` shares the same timestamps; reel clips stay inside the shot containing the matched moment — no mid-shot slices, no splicing across cuts.
+- **Speech search** (`--features speech`) — `eidetic transcribe` runs Whisper over video audio (silent tracks skipped by an energy gate) into an FTS5-indexed transcript store; search merges spoken-word hits into the ranking above visual matches, with the snippet and jump timestamp (`said: "…"`). Transcripts are recall fuel, never subtitles. Off by default: whisper.cpp needs cmake, and default builds stay free of native build deps.
+- **CUDA verified on Blackwell** — ONNX Runtime 1.29 + cuDNN 9.25 via `ORT_DYLIB_PATH` drives the RTX 5070 Ti: ~22× less CPU time embedding, identical rankings. Recipe in the README; a cuda build without `ORT_DYLIB_PATH` now fails loudly instead of letting ort silently download a CPU-only runtime mid-command.
+
+### Changed
+
+- Logs go to stderr; stdout is pipeable data (`search --json | jq` works bare).
+- ADR-0007's deferred model decision is settled with data: on COCO-1K, so400m beats base by only ~2 points Recall@1 (70.5 vs 68.6) at 3× the size and compute — `base` stays the default.
+
+### Verified end-to-end on real media
+
+- HEVC portrait video re-encoded and served with seeking; an MKV remuxed in under a second; plain MP4s keep serving originals. Found live: `infer` reports MKV as `video/webm` (same EBML magic), which is why the playback policy is a compatibility matrix, not two allowlists.
+- The Serena pan video's face joined the existing Serena person (0.945 @0.5s); Sintel's two detected *animated* faces stayed unassigned without creating any person — the no-seed policy working on the first try.
+- Sintel: 7 scene boundaries, frames on shot midpoints; a reel moment at 1.2s cut exactly [0.0s +2.4s] — the whole first shot, stopping at the 2.42s cut.
+- A video muxed with the JFK sample: three clean Whisper segments; searching "ask not what your country can do for you" returns it first with the snippet; 7 silent videos never reached Whisper.
+
+### Internals
+
+- Migrations 005–008: `playback_path`, `faces.ts_secs`, `video_scenes`, `transcripts` + FTS5 + `transcript_runs`. New modules: `eidetic-core::playback`, `eidetic-ml::speech`. CI checks the speech feature builds.
+
 ## v0.4.0 — 2026-08-22
 
 The "videos are real media now" release — and with it, every feature goals.md set out to build is in: ingestion, semantic search, face grouping, and reels. Videos stop being placeholder tiles: they thumbnail, embed, search by *moment*, play in the browser, and get cut into prompt-driven reels. The web viewer grows a People section.
