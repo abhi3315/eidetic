@@ -724,6 +724,59 @@ impl AssetsRepo {
         }))
     }
 
+    /// Every image embedding with its path — input to near-duplicate
+    /// detection (`eidetic dupes`).
+    pub async fn fetch_all_image_embeddings(
+        &self,
+    ) -> crate::Result<Vec<(AssetId, PathBuf, Vec<f32>)>> {
+        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT e.asset_id, a.storage_path, e.vector \
+             FROM embeddings e JOIN assets a ON a.id = e.asset_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        rows.into_iter()
+            .map(|(id, path, blob)| {
+                let v = vector::decode(&blob).ok_or_else(|| crate::Error::CorruptRow {
+                    table: "embeddings",
+                    column: "vector",
+                    detail: format!("asset {id}: ragged blob"),
+                })?;
+                Ok((parse_id(&id), PathBuf::from(path), v))
+            })
+            .collect()
+    }
+
+    /// Every video's frame embeddings, grouped per asset — input to
+    /// near-duplicate detection.
+    pub async fn fetch_all_frame_embedding_sets(
+        &self,
+    ) -> crate::Result<Vec<(AssetId, PathBuf, Vec<Vec<f32>>)>> {
+        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT f.asset_id, a.storage_path, f.vector \
+             FROM frame_embeddings f JOIN assets a ON a.id = f.asset_id \
+             ORDER BY f.asset_id, f.ts_secs",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        let mut out: Vec<(AssetId, PathBuf, Vec<Vec<f32>>)> = Vec::new();
+        for (id, path, blob) in rows {
+            let v = vector::decode(&blob).ok_or_else(|| crate::Error::CorruptRow {
+                table: "frame_embeddings",
+                column: "vector",
+                detail: format!("asset {id}: ragged blob"),
+            })?;
+            let asset = parse_id(&id);
+            match out.last_mut() {
+                Some((last, _, vecs)) if *last == asset => vecs.push(v),
+                _ => out.push((asset, PathBuf::from(path), vec![v])),
+            }
+        }
+        Ok(out)
+    }
+
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.

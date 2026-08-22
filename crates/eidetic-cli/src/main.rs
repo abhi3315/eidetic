@@ -1,3 +1,4 @@
+mod dupes;
 mod eval;
 mod reel;
 
@@ -123,6 +124,13 @@ enum Command {
     /// Transcribe speech in videos so search can find spoken words
     /// (needs a build with --features speech, plus ffmpeg).
     Transcribe,
+    /// Report perceptual duplicates: re-exported photos and re-encoded or
+    /// truncated copies of videos. Reporting only — nothing is deleted.
+    Dupes {
+        /// Similarity floor for photos (videos use a slightly looser one).
+        #[arg(long, default_value_t = dupes::PHOTO_THRESHOLD)]
+        threshold: f32,
+    },
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1315,6 +1323,51 @@ async fn main() -> anyhow::Result<()> {
                     println!("Done. Transcribed {done}, silent {silent}.");
                 }
             }
+        }
+
+        Command::Dupes { threshold } => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::AssetsRepo::new(pool);
+
+            let photos = repo
+                .fetch_all_image_embeddings()
+                .await
+                .context("failed to load image embeddings")?;
+            let videos = repo
+                .fetch_all_frame_embedding_sets()
+                .await
+                .context("failed to load frame embeddings")?;
+
+            let video_threshold = (threshold - 0.015).clamp(0.5, 1.0);
+            let mut pairs = dupes::photo_pairs(&photos, threshold);
+            pairs.extend(dupes::video_pairs(&videos, video_threshold));
+
+            if pairs.is_empty() {
+                println!(
+                    "No perceptual duplicates among {} photo(s) and {} video(s). \
+                     (Exact duplicates never import in the first place.)",
+                    photos.len(),
+                    videos.len()
+                );
+                return Ok(());
+            }
+
+            let groups = dupes::group(&pairs);
+            println!(
+                "{} duplicate group(s) across {} asset(s):",
+                groups.len(),
+                groups.iter().map(Vec::len).sum::<usize>()
+            );
+            for (i, members) in groups.iter().enumerate() {
+                println!("group {}:", i + 1);
+                for (_, path) in members {
+                    println!("  {}", path.display());
+                }
+            }
+            println!("Nothing was changed; review and delete by hand if warranted.");
         }
 
         Command::Search {
