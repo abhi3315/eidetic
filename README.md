@@ -22,7 +22,8 @@ Written in Rust.
   - `--json`: full JSON array
 - `eidetic reel "sunset at the beach"`: cut a short mp4 from the best-matching photos and video moments (needs ffmpeg)
   - `--audio track.mp3`: detect the track's beats (pure-Rust Ellis tracker) and land every cut on the grid — 4 beats per shot normally, 2 in high-energy sections — with the music laid underneath and faded out. Tracks with no stable tempo fall back to fixed-length cuts
-  - `--portrait`: 1080x1920 with cover-crop (no black bars) — the Instagram/Shorts format
+  - `--portrait`: 1080x1920 — the Instagram/Shorts format. Framing is per-clip auto: shots with faces get a face-following cover-crop; scenic shots render fit-inside over a blurred backdrop (no black bars, no butchered panoramas). Force a style with `--frame cover|blur|pad`
+  - **Voiceover mode** (speech build): when `--audio` is narration rather than music, Whisper transcribes it and each spoken span auto-selects the best-matching shot — "here we reached Pangong" puts the Pangong clip on screen while you say it. Mode is detected automatically: beats → music-synced, speech → voiceover, neither → fixed cuts
   - Video hits become ~4s clips around the matched frame, snapped inside the shot's scene boundaries so cuts never splice across shots; photos hold 3s with a Ken Burns push-in
   - `--duration N` target seconds (default 30), `--size WxH` (default 1920x1080), `--output file`, `--dry-run` to print the cut list
 - `eidetic faces`: detect faces in imported images and videos, then group them into people

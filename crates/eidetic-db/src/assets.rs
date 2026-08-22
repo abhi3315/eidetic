@@ -67,6 +67,7 @@ pub struct LibraryStats {
     pub latest: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone)]
 pub struct SearchResult {
     pub id: AssetId,
     pub storage_path: PathBuf,

@@ -119,10 +119,15 @@ enum Command {
         #[arg(long)]
         audio: Option<PathBuf>,
 
-        /// Vertical 1080x1920 with cover-crop (no black bars) — the
-        /// Instagram/Shorts format. Overrides --size.
+        /// Vertical 1080x1920 — the Instagram/Shorts format. Overrides
+        /// --size. Framing defaults to auto: see --frame.
         #[arg(long)]
         portrait: bool,
+
+        /// Framing style: auto (faces → follow them with a cover-crop;
+        /// scenic shots → fit over a blurred backdrop), cover, blur, pad.
+        #[arg(long, default_value = "auto")]
+        frame: String,
 
         /// Print the cut list without rendering.
         #[arg(long)]
@@ -1006,6 +1011,7 @@ async fn main() -> anyhow::Result<()> {
             size,
             audio,
             portrait,
+            frame,
             dry_run,
         } => {
             let (w, h) = size
@@ -1014,10 +1020,17 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|(w, h)| *w > 0 && *h > 0)
                 .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
             let (w, h) = if portrait { (1080, 1920) } else { (w, h) };
-            let fit = if portrait {
-                reel::Fit::Cover
-            } else {
-                reel::Fit::Pad
+            let fit = match frame.as_str() {
+                "auto" if portrait => reel::Fit::Auto,
+                // Landscape output fits landscape sources anyway; auto keeps
+                // the classic pad there.
+                "auto" => reel::Fit::Pad,
+                "cover" => reel::Fit::Cover,
+                "blur" => reel::Fit::Blur,
+                "pad" => reel::Fit::Pad,
+                other => {
+                    anyhow::bail!("invalid --frame {other:?}; valid values: auto, cover, blur, pad")
+                }
             };
             if !dry_run && output.exists() {
                 anyhow::bail!(
@@ -1069,6 +1082,8 @@ async fn main() -> anyhow::Result<()> {
             // runs at most as long as the track. A track with no stable
             // tempo (or missing ffmpeg) falls back to the fixed-window plan.
             let mut grid = None;
+            #[allow(unused_mut)]
+            let mut voiceover_segments: Option<Vec<(f64, f64, String)>> = None;
             let mut total = duration;
             if let Some(track) = &audio {
                 if !track.exists() {
@@ -1084,10 +1099,12 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("ffmpeg is required for --audio"))?;
                 let audio_len = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
                 total = duration.min(audio_len);
-                grid =
-                    tokio::task::spawn_blocking(move || eidetic_ingest::beats::track_beats(&pcm))
-                        .await
-                        .context("beat thread panicked")?;
+                let pcm_for_beats = pcm.clone();
+                grid = tokio::task::spawn_blocking(move || {
+                    eidetic_ingest::beats::track_beats(&pcm_for_beats)
+                })
+                .await
+                .context("beat thread panicked")?;
                 match &grid {
                     Some(g) => println!(
                         "Beat grid: {:.1} BPM, {} beats, {} high-energy section(s)",
@@ -1095,18 +1112,119 @@ async fn main() -> anyhow::Result<()> {
                         g.beats.len(),
                         g.high_energy.len()
                     ),
-                    None => eprintln!(
-                        "No stable tempo found in {}; using fixed-length cuts.",
-                        track.display()
-                    ),
+                    None => {
+                        // Not music — maybe narration. With a speech build,
+                        // Whisper decides: spoken words drive the shot list
+                        // (voiceover mode); otherwise fixed-length cuts.
+                        #[cfg(feature = "speech")]
+                        {
+                            let models_dir = config.paths.models_cache.clone();
+                            let segments =
+                                tokio::task::spawn_blocking(move || -> eidetic_ml::Result<_> {
+                                    let t =
+                                        eidetic_ml::speech::SpeechTranscriber::load(&models_dir)?;
+                                    t.transcribe(&pcm)
+                                })
+                                .await
+                                .context("transcription thread panicked")?
+                                .context("failed to transcribe the audio track")?;
+                            if segments.is_empty() {
+                                eprintln!(
+                                    "No stable tempo and no speech in {}; using fixed-length cuts.",
+                                    track.display()
+                                );
+                            } else {
+                                println!(
+                                    "Voiceover mode: {} spoken segment(s) drive the shot list",
+                                    segments.len()
+                                );
+                                voiceover_segments = Some(
+                                    segments
+                                        .into_iter()
+                                        .map(|s| (s.start_secs, s.end_secs, s.text))
+                                        .collect::<Vec<_>>(),
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "speech"))]
+                        {
+                            let _unused = pcm;
+                            eprintln!(
+                                "No stable tempo found in {} (voiceover mode needs a \
+                                 --features speech build); using fixed-length cuts.",
+                                track.display()
+                            );
+                        }
+                    }
                 }
             }
 
-            let plan = match &grid {
-                Some(g) => {
-                    reel::plan_synced(&results, g, total, &config.paths.library_dir, &scenes)
+            let mut focus = framing_focus(&config, &repo, &results).await?;
+
+            // Voiceover: each spoken span becomes a search; its best
+            // un-recently-used hit becomes the shot for exactly that span.
+            let mut voiceover_pairs: Option<Vec<(f64, eidetic_db::SearchResult)>> = None;
+            if let Some(segments) = &voiceover_segments {
+                let spans = reel::speech_spans(segments, 2.5, 8.0, total);
+                let texts: Vec<String> = spans.iter().map(|s| s.2.clone()).collect();
+                let models_dir = config.paths.models_cache.clone();
+                let embs =
+                    tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<Vec<f32>>> {
+                        let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                        texts.iter().map(|t| e.embed_text(t)).collect()
+                    })
+                    .await
+                    .context("embedder thread panicked")?
+                    .context("failed to embed narration")?;
+
+                let mut pairs = Vec::with_capacity(spans.len());
+                let mut prev: Option<eidetic_core::AssetId> = None;
+                for ((start, end, text), emb) in spans.iter().zip(&embs) {
+                    let hits = repo
+                        .search(text, emb, 5)
+                        .await
+                        .context("voiceover search failed")?;
+                    let chosen = hits
+                        .iter()
+                        .find(|h| Some(h.id) != prev)
+                        .or_else(|| hits.first());
+                    if let Some(hit) = chosen {
+                        prev = Some(hit.id);
+                        pairs.push((end - start, hit.clone()));
+                    }
                 }
-                None => reel::plan(&results, total, &config.paths.library_dir, &scenes),
+                voiceover_pairs = Some(pairs);
+            }
+
+            let plan = match (&voiceover_pairs, &grid) {
+                (Some(pairs), _) => {
+                    // Framing and scene data for the chosen shots (they may
+                    // not overlap the prompt's search results).
+                    let chosen: Vec<eidetic_db::SearchResult> =
+                        pairs.iter().map(|(_, r)| r.clone()).collect();
+                    focus.extend(framing_focus(&config, &repo, &chosen).await?);
+                    let mut all_scenes = scenes.clone();
+                    for r in &chosen {
+                        if r.frame_ts.is_some()
+                            && let Some(s) = repo
+                                .fetch_video_scenes(r.id)
+                                .await
+                                .context("failed to load scene boundaries")?
+                        {
+                            all_scenes.insert(r.id, s);
+                        }
+                    }
+                    reel::plan_assigned(pairs, &config.paths.library_dir, &all_scenes, &focus)
+                }
+                (None, Some(g)) => reel::plan_synced(
+                    &results,
+                    g,
+                    total,
+                    &config.paths.library_dir,
+                    &scenes,
+                    &focus,
+                ),
+                (None, None) => reel::plan(&results, total, &config.paths.library_dir, &scenes),
             };
             if plan.segments.is_empty() {
                 anyhow::bail!(
@@ -1519,6 +1637,58 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Face-aware framing data (goals-v0.7.md phase 1b): which assets have
+/// faces (auto framing: faces → follow them with a cover-crop; none →
+/// scenic blur-fill), and the weighted horizontal face centre for videos.
+async fn framing_focus(
+    config: &Config,
+    repo: &eidetic_db::AssetsRepo,
+    results: &[eidetic_db::SearchResult],
+) -> anyhow::Result<std::collections::HashMap<eidetic_core::AssetId, f64>> {
+    use anyhow::Context;
+    let mut focus = std::collections::HashMap::new();
+    let faces_repo = eidetic_db::FacesRepo::new(
+        eidetic_db::connect(config)
+            .await
+            .context("failed to connect to database")?,
+    );
+    for r in results {
+        if focus.contains_key(&r.id) {
+            continue;
+        }
+        let faces = faces_repo
+            .fetch_face_boxes_for_asset(r.id)
+            .await
+            .context("failed to load faces for framing")?;
+        if faces.is_empty() {
+            continue;
+        }
+        // Photos only need presence (Ken Burns centres itself); videos get
+        // a weighted horizontal centre when the pixel width is known.
+        let mut fx = 0.5;
+        if r.frame_ts.is_some()
+            && let Some(width) = repo
+                .fetch_by_id(r.id)
+                .await
+                .context("failed to load asset for framing")?
+                .and_then(|d| d.pixel_width)
+                .filter(|w| *w > 0)
+        {
+            let mut weight = 0.0f64;
+            let mut cx = 0.0f64;
+            for ((x, _, w, _), score) in &faces {
+                cx += (x + w / 2.0) as f64 * *score as f64;
+                weight += *score as f64;
+            }
+            if weight > 0.0 {
+                fx = (cx / weight / width as f64).clamp(0.0, 1.0);
+            }
+        }
+        focus.insert(r.id, fx);
+    }
+    Ok(focus)
 }
 
 /// Scene-aware sample timestamps for a video: detect scene boundaries once

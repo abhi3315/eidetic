@@ -36,15 +36,21 @@ pub struct ReelPlan {
 pub enum Segment {
     /// (source, clip start seconds, clip length seconds)
     VideoClip(PathBuf, f64, f64),
-    /// (source photo, hold seconds)
+    /// Like VideoClip, with a horizontal focus point (0..1 of source width)
+    /// the cover-crop window centres on — where the faces are.
+    VideoClipFocus(PathBuf, f64, f64, f64),
+    /// (source photo, hold seconds) — Ken Burns cover-crop.
     Photo(PathBuf, f64),
+    /// (source photo, hold seconds) — scenic: fit-inside over a blurred
+    /// cover background, no crop. For panoramas and faceless landscapes.
+    PhotoScenic(PathBuf, f64),
 }
 
 impl Segment {
     fn secs(&self) -> f64 {
         match self {
-            Segment::VideoClip(_, _, len) => *len,
-            Segment::Photo(_, secs) => *secs,
+            Segment::VideoClip(_, _, len) | Segment::VideoClipFocus(_, _, len, _) => *len,
+            Segment::Photo(_, secs) | Segment::PhotoScenic(_, secs) => *secs,
         }
     }
 
@@ -53,7 +59,13 @@ impl Segment {
             Segment::VideoClip(p, start, len) => {
                 format!("{} [{start:.1}s +{len:.1}s]", p.display())
             }
+            Segment::VideoClipFocus(p, start, len, fx) => {
+                format!("{} [{start:.1}s +{len:.1}s, focus x={fx:.2}]", p.display())
+            }
             Segment::Photo(p, secs) => format!("{} [photo, {secs:.1}s]", p.display()),
+            Segment::PhotoScenic(p, secs) => {
+                format!("{} [photo scenic, {secs:.1}s]", p.display())
+            }
         }
     }
 }
@@ -108,9 +120,25 @@ pub fn plan(
 pub enum Fit {
     /// Fit inside, pad with black (the landscape default).
     Pad,
-    /// Fill the frame, crop the overflow — what vertical/Instagram output
-    /// wants; black side bars are the loudest auto-generated tell.
+    /// Fill the frame, crop the overflow.
     Cover,
+    /// Fit inside over a blurred, darkened cover of itself — the cinematic
+    /// treatment for scenic footage in a mismatched frame: no black bars,
+    /// no butchered panoramas.
+    Blur,
+    /// Per-clip: faces present → Cover (following them); no faces → Blur.
+    Auto,
+}
+
+impl Fit {
+    /// Resolve Auto per segment: `focused` = this clip has face data.
+    fn resolve(self, focused: bool) -> Fit {
+        match self {
+            Fit::Auto if focused => Fit::Cover,
+            Fit::Auto => Fit::Blur,
+            other => other,
+        }
+    }
 }
 
 /// Render the plan to `output` at `width`x`height`, 30fps, H.264. With
@@ -142,7 +170,16 @@ pub fn render(
                 .arg("-i")
                 .arg(src)
                 .args(["-t", &format!("{len:.3}")])
-                .args(["-vf", &normalize_filter(width, height, fit)])
+                .args(["-vf", &normalize_filter(width, height, fit.resolve(false))])
+                .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
+                .arg(&seg_path)
+                .status(),
+            Segment::VideoClipFocus(src, start, len, fx) => Command::new(ffmpeg)
+                .args(["-y", "-v", "error", "-ss", &format!("{start:.3}")])
+                .arg("-i")
+                .arg(src)
+                .args(["-t", &format!("{len:.3}")])
+                .args(["-vf", &focus_filter(width, height, fit.resolve(true), *fx)])
                 .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
                 .arg(&seg_path)
                 .status(),
@@ -152,6 +189,15 @@ pub fn render(
                 .arg(src)
                 .args(["-t", &format!("{secs:.3}")])
                 .args(["-vf", &ken_burns_filter(width, height, *secs)])
+                .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
+                .arg(&seg_path)
+                .status(),
+            Segment::PhotoScenic(src, secs) => Command::new(ffmpeg)
+                .args(["-y", "-v", "error", "-loop", "1"])
+                .arg("-i")
+                .arg(src)
+                .args(["-t", &format!("{secs:.3}")])
+                .args(["-vf", &blur_fill_filter(width, height)])
                 .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
                 .arg(&seg_path)
                 .status(),
@@ -267,6 +313,7 @@ pub fn plan_synced(
     total_secs: f64,
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
+    focus: &HashMap<AssetId, f64>,
 ) -> ReelPlan {
     let spans = beat_spans(grid, total_secs);
     let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
@@ -280,28 +327,7 @@ pub fn plan_synced(
     let mut total = 0.0;
     for ((_, end), r) in spans.iter().zip(&strong) {
         let span = end - total;
-        let seg = match r.frame_ts {
-            Some(ts) => {
-                let duration = r.duration_secs.unwrap_or(f64::MAX);
-                let span = span.min(duration);
-                let empty = Vec::new();
-                let bounds = scenes.get(&r.id).unwrap_or(&empty);
-                let shot_start = bounds
-                    .iter()
-                    .copied()
-                    .filter(|s| *s <= ts)
-                    .fold(0.0, f64::max);
-                // Start at the shot boundary when the span fits after it;
-                // otherwise center on the moment and clamp to the file.
-                let start = if duration - shot_start >= span && ts - shot_start <= span {
-                    shot_start
-                } else {
-                    (ts - span / 2.0).clamp(0.0, (duration - span).max(0.0))
-                };
-                Segment::VideoClip(r.storage_path.clone(), start, span)
-            }
-            None => Segment::Photo(photo_source(r, library_dir), span),
-        };
+        let seg = fill_span(r, span, library_dir, scenes, focus);
         total += seg.secs();
         segments.push(seg);
     }
@@ -309,6 +335,114 @@ pub fn plan_synced(
         segments,
         total_secs: total,
     }
+}
+
+/// One shot filling one span exactly: videos cut around their matched
+/// moment (shot-boundary aligned when possible; sync beats scene purity),
+/// photos hold — Ken Burns when faces are present, scenic blur-fill when
+/// not.
+fn fill_span(
+    r: &SearchResult,
+    span: f64,
+    library_dir: &Path,
+    scenes: &HashMap<AssetId, Vec<f64>>,
+    focus: &HashMap<AssetId, f64>,
+) -> Segment {
+    match r.frame_ts {
+        Some(ts) => {
+            let duration = r.duration_secs.unwrap_or(f64::MAX);
+            let span = span.min(duration);
+            let empty = Vec::new();
+            let bounds = scenes.get(&r.id).unwrap_or(&empty);
+            let shot_start = bounds
+                .iter()
+                .copied()
+                .filter(|s| *s <= ts)
+                .fold(0.0, f64::max);
+            // Start at the shot boundary when the span fits after it;
+            // otherwise center on the moment and clamp to the file.
+            let start = if duration - shot_start >= span && ts - shot_start <= span {
+                shot_start
+            } else {
+                (ts - span / 2.0).clamp(0.0, (duration - span).max(0.0))
+            };
+            match focus.get(&r.id) {
+                Some(fx) => Segment::VideoClipFocus(r.storage_path.clone(), start, span, *fx),
+                None => Segment::VideoClip(r.storage_path.clone(), start, span),
+            }
+        }
+        None if focus.contains_key(&r.id) => Segment::Photo(photo_source(r, library_dir), span),
+        None => Segment::PhotoScenic(photo_source(r, library_dir), span),
+    }
+}
+
+/// Voiceover plan: each pair is (span seconds, the shot chosen for what is
+/// being said during that span) — see `speech_spans` and the reel command.
+pub fn plan_assigned(
+    pairs: &[(f64, SearchResult)],
+    library_dir: &Path,
+    scenes: &HashMap<AssetId, Vec<f64>>,
+    focus: &HashMap<AssetId, f64>,
+) -> ReelPlan {
+    let mut segments = Vec::new();
+    let mut total = 0.0;
+    for (span, r) in pairs {
+        let seg = fill_span(r, *span, library_dir, scenes, focus);
+        total += seg.secs();
+        segments.push(seg);
+    }
+    ReelPlan {
+        segments,
+        total_secs: total,
+    }
+}
+
+/// Merge raw speech segments into presentation spans covering the narration
+/// contiguously from t=0: each span at least `min` seconds (visuals must
+/// not flash mid-sentence), split into equal slices when longer than `max`.
+/// Returns (start, end, spoken text) per span; the last span stretches to
+/// `total` so the tail of the narration keeps a picture.
+pub fn speech_spans(
+    segments: &[(f64, f64, String)],
+    min: f64,
+    max: f64,
+    total: f64,
+) -> Vec<(f64, f64, String)> {
+    let mut spans: Vec<(f64, f64, String)> = Vec::new();
+    let mut i = 0;
+    while i < segments.len() {
+        let start = spans.last().map(|s| s.1).unwrap_or(0.0);
+        if start >= total {
+            break;
+        }
+        let mut end = segments[i].1;
+        let mut text = segments[i].2.clone();
+        let mut j = i + 1;
+        while end - start < min && j < segments.len() {
+            end = segments[j].1;
+            text.push(' ');
+            text.push_str(&segments[j].2);
+            j += 1;
+        }
+        let end = end.min(total).max(start + min.min(total - start));
+        let len = end - start;
+        let slices = (len / max).ceil().max(1.0) as usize;
+        let slice = len / slices as f64;
+        for k in 0..slices {
+            spans.push((
+                start + k as f64 * slice,
+                start + (k + 1) as f64 * slice,
+                text.clone(),
+            ));
+        }
+        i = j;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.1 < total
+    {
+        last.1 = total;
+    }
+    spans
 }
 
 /// Where to cut a video segment around the matched moment `ts`.
@@ -359,6 +493,20 @@ fn photo_source(r: &SearchResult, library_dir: &Path) -> PathBuf {
     r.storage_path.clone()
 }
 
+/// Cover-crop centred on a horizontal focus point (0..1 of source width) —
+/// the crop window slides to keep faces in frame, clamped to the image.
+/// Pad mode has no crop to steer, so focus degrades to the plain filter.
+fn focus_filter(w: u32, h: u32, fit: Fit, fx: f64) -> String {
+    match fit {
+        Fit::Pad | Fit::Blur | Fit::Auto => normalize_filter(w, h, fit),
+        Fit::Cover => format!(
+            "scale={w}:{h}:force_original_aspect_ratio=increase,\
+             crop={w}:{h}:'clip(iw*{fx:.4}-ow/2,0,iw-ow)':'(ih-oh)/2',\
+             fps=30,format=yuv420p"
+        ),
+    }
+}
+
 /// Fit the input to the frame per `fit`, normalise fps/pixfmt so concat's
 /// `-c copy` join is legal across segments.
 fn normalize_filter(w: u32, h: u32, fit: Fit) -> String {
@@ -371,7 +519,20 @@ fn normalize_filter(w: u32, h: u32, fit: Fit) -> String {
             "scale={w}:{h}:force_original_aspect_ratio=increase,\
              crop={w}:{h},fps=30,format=yuv420p"
         ),
+        Fit::Blur | Fit::Auto => blur_fill_filter(w, h),
     }
+}
+
+/// The cinematic mismatched-aspect treatment: the frame is a blurred,
+/// darkened cover of the clip, with the clip itself fitted inside intact.
+fn blur_fill_filter(w: u32, h: u32) -> String {
+    format!(
+        "split[bg][fg];\
+         [bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},\
+         boxblur=20:2,eq=brightness=-0.15[b];\
+         [fg]scale={w}:{h}:force_original_aspect_ratio=decrease[f];\
+         [b][f]overlay=(W-w)/2:(H-h)/2,fps=30,format=yuv420p"
+    )
 }
 
 /// Ken Burns for stills: cover-crop to the frame, then a slow centred
@@ -553,13 +714,22 @@ mod tests {
         let grid = grid_120bpm(30.0);
         // Two strong hits for many spans: reel ends after two spans.
         let results = vec![hit(0.5, Some(5.0), Some(60.0)), hit(0.5, None, None)];
-        let p = plan_synced(&results, &grid, 20.0, &lib(), &HashMap::new());
+        let p = plan_synced(
+            &results,
+            &grid,
+            20.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(p.segments.len(), 2);
         assert!((p.segments[0].secs() - 2.0).abs() < 1e-9, "span-sized clip");
         assert!((p.total_secs - 4.0).abs() < 1e-9);
         match &p.segments[1] {
-            Segment::Photo(_, secs) => assert!((*secs - 2.0).abs() < 1e-9),
-            _ => panic!("expected photo"),
+            // No face data in the test fixtures, so the photo renders
+            // scenic (blur-fill) — the auto-framing default.
+            Segment::PhotoScenic(_, secs) => assert!((*secs - 2.0).abs() < 1e-9),
+            other => panic!("expected scenic photo, got {}", other.describe()),
         }
     }
 

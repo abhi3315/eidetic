@@ -320,6 +320,25 @@ impl FacesRepo {
             .collect()
     }
 
+    /// Face boxes for one asset — (bbox x,y,w,h in original pixels, score).
+    /// Feeds face-aware reel framing.
+    pub async fn fetch_face_boxes_for_asset(
+        &self,
+        asset: AssetId,
+    ) -> crate::Result<Vec<((f32, f32, f32, f32), f32)>> {
+        let rows: Vec<(f32, f32, f32, f32, f32)> = sqlx::query_as(
+            "SELECT bbox_x, bbox_y, bbox_w, bbox_h, score FROM faces WHERE asset_id = ?",
+        )
+        .bind(id_text(asset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(rows
+            .into_iter()
+            .map(|(x, y, w, h, s)| ((x, y, w, h), s))
+            .collect())
+    }
+
     /// Create an unnamed person. Clustering produces candidates; naming is a
     /// separate, user-driven step.
     pub async fn create_person(&self) -> crate::Result<PersonId> {
