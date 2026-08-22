@@ -12,7 +12,9 @@
 //! robustness (a failed segment names its source file).
 
 use anyhow::{Context, Result, bail};
+use eidetic_core::AssetId;
 use eidetic_db::SearchResult;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,8 +63,15 @@ impl Segment {
 /// scoring below zero, or below [`RELATIVE_SCORE_FLOOR`] of the top hit,
 /// never enters the reel even if there is room.
 ///
-/// `library_dir` locates photo thumbnails — see [`photo_source`].
-pub fn plan(results: &[SearchResult], target_secs: f64, library_dir: &Path) -> ReelPlan {
+/// `library_dir` locates photo thumbnails — see [`photo_source`]. `scenes`
+/// holds per-video scene boundaries (empty entry or missing key = single
+/// shot / undetected) so cuts snap to shots — see [`clip_bounds`].
+pub fn plan(
+    results: &[SearchResult],
+    target_secs: f64,
+    library_dir: &Path,
+    scenes: &HashMap<AssetId, Vec<f64>>,
+) -> ReelPlan {
     let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
     let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
 
@@ -74,9 +83,9 @@ pub fn plan(results: &[SearchResult], target_secs: f64, library_dir: &Path) -> R
         }
         let seg = match r.frame_ts {
             Some(ts) => {
-                let duration = r.duration_secs.unwrap_or(f64::MAX);
-                let start = (ts - VIDEO_LEAD_SECS).max(0.0);
-                let len = VIDEO_CLIP_SECS.min(duration - start).max(1.0);
+                let empty = Vec::new();
+                let bounds = scenes.get(&r.id).unwrap_or(&empty);
+                let (start, len) = clip_bounds(ts, r.duration_secs, bounds);
                 Segment::VideoClip(r.storage_path.clone(), start, len)
             }
             None => Segment::Photo(photo_source(r, library_dir)),
@@ -155,6 +164,31 @@ pub fn render(plan: &ReelPlan, output: &Path, width: u32, height: u32) -> Result
     Ok(())
 }
 
+/// Where to cut a video segment around the matched moment `ts`.
+///
+/// The clip stays inside the shot containing `ts` (goals-v0.5.md #3): a cut
+/// mid-shot looks like an editing accident, and crossing a boundary splices
+/// in unrelated footage. Within the shot the usual window applies — up to
+/// [`VIDEO_LEAD_SECS`] of lead-in, [`VIDEO_CLIP_SECS`] total — and a shot
+/// shorter than the window is used whole.
+fn clip_bounds(ts: f64, duration_secs: Option<f64>, scenes: &[f64]) -> (f64, f64) {
+    let duration = duration_secs.unwrap_or(f64::MAX);
+    let shot_start = scenes
+        .iter()
+        .copied()
+        .filter(|s| *s <= ts)
+        .fold(0.0, f64::max);
+    let shot_end = scenes
+        .iter()
+        .copied()
+        .filter(|s| *s > ts)
+        .fold(duration, f64::min);
+
+    let start = (ts - VIDEO_LEAD_SECS).max(shot_start);
+    let len = (shot_end - start).min(VIDEO_CLIP_SECS).max(0.5);
+    (start, len)
+}
+
 /// The file ffmpeg should read for a photo segment.
 ///
 /// The original can be HEIC or DNG (which ffmpeg does not decode) and its
@@ -230,7 +264,7 @@ mod tests {
     fn plan_respects_target_duration() {
         // Ten strong photo hits at 3s each against a 10s target: 3 fit.
         let results: Vec<_> = (0..10).map(|_| hit(0.5, None, None)).collect();
-        let p = plan(&results, 10.0, &lib());
+        let p = plan(&results, 10.0, &lib(), &HashMap::new());
         assert_eq!(p.segments.len(), 3);
         assert!((p.total_secs - 9.0).abs() < 1e-9);
     }
@@ -238,21 +272,25 @@ mod tests {
     #[test]
     fn plan_drops_weak_tail_even_with_room() {
         let results = vec![hit(0.5, None, None), hit(0.1, None, None)];
-        let p = plan(&results, 60.0, &lib());
+        let p = plan(&results, 60.0, &lib(), &HashMap::new());
         assert_eq!(p.segments.len(), 1, "0.1 < 35% of 0.5 is padding");
     }
 
     #[test]
     fn plan_drops_non_positive_scores() {
         let results = vec![hit(0.0, None, None), hit(-0.2, None, None)];
-        assert!(plan(&results, 30.0, &lib()).segments.is_empty());
+        assert!(
+            plan(&results, 30.0, &lib(), &HashMap::new())
+                .segments
+                .is_empty()
+        );
     }
 
     #[test]
     fn video_clip_leads_into_the_moment_and_respects_bounds() {
         // Moment at 9s of a 10s video: start = 7.5, len clamped to 2.5.
         let results = vec![hit(0.5, Some(9.0), Some(10.0))];
-        let p = plan(&results, 30.0, &lib());
+        let p = plan(&results, 30.0, &lib(), &HashMap::new());
         match &p.segments[0] {
             Segment::VideoClip(_, start, len) => {
                 assert!((start - 7.5).abs() < 1e-9);
@@ -263,7 +301,7 @@ mod tests {
 
         // Moment at 0.5s: lead-in clamps to the file start.
         let results = vec![hit(0.5, Some(0.5), Some(10.0))];
-        match &plan(&results, 30.0, &lib()).segments[0] {
+        match &plan(&results, 30.0, &lib(), &HashMap::new()).segments[0] {
             Segment::VideoClip(_, start, len) => {
                 assert_eq!(*start, 0.0);
                 assert!((len - 4.0).abs() < 1e-9);
@@ -278,7 +316,7 @@ mod tests {
         let mut thumbed = hit(0.5, None, None);
         thumbed.storage_path = PathBuf::from(format!("/lib/ab/ab/{hash}.heic"));
         thumbed.thumbnails_generated = true;
-        let p = plan(&[thumbed], 30.0, &lib());
+        let p = plan(&[thumbed], 30.0, &lib(), &HashMap::new());
         match &p.segments[0] {
             Segment::Photo(src) => {
                 let s = src.to_str().unwrap();
@@ -290,16 +328,37 @@ mod tests {
 
         // No thumbnail -> the original is used as-is.
         let raw = hit(0.5, None, None);
-        match &plan(&[raw], 30.0, &lib()).segments[0] {
+        match &plan(&[raw], 30.0, &lib(), &HashMap::new()).segments[0] {
             Segment::Photo(src) => assert_eq!(src, &PathBuf::from("/x")),
             _ => panic!("expected a photo"),
         }
     }
 
     #[test]
+    fn clip_stays_inside_its_shot() {
+        // Moment at 10s, shot spans [8, 11) of a 60s video: the clip may not
+        // reach back past 8 nor forward past 11.
+        let (start, len) = clip_bounds(10.0, Some(60.0), &[8.0, 11.0, 20.0]);
+        assert_eq!(start, 8.5, "lead-in clamped to the shot start");
+        assert!((start + len - 11.0).abs() < 1e-9, "ends at the boundary");
+
+        // No scenes: the plain window applies.
+        let (start, len) = clip_bounds(10.0, Some(60.0), &[]);
+        assert_eq!((start, len), (8.5, 4.0));
+
+        // Tiny shot [9.8, 10.4): used whole, floored at half a second.
+        let (start, len) = clip_bounds(10.0, Some(60.0), &[9.8, 10.4]);
+        assert!((start - 9.8).abs() < 1e-9);
+        assert!((len - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
     fn plan_always_takes_at_least_one_strong_hit() {
         // Target shorter than the first segment still yields that segment.
         let results = vec![hit(0.5, Some(5.0), Some(60.0))];
-        assert_eq!(plan(&results, 1.0, &lib()).segments.len(), 1);
+        assert_eq!(
+            plan(&results, 1.0, &lib(), &HashMap::new()).segments.len(),
+            1
+        );
     }
 }

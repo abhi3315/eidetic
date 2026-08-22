@@ -488,7 +488,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                let timestamps = eidetic_ingest::video::sample_timestamps(duration);
+                let timestamps = scene_timestamps(&repo, id, &path, duration).await?;
                 let (reply_tx, reply_rx) = oneshot::channel();
                 if job_tx
                     .send(EmbedJob::Video(path.clone(), timestamps, reply_tx))
@@ -684,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
+            let assets_repo = eidetic_db::AssetsRepo::new(pool.clone());
             let faces_repo = eidetic_db::FacesRepo::new(pool);
 
             if !cluster_only {
@@ -846,7 +847,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let mut vid_found = 0u32;
                     for (i, (asset_id, path, duration)) in videos.into_iter().enumerate() {
-                        let timestamps = eidetic_ingest::video::sample_timestamps(duration);
+                        let timestamps =
+                            scene_timestamps(&assets_repo, asset_id, &path, duration).await?;
                         let (reply_tx, reply_rx) = oneshot::channel();
                         if job_tx
                             .send(FaceJob::Video(path.clone(), timestamps, reply_tx))
@@ -1018,7 +1020,22 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("search failed")?;
 
-            let plan = reel::plan(&results, duration, &config.paths.library_dir);
+            // Scene boundaries per video hit, so cuts snap to shots. Missing
+            // detection (imported pre-v0.5, or ffmpeg-less embed) just means
+            // plain windows for that video.
+            let mut scenes = std::collections::HashMap::new();
+            for r in &results {
+                if r.frame_ts.is_some()
+                    && let Some(s) = repo
+                        .fetch_video_scenes(r.id)
+                        .await
+                        .context("failed to load scene boundaries")?
+                {
+                    scenes.insert(r.id, s);
+                }
+            }
+
+            let plan = reel::plan(&results, duration, &config.paths.library_dir, &scenes);
             if plan.segments.is_empty() {
                 anyhow::bail!(
                     "nothing in the library matches {prompt:?} confidently enough for a reel"
@@ -1235,6 +1252,51 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Scene-aware sample timestamps for a video: detect scene boundaries once
+/// (a full decode), persist them, and reuse forever after. Both the embed
+/// and faces passes call this, so whichever runs first pays the decode.
+async fn scene_timestamps(
+    repo: &eidetic_db::AssetsRepo,
+    id: eidetic_core::AssetId,
+    path: &std::path::Path,
+    duration: Option<f64>,
+) -> anyhow::Result<Vec<f64>> {
+    use anyhow::Context;
+    let scenes = match repo
+        .fetch_video_scenes(id)
+        .await
+        .context("failed to load scene boundaries")?
+    {
+        Some(scenes) => scenes,
+        None => {
+            let p = path.to_path_buf();
+            let detected =
+                tokio::task::spawn_blocking(move || eidetic_ingest::video::detect_scenes(&p))
+                    .await
+                    .context("scene detection thread panicked")?;
+            match detected {
+                Ok(Some(s)) => {
+                    repo.store_video_scenes(id, &s)
+                        .await
+                        .context("failed to store scene boundaries")?;
+                    s
+                }
+                // ffmpeg missing or the file wouldn't decode for detection:
+                // fall back to even sampling rather than blocking the pass.
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e,
+                        "scene detection failed; using even sampling");
+                    Vec::new()
+                }
+            }
+        }
+    };
+    Ok(eidetic_ingest::video::scene_sample_timestamps(
+        duration, &scenes,
+    ))
 }
 
 /// Turn per-frame video detections into rows worth storing: a stricter

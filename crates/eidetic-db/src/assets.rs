@@ -508,6 +508,52 @@ impl AssetsRepo {
         Ok(())
     }
 
+    /// Replace a video's persisted scene boundaries (goals-v0.5.md #3).
+    ///
+    /// A sentinel row at ts = -1 always lands, so "detection ran and found a
+    /// single-shot video" (sentinel only) is distinguishable from "never
+    /// ran" (no rows) — without it, every pass over a single-shot video
+    /// would pay the full-decode detection again.
+    pub async fn store_video_scenes(&self, id: AssetId, scenes: &[f64]) -> crate::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
+        sqlx::query("DELETE FROM video_scenes WHERE asset_id = ?")
+            .bind(id_text(id))
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::Error::Query)?;
+        for ts in scenes.iter().filter(|ts| **ts >= 0.0).chain([&-1.0]) {
+            sqlx::query("INSERT INTO video_scenes (asset_id, ts_secs) VALUES (?, ?)")
+                .bind(id_text(id))
+                .bind(ts)
+                .execute(&mut *tx)
+                .await
+                .map_err(crate::Error::Query)?;
+        }
+        tx.commit().await.map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
+    /// Scene boundaries for one video, ascending (the ts=-1 sentinel is
+    /// filtered out). `None` when detection has never run; `Some(vec![])`
+    /// for a detected single-shot video.
+    pub async fn fetch_video_scenes(&self, id: AssetId) -> crate::Result<Option<Vec<f64>>> {
+        let rows: Vec<(f64,)> =
+            sqlx::query_as("SELECT ts_secs FROM video_scenes WHERE asset_id = ? ORDER BY ts_secs")
+                .bind(id_text(id))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            rows.into_iter()
+                .map(|(ts,)| ts)
+                .filter(|ts| *ts >= 0.0)
+                .collect(),
+        ))
+    }
+
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.

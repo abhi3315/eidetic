@@ -285,6 +285,101 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
     Ok(Some(()))
 }
 
+/// Scene-change threshold for ffmpeg's `scene` score. 0.3 catches soft cuts
+/// (matches PySceneDetect's default sensitivity); hard cuts score far above.
+const SCENE_THRESHOLD: f64 = 0.3;
+
+/// Detect scene-change timestamps with ffmpeg's scene filter.
+///
+/// This is a full decode of the video — the one expensive pass — so callers
+/// persist the result (`video_scenes`) and every later consumer reads it
+/// back. A single-shot video returns an empty Vec, which is a real answer,
+/// not a failure. `Ok(None)` when ffmpeg is missing.
+pub fn detect_scenes(path: &Path) -> Result<Option<Vec<f64>>> {
+    let Some(ffmpeg) = ffmpeg() else {
+        return Ok(None);
+    };
+    let output = Command::new(ffmpeg)
+        .args(["-v", "info", "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            &format!("select='gt(scene,{SCENE_THRESHOLD})',showinfo"),
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::VideoProbe {
+            path: path.to_path_buf(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    // showinfo logs one line per selected frame; pts_time is the timestamp.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut scenes: Vec<f64> = stderr
+        .lines()
+        .filter_map(|line| {
+            let idx = line.find("pts_time:")?;
+            line[idx + "pts_time:".len()..]
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    scenes.sort_by(f64::total_cmp);
+    scenes.dedup();
+    Ok(Some(scenes))
+}
+
+/// One sample per scene, capped and duration-scaled (goals-v0.5.md #3).
+///
+/// Scene boundaries split `[0, duration)` into shots; each shot contributes
+/// its midpoint. When there are more shots than the cap allows, the longest
+/// shots win (length is the cheap proxy for "this is where the content is").
+/// With no detected scenes — single-shot video, or detection unavailable —
+/// falls back to the plain even sampler.
+pub fn scene_sample_timestamps(duration_secs: Option<f64>, scenes: &[f64]) -> Vec<f64> {
+    let Some(d) = duration_secs.filter(|d| *d > 0.0) else {
+        return sample_timestamps(duration_secs);
+    };
+    if scenes.is_empty() {
+        return sample_timestamps(duration_secs);
+    }
+
+    // Shot list: [0, s1), [s1, s2), ..., [sn, d). Degenerate slivers under
+    // half a second are noise from rapid cuts and are dropped.
+    let mut bounds = Vec::with_capacity(scenes.len() + 2);
+    bounds.push(0.0);
+    bounds.extend(scenes.iter().copied().filter(|s| *s > 0.0 && *s < d));
+    bounds.push(d);
+    let mut shots: Vec<(f64, f64)> = bounds
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|(a, b)| b - a >= 0.5)
+        .collect();
+    if shots.is_empty() {
+        return sample_timestamps(duration_secs);
+    }
+
+    // Cap scales with duration: a 10s clip keeps ~5, a long video up to 24.
+    let cap = ((d / 5.0).round() as usize).clamp(5, 24);
+    if shots.len() > cap {
+        shots.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
+        shots.truncate(cap);
+    }
+
+    let mut ts: Vec<f64> = shots.iter().map(|(a, b)| (a + b) / 2.0).collect();
+    ts.sort_by(f64::total_cmp);
+    ts
+}
+
 /// The timestamp the single representative thumbnail frame is taken at:
 /// 10% in, but at least half a second (skipping fade-from-black openings),
 /// and never past the end.
@@ -459,6 +554,40 @@ mod tests {
         std::fs::write(&bad, b"not a video").unwrap();
         assert!(probe(&bad).is_err());
         assert!(extract_frame(&bad, 0.0).is_err());
+    }
+
+    #[test]
+    fn scene_sampling_takes_shot_midpoints() {
+        // 10s video, cuts at 4 and 7: shots [0,4) [4,7) [7,10) -> midpoints.
+        let ts = scene_sample_timestamps(Some(10.0), &[4.0, 7.0]);
+        assert_eq!(ts, vec![2.0, 5.5, 8.5]);
+    }
+
+    #[test]
+    fn scene_sampling_falls_back_without_scenes() {
+        assert_eq!(
+            scene_sample_timestamps(Some(10.0), &[]),
+            sample_timestamps(Some(10.0)),
+            "single-shot video uses the even sampler"
+        );
+        assert_eq!(scene_sample_timestamps(None, &[1.0]), vec![0.0]);
+    }
+
+    #[test]
+    fn scene_sampling_caps_by_longest_shots() {
+        // 20 rapid cuts every 0.6s in a 12s video -> cap is max(5, 12/5)=5;
+        // survivors are shots, all >= 0.5s, count capped.
+        let scenes: Vec<f64> = (1..20).map(|i| i as f64 * 0.6).collect();
+        let ts = scene_sample_timestamps(Some(12.0), &scenes);
+        assert!(ts.len() <= 5, "capped: {ts:?}");
+        assert!(ts.windows(2).all(|w| w[0] < w[1]), "sorted: {ts:?}");
+    }
+
+    #[test]
+    fn scene_sampling_drops_sub_half_second_slivers() {
+        // Cut at 0.2s: the [0, 0.2) sliver is noise; the rest samples fine.
+        let ts = scene_sample_timestamps(Some(10.0), &[0.2]);
+        assert_eq!(ts, vec![5.1], "midpoint of [0.2, 10)");
     }
 
     /// Playback transcode paths: an unsafe codec re-encodes to H.264; a safe

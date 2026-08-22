@@ -14,14 +14,14 @@ Written in Rust.
   - Stores files in a content-addressable layout under `EIDETIC_LIBRARY_DIR`
   - Supports: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC/HEIF (via libheif, on by default — see [Build features](#build-features)), DNG/Apple ProRAW (via embedded JPEG preview), and videos (MP4/MOV/MKV/WebM and friends)
   - Videos are probed with ffprobe ([ADR-0011](docs/adr/0011-video-pipeline.md)): duration, codec, rotation-aware dimensions, creation date, and the QuickTime GPS tag iPhones write — which geocodes offline exactly like photo EXIF. A representative frame becomes the thumbnail. ffmpeg is a *runtime* dependency: without it videos still import, and one warning tells you what to install.
-- `eidetic embed`: generate SigLIP 2 embeddings for all imported images and videos (~1.4 GiB model download on first run). Videos get up to 5 sampled frames across the middle 80% of their duration, each stored with its timestamp.
+- `eidetic embed`: generate SigLIP 2 embeddings for all imported images and videos (~1.4 GiB model download on first run). Videos are scene-detected once (ffmpeg), then sampled one frame per shot (duration-scaled, up to 24) with each frame stored under its timestamp; single-shot clips fall back to even sampling.
 - `eidetic search "dog on beach"`: find photos *and video moments* by natural-language description
   - Video results carry the timestamp of the best-matching frame (`@7.0s` on default output, `ts` as a field)
   - `--limit N`: number of results (default 10)
   - `--fields score,ts,date,path`: tab-separated column output
   - `--json`: full JSON array
 - `eidetic reel "sunset at the beach"`: cut a short mp4 from the best-matching photos and video moments (needs ffmpeg)
-  - Video hits become ~4s clips around the matched frame; photos hold 3s with a Ken Burns push-in
+  - Video hits become ~4s clips around the matched frame, snapped inside the shot's scene boundaries so cuts never splice across shots; photos hold 3s with a Ken Burns push-in
   - `--duration N` target seconds (default 30), `--size WxH` (default 1920x1080), `--output file`, `--dry-run` to print the cut list
 - `eidetic faces`: detect faces in imported images and videos, then group them into people
   - Video faces come from the sampled frames (needs ffmpeg), pass a stricter quality gate, and may *join* existing people but never form new ones — motion blur and compression artifacts are the classic cluster poison. A person's page deep-links to the moment they appear
