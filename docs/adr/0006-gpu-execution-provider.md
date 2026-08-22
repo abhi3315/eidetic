@@ -51,3 +51,21 @@ Add a CUDA execution provider, but **pin the ONNX Runtime version explicitly and
 - ONNX Runtime Blackwell/sm_120 reports: https://github.com/microsoft/onnxruntime/issues/26177 , https://github.com/microsoft/onnxruntime/issues/26245
 - ort cargo features / linking: https://ort.pyke.io/setup/cargo-features
 - Verified stack recorded in project memory (`eidetic-ort-blackwell-constraint`).
+
+## Amendment: Blackwell V-gate verified closed (2026-08-22)
+
+The runtime gate this ADR left open — "does an out-of-tree ONNX Runtime drive
+sm_120 through ort's load-dynamic path?" — has been verified on the real
+hardware. ONNX Runtime **1.29.0** (`onnxruntime-linux-x64-gpu_cuda12`) plus
+**cuDNN 9.25** via `ORT_DYLIB_PATH`/`LD_LIBRARY_PATH` registers the CUDA EP
+and executes SigLIP 2 on an RTX 5070 Ti: embedding CPU time drops ~22×
+(133 s → 6 s user time on an 80-asset library) and search rankings are
+identical to the CPU path. The working recipe is in the README ("Running the
+GPU build").
+
+One trap found and fixed on the way: with `load-dynamic` active and
+`ORT_DYLIB_PATH` unset, ort falls back to its `download-binaries` feature and
+silently fetches a CPU-only runtime from the network at first session build —
+observed as a multi-minute stall with no output. `build_session` now refuses
+to run a cuda-feature binary without `ORT_DYLIB_PATH`, with instructions in
+the error.

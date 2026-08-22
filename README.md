@@ -156,6 +156,25 @@ cargo build --release -p eidetic-cli --no-default-features
 cargo build --release -p eidetic-cli --features cuda
 ```
 
+### Running the GPU build
+
+A `cuda` build loads ONNX Runtime dynamically and refuses to start without `ORT_DYLIB_PATH` (otherwise ort would silently download a CPU-only runtime). Verified working recipe on an RTX 5070 Ti (Blackwell, sm_120):
+
+```bash
+# One-time: fetch an ORT >= 1.27 CUDA build and cuDNN 9 (no login needed)
+D=~/.cache/eidetic/ort && mkdir -p $D && cd $D
+curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-gpu_cuda12-1.29.0.tgz
+curl -LO https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.25.0.15_cuda12-archive.tar.xz
+tar xzf onnxruntime-*.tgz && tar xJf cudnn-*.tar.xz
+
+# Every run
+export ORT_DYLIB_PATH=$D/onnxruntime-linux-x64-gpu_cuda12-1.29.0/lib/libonnxruntime.so
+export LD_LIBRARY_PATH=$D/onnxruntime-linux-x64-gpu_cuda12-1.29.0/lib:$D/cudnn-linux-x86_64-9.25.0.15_cuda12-archive/lib
+EIDETIC_ACCELERATOR=cuda eidetic embed
+```
+
+Measured on the RTX 5070 Ti: embedding CPU time drops ~22× (133 s → 6 s of CPU work for an 80-asset library); embeddings are bit-identical in ranking to the CPU path.
+
 HEIC is on by default because it is the primary format for iPhone photos and libheif is the mature, correct decoder for it (LGPL, so linking it from this MIT/Apache codebase is distribution-clean). The trade-off is a system dependency; `--no-default-features` drops it entirely at the cost of HEIC support. See [ADR-0008](docs/adr/0008-heic-decode.md).
 
 ## Documentation

@@ -272,6 +272,21 @@ pub(crate) fn session_for_current_accelerator(
 /// the CPU EP, and `Mode::CoreML` errors. `coreml_cache_dir` is where ort
 /// stores the compiled CoreML model so subsequent loads skip recompile.
 fn build_session(model_path: &Path, mode: Mode, coreml_cache_dir: &Path) -> Result<Session> {
+    // A cuda build loads ONNX Runtime dynamically (ort/load-dynamic). With
+    // ORT_DYLIB_PATH unset, ort falls back to its download-binaries path and
+    // silently fetches a CPU-only runtime from the network at first use —
+    // observed as a mysterious multi-minute stall. Refuse loudly instead.
+    #[cfg(feature = "cuda")]
+    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        return Err(Error::ModelLoad(
+            "this binary was built with --features cuda, which loads ONNX Runtime \
+             dynamically: set ORT_DYLIB_PATH=/path/to/libonnxruntime.so from a CUDA \
+             build (>= 1.27 for Blackwell GPUs) and put its lib dir plus cuDNN 9 on \
+             LD_LIBRARY_PATH. See ADR-0006."
+                .into(),
+        ));
+    }
+
     let mut builder =
         Session::builder().map_err(|e: ort::Error| Error::ModelLoad(e.to_string()))?;
 
