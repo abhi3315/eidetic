@@ -19,6 +19,15 @@ These stopped being polish; they're the agent's working surface:
 3. **OTIO export** (v0.7 phase 3): the "rough cut + human polish" shape is what the research says users actually accept (Underlord lands ~70%; everyone polishes). Kdenlive/Resolve open the agent's cut.
 4. **Sharpness gate and section crossfades** (deferred from phase 1): quality floor for shots the agent picks blind.
 
+## Phase 0.5 — the craft layer (owner's bar: "ready to upload")
+
+What separates a correct render from a postable one, scoped honestly:
+
+- **Transition engine**: a curated ffmpeg `xfade` vocabulary (cut, crossfade, dip-to-black, slide, whip) chosen per joint by rule — hard cut on strong beats, crossfade across section changes, dip-to-black only as an ending. Changes the timeline math (transitions overlap), so it lands with the project-file work.
+- **Music structure, not just beats**: section detection (intro/verse/chorus/drop) from the existing onset/energy machinery, plus Whisper over the music for lyric moments — the agent holds calm shots through verses, saves the hero clip for the drop, and can cut "summer" footage where the song says it.
+- **Variations**: N candidate project files per request (different selections, orderings, transition styles), rendered as fast low-res previews; the human picks with eyes, the agent applies follow-ups to the winner, only the winner renders full-res. The LLM judges cut lists by metadata; the human judges pixels — that division is permanent and correct.
+- **Ceiling, stated plainly**: montage-class reels (trips, events, voiceover vlogs) are the "ready to upload" target. Speed-ramps, VFX, grading, and caption design stay editor work — reachable through the OTIO export, never reimplemented here.
+
 ## Phase 1 — `eidetic mcp`: the library and the edit as tools
 
 A stdio MCP server (official Rust SDK) exposing what the CLI already does, structured for an agent:
