@@ -166,6 +166,12 @@ enum Command {
         #[arg(long, value_name = "FORMAT")]
         export: Option<String>,
 
+        /// Blur floor (Laplacian variance at 640px): candidates whose
+        /// matched frame or photo scores below this never enter the reel.
+        /// 0 disables the gate.
+        #[arg(long, default_value_t = reel::MIN_SHARPNESS)]
+        min_sharpness: f64,
+
         /// Print the cut list without rendering.
         #[arg(long)]
         dry_run: bool,
@@ -1162,6 +1168,7 @@ async fn main() -> anyhow::Result<()> {
             portrait,
             frame,
             export,
+            min_sharpness,
             dry_run,
         } => {
             let prompt = prompt.expect("clap enforces a prompt when no reel subcommand is given");
@@ -1207,6 +1214,30 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await
                 .context("search failed")?;
+
+            // The sharpness gate (goals-v0.8.md phase 0): a quality floor
+            // for shots picked blind. If it would empty the pool entirely,
+            // a soft reel beats no reel — keep the ungated list.
+            let results = if min_sharpness > 0.0 {
+                let library_dir = config.paths.library_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let gated: Vec<_> = results
+                        .iter()
+                        .filter(|r| reel::sharp_enough(r, &library_dir, min_sharpness))
+                        .cloned()
+                        .collect();
+                    if gated.is_empty() && !results.is_empty() {
+                        eprintln!("sharpness gate would drop every candidate; keeping them all");
+                        results
+                    } else {
+                        gated
+                    }
+                })
+                .await
+                .context("sharpness thread panicked")?
+            } else {
+                results
+            };
 
             // Scene boundaries per video hit, so cuts snap to shots. Missing
             // detection (imported pre-v0.5, or ffmpeg-less embed) just means
@@ -2156,11 +2187,19 @@ async fn reel_edit(
                 .search(query, emb, 10, &eidetic_db::SearchFilters::default())
                 .await
                 .context("swap search failed")?;
-            // Prefer something not already in the reel; a swap that hands
-            // back a shot the user is looking at helps nobody.
+            // Prefer something not already in the reel and sharp enough; a
+            // swap that hands back a shot the user is looking at (or a
+            // blurry one) helps nobody. Degrade gracefully: unused beats
+            // sharp beats give-up.
+            let lib = config.paths.library_dir.clone();
             let hit = hits
                 .iter()
-                .find(|h| h.score > 0.0 && !used.contains(&h.id))
+                .find(|h| {
+                    h.score > 0.0
+                        && !used.contains(&h.id)
+                        && reel::sharp_enough(h, &lib, reel::MIN_SHARPNESS)
+                })
+                .or_else(|| hits.iter().find(|h| h.score > 0.0 && !used.contains(&h.id)))
                 .or_else(|| hits.iter().find(|h| h.score > 0.0))
                 .with_context(|| format!("nothing in the library matches {query:?}"))?;
             let mut scenes = std::collections::HashMap::new();

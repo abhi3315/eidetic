@@ -32,6 +32,34 @@ const VIDEO_CLIP_SECS: f64 = 4.0;
 const PHOTO_CLIP_SECS: f64 = 3.0;
 /// A hit scoring below this fraction of the best hit is padding, not content.
 const RELATIVE_SCORE_FLOOR: f64 = 0.35;
+/// Default Laplacian-variance floor for the sharpness gate. Calibrated on
+/// real media at 640px: heavy blur lands under ~10, soft-but-usable photos
+/// (LFW crowd shots) around 20-70, sharp frames in the hundreds. 12 rejects
+/// clear junk without punishing soft content.
+pub const MIN_SHARPNESS: f64 = 12.0;
+
+/// Is this hit's matched visual sharp enough to put in a reel? Measured on
+/// what would actually render: the photo thumbnail, or the video frame at
+/// the matched moment. Unmeasurable (no ffmpeg, undecodable) counts as
+/// sharp — the gate exists to catch definite junk, not to veto on doubt.
+pub fn sharp_enough(r: &SearchResult, library_dir: &Path, floor: f64) -> bool {
+    let score = match r.frame_ts {
+        Some(ts) => eidetic_ingest::sharpness::video_sharpness(&r.storage_path, ts)
+            .ok()
+            .flatten(),
+        None => eidetic_ingest::sharpness::image_sharpness(&photo_source(r, library_dir)).ok(),
+    };
+    match score {
+        Some(s) if s < floor => {
+            eprintln!(
+                "sharpness gate: dropped {} ({s:.1} < {floor:.1})",
+                r.storage_path.display()
+            );
+            false
+        }
+        _ => true,
+    }
+}
 
 /// One slot of the cut list — the unit `reel edit` (and later an agent)
 /// inspects and mutates, so it carries identity (`asset`) and provenance

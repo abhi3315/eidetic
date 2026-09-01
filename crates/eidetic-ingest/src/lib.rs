@@ -3,6 +3,7 @@ mod error;
 mod hasher;
 mod import;
 mod meta;
+pub mod sharpness;
 mod store;
 pub mod thumbnail;
 pub mod video;
