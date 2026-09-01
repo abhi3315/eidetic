@@ -2,6 +2,30 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.7.0 — 2026-09-01
+
+The reel studio (goals-v0.7 phases 1 + 1b) plus the library stewardship a completeness audit demanded before the v0.8 agent work.
+
+### Added
+
+- **Beat-synced reels** — `eidetic reel "prompt" --audio track.mp3`: a pure-Rust Ellis beat tracker (spectral flux → autocorrelation → DP, ~300 lines over rustfft) locks cuts to the music: 4 beats per shot in normal sections, 2 in high-energy ones (RMS analysis), 0.6 s floor, music laid under with a fade-out. Synthetic click tracks at 90/120/150 BPM recover tempo within 4% and phase within 80 ms. No-tempo tracks fall back gracefully.
+- **Voiceover mode** (speech builds) — narration instead of music: Whisper transcribes it, each spoken span (≥2.5 s, split ~8 s) becomes a search query over the library (semantic *and* transcript), and the best un-recently-used shot fills exactly that span. Mode is auto-detected: beats → music-synced, speech → voiceover, neither → fixed cuts.
+- **Auto framing** — `--portrait` (1080×1920) with per-clip style: shots with faces get a face-following cover-crop (weighted bbox centre steers the window); scenic shots render fit-inside over a blurred, darkened cover — no black bars, no butchered panoramas. `--frame cover|blur|pad` forces a style; Ken Burns zoom now scales with span length.
+- **`eidetic rm`** — assets can finally leave: dry-run by default, `--force` removes the DB row (children cascade) plus original, thumbnails, playback copy and face crops. Accepts id, content hash, storage path, or unambiguous filename.
+- **`eidetic verify`** — the content-addressed layout pays its bit-rot dividend: every original re-hashed against the database; corruption, missing files and orphan CAS files reported, non-zero exit on damage.
+- **Structured search filters** — `--person`, `--after`, `--before`, `--place`, `--kind image|video` combine with semantic + spoken-word ranking.
+- **Grid pagination** — 48 per page with total count and newer/older navigation, replacing the fixed 24-most-recent keyhole.
+
+### Verified on a rebuilt real-media corpus
+
+- 120 BPM click track: 121.0 BPM detected, 8 spans of exactly 4 beats, 1080×1920 H.264+AAC out.
+- JFK narration: voiceover mode picked the matching clip via the library's own transcript index.
+- rm --force left zero files for the removed hash; verify caught a single corrupted byte and a planted orphan, then reported clean after restore; person-filtered search returned exactly the named person's photos.
+
+### Internals
+
+- New: `eidetic-ingest::beats`, reel `Fit`/framing engine, `SearchFilters`, `RemovalManifest`; `rustfft` (pure Rust) is the only new dependency. The corpus rebuild is scripted (`rebuild-corpus.sh` pattern) after /tmp cleanup ate the test library twice.
+
 ## v0.6.0 — 2026-08-22
 
 The leftovers release: the three items deliberately left on the table after v0.5 — GPU speech decode, perceptual dedup, and the WebDAV interface goals.md promised from day one. With this, both goal documents are exhausted.
