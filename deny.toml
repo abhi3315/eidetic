@@ -31,6 +31,8 @@ allow = [
     "0BSD",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    # Public domain (OSI approved); whisper-rs / whisper-rs-sys.
+    "Unlicense",
 ]
 confidence-threshold = 0.8
 exceptions = [
