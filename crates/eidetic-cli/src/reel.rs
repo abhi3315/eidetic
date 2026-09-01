@@ -435,10 +435,14 @@ pub fn render(
         vf.push_str(",setsar=1");
         // Dip-to-black as an ENDING is the one place it always earns its
         // keep: with music, the video tail fades with the audio's fade.
-        if i + 1 == slots.len() && audio.is_some() && slot.duration > 1.0 {
+        // The fade shrinks with a short final slot (drop sections end on
+        // 2-beat cuts) rather than being skipped — an abrupt final frame
+        // reads as a glitch either way.
+        if i + 1 == slots.len() && audio.is_some() {
+            let d = (slot.duration / 2.0).min(0.5);
             vf.push_str(&format!(
-                ",fade=t=out:st={:.3}:d=0.5",
-                (slot.duration - 0.5).max(0.0)
+                ",fade=t=out:st={:.3}:d={d:.3}",
+                (slot.duration - d).max(0.0)
             ));
         }
         let mut cmd = Command::new(ffmpeg);
