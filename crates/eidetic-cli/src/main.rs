@@ -1,5 +1,6 @@
 mod dupes;
 mod eval;
+mod otio;
 mod project;
 mod reel;
 
@@ -22,6 +23,9 @@ struct Cli {
     command: Command,
 }
 
+// One value of this enum exists per process, parsed once; the size skew
+// clippy flags (Reel's subcommand + flags) costs nothing worth boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Compute the SHA-256 hash of a file.
@@ -157,6 +161,11 @@ enum Command {
         #[arg(long, default_value = "auto")]
         frame: String,
 
+        /// Also export the timeline for an NLE: `--export otio` writes
+        /// <output>.otio (opens in Kdenlive 25.04+ / Resolve 18.5+).
+        #[arg(long, value_name = "FORMAT")]
+        export: Option<String>,
+
         /// Print the cut list without rendering.
         #[arg(long)]
         dry_run: bool,
@@ -235,11 +244,25 @@ enum ReelAction {
         #[arg(long, short)]
         output: Option<PathBuf>,
 
+        /// Also export the timeline for an NLE: `--export otio` writes
+        /// <output>.otio (opens in Kdenlive 25.04+ / Resolve 18.5+).
+        #[arg(long, value_name = "FORMAT")]
+        export: Option<String>,
+
         /// Apply and save the edits and print the new cut list, but skip
         /// the render.
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Validate --export and hand back the target path for a render output.
+fn export_path(format: Option<&str>, output: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
+    match format {
+        None => Ok(None),
+        Some("otio") => Ok(Some(output.with_extension("otio"))),
+        Some(other) => anyhow::bail!("unknown --export format {other:?}; supported: otio"),
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1109,12 +1132,22 @@ async fn main() -> anyhow::Result<()> {
                     retime,
                     reorder,
                     output,
+                    export,
                     dry_run,
                 }),
             ..
         } => {
             reel_edit(
-                &project, &swap, &drop, &pin, &unpin, &retime, reorder, output, dry_run,
+                &project,
+                &swap,
+                &drop,
+                &pin,
+                &unpin,
+                &retime,
+                reorder,
+                output,
+                export.as_deref(),
+                dry_run,
             )
             .await?;
         }
@@ -1128,6 +1161,7 @@ async fn main() -> anyhow::Result<()> {
             audio,
             portrait,
             frame,
+            export,
             dry_run,
         } => {
             let prompt = prompt.expect("clap enforces a prompt when no reel subcommand is given");
@@ -1380,6 +1414,10 @@ async fn main() -> anyhow::Result<()> {
             let proj_path = project::ReelProject::path_for(&output);
             proj.save(&proj_path)?;
             println!("Project {}", proj_path.display());
+            if let Some(otio_path) = export_path(export.as_deref(), &output)? {
+                otio::export(&proj, &otio_path)?;
+                println!("OTIO    {}", otio_path.display());
+            }
         }
 
         Command::Transcode => {
@@ -2004,6 +2042,7 @@ async fn reel_edit(
     retime: &[String],
     reorder: Option<String>,
     output: Option<PathBuf>,
+    export: Option<&str>,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
@@ -2209,6 +2248,10 @@ async fn reel_edit(
     proj.modified = chrono::Utc::now();
     proj.save(project_path)?;
     proj.print_cut_list();
+    if let Some(otio_path) = export_path(export, &proj.output)? {
+        otio::export(&proj, &otio_path)?;
+        println!("OTIO    {}", otio_path.display());
+    }
     if dry_run {
         return Ok(());
     }

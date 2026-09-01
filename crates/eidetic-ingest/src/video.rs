@@ -31,6 +31,9 @@ pub struct VideoProbe {
     /// From the QuickTime ISO 6709 location tag iPhones write.
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// Average frame rate of the video stream, e.g. 29.97. The OTIO export
+    /// expresses clip ranges at each source's real rate.
+    pub frame_rate: Option<f64>,
 }
 
 /// Locate a binary: `$env_var` override first, then trust `PATH`.
@@ -119,7 +122,7 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
         .flatten()
         .find(|s| s["codec_type"].as_str() == Some("video"));
 
-    let (video_codec, width, height) = match video_stream {
+    let (video_codec, width, height, frame_rate) = match video_stream {
         Some(s) => {
             let rotated = stream_rotation(s) % 180 != 0;
             let (w, h) = (s["width"].as_i64(), s["height"].as_i64());
@@ -127,9 +130,14 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
                 s["codec_name"].as_str().map(str::to_string),
                 if rotated { h } else { w },
                 if rotated { w } else { h },
+                s["avg_frame_rate"]
+                    .as_str()
+                    .or_else(|| s["r_frame_rate"].as_str())
+                    .and_then(parse_rational)
+                    .filter(|r| *r > 0.0),
             )
         }
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
 
     let date_taken = tags["creation_time"]
@@ -151,6 +159,19 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
         date_taken,
         latitude,
         longitude,
+        frame_rate,
+    }
+}
+
+/// Parse ffprobe's rational rate strings: `"30000/1001"` or `"25"`.
+/// `"0/0"` (streams with no rate) yields None via the caller's filter.
+fn parse_rational(s: &str) -> Option<f64> {
+    match s.split_once('/') {
+        Some((n, d)) => {
+            let (n, d) = (n.parse::<f64>().ok()?, d.parse::<f64>().ok()?);
+            (d != 0.0).then(|| n / d)
+        }
+        None => s.parse().ok(),
     }
 }
 
