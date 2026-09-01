@@ -31,6 +31,7 @@ eidetic-ingest = { path = "../eidetic-ingest", default-features = false }
 eidetic-db = { path = "../eidetic-db" }
 eidetic-ml = { path = "../eidetic-ml", default-features = false }
 eidetic-server = { path = "../eidetic-server", default-features = false }
+serde = { workspace = true }
 serde_json = { workspace = true }
 csv = { workspace = true }
 clap = { workspace = true }

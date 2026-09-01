@@ -960,6 +960,7 @@ dependencies = [
  "eidetic-ingest",
  "eidetic-ml",
  "eidetic-server",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

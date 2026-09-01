@@ -5,6 +5,10 @@
 //! winners into one mp4. Nothing here talks to a model — the prompt was
 //! embedded once by the caller.
 //!
+//! The cut list is a `Vec<Slot>`: a serializable slot per shot, persisted
+//! as a reel project file (goals-v0.8.md phase 0) so follow-up edits and
+//! agents mutate slots instead of regenerating from scratch.
+//!
 //! Rendering strategy is deliberately boring: every selected segment is
 //! normalised to the same codec/size/fps in its own ffmpeg run, then joined
 //! losslessly with the concat demuxer. One subprocess per segment beats one
@@ -15,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use eidetic_core::AssetId;
 use eidetic_db::SearchResult;
 use eidetic_ingest::beats::BeatGrid;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,45 +33,134 @@ const PHOTO_CLIP_SECS: f64 = 3.0;
 /// A hit scoring below this fraction of the best hit is padding, not content.
 const RELATIVE_SCORE_FLOOR: f64 = 0.35;
 
-pub struct ReelPlan {
-    pub segments: Vec<Segment>,
-    pub total_secs: f64,
+/// One slot of the cut list — the unit `reel edit` (and later an agent)
+/// inspects and mutates, so it carries identity (`asset`) and provenance
+/// (`score`) alongside what ffmpeg needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Slot {
+    /// The library asset this slot cuts from.
+    pub asset: AssetId,
+    /// The file ffmpeg reads: the original for videos, the upright medium
+    /// thumbnail for photos when one exists (see [`photo_source`]).
+    pub source: PathBuf,
+    pub kind: SlotKind,
+    /// In-point in the source, seconds. Always 0 for photos.
+    #[serde(default)]
+    pub start: f64,
+    /// Seconds this slot holds on the timeline.
+    pub duration: f64,
+    /// Horizontal face centre (0..1 of source width) steering the video
+    /// cover-crop window. None = centred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_x: Option<f64>,
+    /// The search score that put the asset here; 0 when placed by hand.
+    #[serde(default)]
+    pub score: f32,
+    /// Pinned slots refuse `--swap` and `--drop`: this shot stays.
+    #[serde(default)]
+    pub pinned: bool,
+    /// How this slot joins the previous one; the first slot's value is
+    /// ignored.
+    #[serde(default)]
+    pub transition_in: Transition,
 }
 
-pub enum Segment {
-    /// (source, clip start seconds, clip length seconds)
-    VideoClip(PathBuf, f64, f64),
-    /// Like VideoClip, with a horizontal focus point (0..1 of source width)
-    /// the cover-crop window centres on — where the faces are.
-    VideoClipFocus(PathBuf, f64, f64, f64),
-    /// (source photo, hold seconds) — Ken Burns cover-crop.
-    Photo(PathBuf, f64),
-    /// (source photo, hold seconds) — scenic: fit-inside over a blurred
-    /// cover background, no crop. For panoramas and faceless landscapes.
-    PhotoScenic(PathBuf, f64),
+/// The ffmpeg treatment for a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotKind {
+    /// A clip cut from a video: cover-crop (focus-steered when faces are
+    /// known) or pad/blur per the frame style.
+    Video,
+    /// A photo held with a slow Ken Burns push-in.
+    Photo,
+    /// A photo fitted intact over a blurred cover of itself — panoramas
+    /// and faceless landscapes.
+    PhotoScenic,
 }
 
-impl Segment {
-    fn secs(&self) -> f64 {
-        match self {
-            Segment::VideoClip(_, _, len) | Segment::VideoClipFocus(_, _, len, _) => *len,
-            Segment::Photo(_, secs) | Segment::PhotoScenic(_, secs) => *secs,
-        }
-    }
+/// The joint between a slot and its predecessor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Transition {
+    #[default]
+    Cut,
+    /// Crossfade over `secs`. The outgoing clip supplies the overlap by
+    /// extending past its out-point; render clamps to the media that
+    /// actually exists there and falls back to a cut when almost none does.
+    Crossfade { secs: f64 },
+}
 
+impl Slot {
     pub fn describe(&self) -> String {
-        match self {
-            Segment::VideoClip(p, start, len) => {
-                format!("{} [{start:.1}s +{len:.1}s]", p.display())
+        let mut s = match self.kind {
+            SlotKind::Video => match self.focus_x {
+                Some(fx) => format!(
+                    "{} [{:.1}s +{:.1}s, focus x={fx:.2}]",
+                    self.source.display(),
+                    self.start,
+                    self.duration
+                ),
+                None => format!(
+                    "{} [{:.1}s +{:.1}s]",
+                    self.source.display(),
+                    self.start,
+                    self.duration
+                ),
+            },
+            SlotKind::Photo => format!("{} [photo, {:.1}s]", self.source.display(), self.duration),
+            SlotKind::PhotoScenic => {
+                format!(
+                    "{} [photo scenic, {:.1}s]",
+                    self.source.display(),
+                    self.duration
+                )
             }
-            Segment::VideoClipFocus(p, start, len, fx) => {
-                format!("{} [{start:.1}s +{len:.1}s, focus x={fx:.2}]", p.display())
-            }
-            Segment::Photo(p, secs) => format!("{} [photo, {secs:.1}s]", p.display()),
-            Segment::PhotoScenic(p, secs) => {
-                format!("{} [photo scenic, {secs:.1}s]", p.display())
-            }
+        };
+        if let Transition::Crossfade { secs } = self.transition_in {
+            s.push_str(&format!(" [xfade {secs:.1}s in]"));
         }
+        if self.pinned {
+            s.push_str(" [pinned]");
+        }
+        s
+    }
+}
+
+/// Total timeline length of a cut list.
+pub fn total_secs(slots: &[Slot]) -> f64 {
+    slots.iter().map(|s| s.duration).sum()
+}
+
+fn video_slot(r: &SearchResult, start: f64, duration: f64, focus_x: Option<f64>) -> Slot {
+    Slot {
+        asset: r.id,
+        source: r.storage_path.clone(),
+        kind: SlotKind::Video,
+        start,
+        duration,
+        focus_x,
+        score: r.score,
+        pinned: false,
+        transition_in: Transition::Cut,
+    }
+}
+
+fn photo_slot(r: &SearchResult, library_dir: &Path, duration: f64, scenic: bool) -> Slot {
+    Slot {
+        asset: r.id,
+        source: photo_source(r, library_dir),
+        kind: if scenic {
+            SlotKind::PhotoScenic
+        } else {
+            SlotKind::Photo
+        },
+        start: 0.0,
+        duration,
+        focus_x: None,
+        score: r.score,
+        pinned: false,
+        transition_in: Transition::Cut,
     }
 }
 
@@ -84,35 +178,32 @@ pub fn plan(
     target_secs: f64,
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
-) -> ReelPlan {
+) -> Vec<Slot> {
     let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
     let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
 
-    let mut segments = Vec::new();
+    let mut slots: Vec<Slot> = Vec::new();
     let mut total = 0.0f64;
     for r in results {
         if (r.score as f64) < floor || r.score <= 0.0 {
             break; // results are sorted; everything after is weaker
         }
-        let seg = match r.frame_ts {
+        let slot = match r.frame_ts {
             Some(ts) => {
                 let empty = Vec::new();
                 let bounds = scenes.get(&r.id).unwrap_or(&empty);
                 let (start, len) = clip_bounds(ts, r.duration_secs, bounds);
-                Segment::VideoClip(r.storage_path.clone(), start, len)
+                video_slot(r, start, len, None)
             }
-            None => Segment::Photo(photo_source(r, library_dir), PHOTO_CLIP_SECS),
+            None => photo_slot(r, library_dir, PHOTO_CLIP_SECS, false),
         };
-        if total + seg.secs() > target_secs && !segments.is_empty() {
+        if total + slot.duration > target_secs && !slots.is_empty() {
             break;
         }
-        total += seg.secs();
-        segments.push(seg);
+        total += slot.duration;
+        slots.push(slot);
     }
-    ReelPlan {
-        segments,
-        total_secs: total,
-    }
+    slots
 }
 
 /// How segments are fitted to the frame.
@@ -141,11 +232,11 @@ impl Fit {
     }
 }
 
-/// Render the plan to `output` at `width`x`height`, 30fps, H.264. With
+/// Render the cut list to `output` at `width`x`height`, 30fps, H.264. With
 /// `audio`, the track is laid under the cut, trimmed to the reel length
 /// with a one-second fade-out.
 pub fn render(
-    plan: &ReelPlan,
+    slots: &[Slot],
     output: &Path,
     width: u32,
     height: u32,
@@ -155,85 +246,69 @@ pub fn render(
     let Some(ffmpeg) = eidetic_ingest::video::ffmpeg() else {
         bail!("ffmpeg not found; install it (or set EIDETIC_FFMPEG_PATH) to render reels");
     };
-    if plan.segments.is_empty() {
+    if slots.is_empty() {
         bail!("nothing matched confidently enough to cut a reel");
     }
 
     let workdir = tempfile::tempdir().context("create reel work dir")?;
-    let mut list = String::new();
+    let mut seg_paths = Vec::with_capacity(slots.len());
 
-    for (i, seg) in plan.segments.iter().enumerate() {
+    for (i, slot) in slots.iter().enumerate() {
+        // A crossfade into the NEXT slot needs this slot to run `fade` secs
+        // past its out-point — the overlap the dissolve consumes. Clamped to
+        // the media that exists there; near-zero falls back to a hard cut.
+        let fade = match slots.get(i + 1).map(|n| n.transition_in) {
+            Some(Transition::Crossfade { secs }) => extendable_secs(ffmpeg, slot, secs),
+            _ => 0.0,
+        };
         let seg_path = workdir.path().join(format!("seg_{i:03}.mp4"));
-        let status = match seg {
-            Segment::VideoClip(src, start, len) => Command::new(ffmpeg)
-                .args(["-y", "-v", "error", "-ss", &format!("{start:.3}")])
-                .arg("-i")
-                .arg(src)
-                .args(["-t", &format!("{len:.3}")])
-                .args(["-vf", &normalize_filter(width, height, fit.resolve(false))])
-                .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
-                .arg(&seg_path)
-                .status(),
-            Segment::VideoClipFocus(src, start, len, fx) => Command::new(ffmpeg)
-                .args(["-y", "-v", "error", "-ss", &format!("{start:.3}")])
-                .arg("-i")
-                .arg(src)
-                .args(["-t", &format!("{len:.3}")])
-                .args(["-vf", &focus_filter(width, height, fit.resolve(true), *fx)])
-                .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
-                .arg(&seg_path)
-                .status(),
-            Segment::Photo(src, secs) => Command::new(ffmpeg)
-                .args(["-y", "-v", "error", "-loop", "1"])
-                .arg("-i")
-                .arg(src)
-                .args(["-t", &format!("{secs:.3}")])
-                .args(["-vf", &ken_burns_filter(width, height, *secs)])
-                .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
-                .arg(&seg_path)
-                .status(),
-            Segment::PhotoScenic(src, secs) => Command::new(ffmpeg)
-                .args(["-y", "-v", "error", "-loop", "1"])
-                .arg("-i")
-                .arg(src)
-                .args(["-t", &format!("{secs:.3}")])
-                .args(["-vf", &blur_fill_filter(width, height)])
-                .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
-                .arg(&seg_path)
-                .status(),
+        let rendered = slot.duration + fade;
+        let vf = match slot.kind {
+            SlotKind::Video => match slot.focus_x {
+                Some(fx) => focus_filter(width, height, fit.resolve(true), fx),
+                None => normalize_filter(width, height, fit.resolve(false)),
+            },
+            SlotKind::Photo => ken_burns_filter(width, height, rendered),
+            SlotKind::PhotoScenic => blur_fill_filter(width, height),
+        };
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-y", "-v", "error"]);
+        match slot.kind {
+            SlotKind::Video => {
+                cmd.args(["-ss", &format!("{:.3}", slot.start)]);
+            }
+            SlotKind::Photo | SlotKind::PhotoScenic => {
+                cmd.args(["-loop", "1"]);
+            }
         }
-        .context("run ffmpeg for a segment")?;
+        let status = cmd
+            .arg("-i")
+            .arg(&slot.source)
+            .args(["-t", &format!("{rendered:.3}")])
+            .args(["-vf", &vf])
+            .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
+            .arg(&seg_path)
+            .status()
+            .context("run ffmpeg for a segment")?;
         if !status.success() {
-            bail!("ffmpeg failed on segment {}: {}", i + 1, seg.describe());
+            bail!("ffmpeg failed on segment {}: {}", i + 1, slot.describe());
         }
-        // concat-demuxer syntax; single quotes inside paths are escaped as '\''
-        list.push_str(&format!(
-            "file '{}'\n",
-            seg_path.display().to_string().replace('\'', "'\\''")
-        ));
+        seg_paths.push((seg_path, fade));
     }
 
-    let list_path = workdir.path().join("concat.txt");
-    std::fs::write(&list_path, list).context("write concat list")?;
-
+    let total = total_secs(slots);
     let silent = match audio {
         None => output.to_path_buf(),
         Some(_) => workdir.path().join("silent.mp4"),
     };
-    let status = Command::new(ffmpeg)
-        .args(["-y", "-v", "error", "-f", "concat", "-safe", "0"])
-        .arg("-i")
-        .arg(&list_path)
-        .args(["-c", "copy"])
-        .arg(&silent)
-        .status()
-        .context("run ffmpeg concat")?;
-    if !status.success() {
-        bail!("ffmpeg concat failed");
+    if seg_paths.iter().all(|(_, fade)| *fade == 0.0) {
+        concat_copy(ffmpeg, &seg_paths, workdir.path(), &silent)?;
+    } else {
+        xfade_chain(ffmpeg, &seg_paths, slots, &silent)?;
     }
 
     if let Some(track) = audio {
-        let fade_start = (plan.total_secs - 1.0).max(0.0);
+        let fade_start = (total - 1.0).max(0.0);
         let status = Command::new(ffmpeg)
             .args(["-y", "-v", "error"])
             .arg("-i")
@@ -246,7 +321,7 @@ pub fn render(
                 "-af",
                 &format!("afade=t=out:st={fade_start:.3}:d=1"),
                 "-t",
-                &format!("{:.3}", plan.total_secs),
+                &format!("{total:.3}"),
             ])
             .arg(output)
             .status()
@@ -256,6 +331,107 @@ pub fn render(
         }
     }
     Ok(())
+}
+
+/// Lossless join for an all-cuts reel: the concat demuxer with `-c copy`.
+fn concat_copy(
+    ffmpeg: &Path,
+    seg_paths: &[(PathBuf, f64)],
+    workdir: &Path,
+    output: &Path,
+) -> Result<()> {
+    let mut list = String::new();
+    for (p, _) in seg_paths {
+        // concat-demuxer syntax; single quotes inside paths are escaped as '\''
+        list.push_str(&format!(
+            "file '{}'\n",
+            p.display().to_string().replace('\'', "'\\''")
+        ));
+    }
+    let list_path = workdir.join("concat.txt");
+    std::fs::write(&list_path, list).context("write concat list")?;
+    let status = Command::new(ffmpeg)
+        .args(["-y", "-v", "error", "-f", "concat", "-safe", "0"])
+        .arg("-i")
+        .arg(&list_path)
+        .args(["-c", "copy"])
+        .arg(output)
+        .status()
+        .context("run ffmpeg concat")?;
+    if !status.success() {
+        bail!("ffmpeg concat failed");
+    }
+    Ok(())
+}
+
+/// Join segments with per-joint transitions: hard cuts use the concat
+/// filter, crossfades use xfade. One re-encode of the whole timeline.
+///
+/// Beat sync survives because each fading segment was rendered `fade` secs
+/// LONGER than its slot: the dissolve consumes exactly that extension, so
+/// every later cut still lands where the grid put it. xfade's offset is
+/// therefore the sum of *nominal* durations so far, not of file lengths.
+fn xfade_chain(
+    ffmpeg: &Path,
+    seg_paths: &[(PathBuf, f64)],
+    slots: &[Slot],
+    output: &Path,
+) -> Result<()> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-v", "error"]);
+    for (p, _) in seg_paths {
+        cmd.arg("-i").arg(p);
+    }
+    let mut graph = String::new();
+    let mut acc = "0:v".to_string();
+    let mut offset = slots[0].duration;
+    for i in 1..seg_paths.len() {
+        let out = format!("v{i}");
+        let fade = seg_paths[i - 1].1;
+        if fade > 0.0 {
+            graph.push_str(&format!(
+                "[{acc}][{i}:v]xfade=transition=fade:duration={fade:.3}:offset={offset:.3}[{out}];"
+            ));
+        } else {
+            graph.push_str(&format!("[{acc}][{i}:v]concat=n=2:v=1:a=0[{out}];"));
+        }
+        offset += slots[i].duration;
+        acc = out;
+    }
+    graph.pop(); // trailing ';'
+    let status = cmd
+        .args(["-filter_complex", &graph])
+        .args(["-map", &format!("[{acc}]")])
+        .args(["-c:v", "libx264", "-preset", "veryfast"])
+        .arg(output)
+        .status()
+        .context("run ffmpeg transition chain")?;
+    if !status.success() {
+        bail!("ffmpeg transition chain failed");
+    }
+    Ok(())
+}
+
+/// How many seconds past its out-point `slot` can actually extend, capped
+/// at `want`. Photos loop forever; videos are probed (a project file may
+/// have been retimed by hand since planning). Under 0.15s a dissolve reads
+/// as a glitch, so it degrades to a cut (0.0).
+fn extendable_secs(ffmpeg: &Path, slot: &Slot, want: f64) -> f64 {
+    let avail = match slot.kind {
+        SlotKind::Photo | SlotKind::PhotoScenic => want,
+        SlotKind::Video => {
+            let _ = ffmpeg; // probing uses ffprobe, located independently
+            match eidetic_ingest::video::probe(&slot.source) {
+                Ok(Some(p)) => p
+                    .duration_secs
+                    .map(|d| (d - slot.start - slot.duration).max(0.0))
+                    .unwrap_or(0.0)
+                    .min(want),
+                _ => 0.0,
+            }
+        }
+    };
+    if avail < 0.15 { 0.0 } else { avail }
 }
 
 /// Cut spans from a beat grid (goals-v0.7.md phase 1): each span starts on
@@ -302,11 +478,18 @@ pub fn beat_spans(grid: &BeatGrid, total_secs: f64) -> Vec<(f64, f64)> {
     spans
 }
 
+/// Seconds a crossfade takes at an energy-section boundary.
+const SECTION_FADE_SECS: f64 = 0.5;
+
 /// Beat-synced plan: each music span gets one shot, taken in score order
 /// with the same weak-tail rules as [`plan`]. A video hit fills its span
 /// exactly (sync beats scene purity: if the shot's scene is shorter than
 /// the span, the clip crosses the boundary rather than breaking the grid);
 /// photos hold for the span. The reel ends early if strong shots run out.
+///
+/// Joints where the music crosses an energy-section boundary are marked as
+/// crossfades (the cut vocabulary's one softener): the eye reads the
+/// dissolve as "the song changed here".
 pub fn plan_synced(
     results: &[SearchResult],
     grid: &BeatGrid,
@@ -314,7 +497,7 @@ pub fn plan_synced(
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
     focus: &HashMap<AssetId, f64>,
-) -> ReelPlan {
+) -> Vec<Slot> {
     let spans = beat_spans(grid, total_secs);
     let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
     let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
@@ -323,31 +506,38 @@ pub fn plan_synced(
         .take_while(|r| r.score > 0.0 && (r.score as f64) >= floor)
         .collect();
 
-    let mut segments = Vec::new();
+    let mut slots = Vec::new();
     let mut total = 0.0;
     for ((_, end), r) in spans.iter().zip(&strong) {
         let span = end - total;
-        let seg = fill_span(r, span, library_dir, scenes, focus);
-        total += seg.secs();
-        segments.push(seg);
+        let slot = fill_span(r, span, library_dir, scenes, focus);
+        total += slot.duration;
+        slots.push(slot);
     }
-    ReelPlan {
-        segments,
-        total_secs: total,
+    for i in 1..slots.len() {
+        let (a, b) = (spans[i - 1], spans[i]);
+        let before = grid.is_high_energy((a.0 + a.1) / 2.0);
+        let after = grid.is_high_energy((b.0 + b.1) / 2.0);
+        if before != after {
+            slots[i].transition_in = Transition::Crossfade {
+                secs: SECTION_FADE_SECS,
+            };
+        }
     }
+    slots
 }
 
 /// One shot filling one span exactly: videos cut around their matched
 /// moment (shot-boundary aligned when possible; sync beats scene purity),
 /// photos hold — Ken Burns when faces are present, scenic blur-fill when
 /// not.
-fn fill_span(
+pub fn fill_span(
     r: &SearchResult,
     span: f64,
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
     focus: &HashMap<AssetId, f64>,
-) -> Segment {
+) -> Slot {
     match r.frame_ts {
         Some(ts) => {
             let duration = r.duration_secs.unwrap_or(f64::MAX);
@@ -366,13 +556,9 @@ fn fill_span(
             } else {
                 (ts - span / 2.0).clamp(0.0, (duration - span).max(0.0))
             };
-            match focus.get(&r.id) {
-                Some(fx) => Segment::VideoClipFocus(r.storage_path.clone(), start, span, *fx),
-                None => Segment::VideoClip(r.storage_path.clone(), start, span),
-            }
+            video_slot(r, start, span, focus.get(&r.id).copied())
         }
-        None if focus.contains_key(&r.id) => Segment::Photo(photo_source(r, library_dir), span),
-        None => Segment::PhotoScenic(photo_source(r, library_dir), span),
+        None => photo_slot(r, library_dir, span, !focus.contains_key(&r.id)),
     }
 }
 
@@ -383,18 +569,11 @@ pub fn plan_assigned(
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
     focus: &HashMap<AssetId, f64>,
-) -> ReelPlan {
-    let mut segments = Vec::new();
-    let mut total = 0.0;
-    for (span, r) in pairs {
-        let seg = fill_span(r, *span, library_dir, scenes, focus);
-        total += seg.secs();
-        segments.push(seg);
-    }
-    ReelPlan {
-        segments,
-        total_secs: total,
-    }
+) -> Vec<Slot> {
+    pairs
+        .iter()
+        .map(|(span, r)| fill_span(r, *span, library_dir, scenes, focus))
+        .collect()
 }
 
 /// Merge raw speech segments into presentation spans covering the narration
@@ -476,7 +655,7 @@ fn clip_bounds(ts: f64, duration_secs: Option<f64>, scenes: &[f64]) -> (f64, f64
 /// EXIF orientation would be ignored even for JPEG. The medium thumbnail is
 /// an upright 1024px JPEG, so prefer it whenever it exists; fall back to the
 /// original for the rare un-thumbnailed photo.
-fn photo_source(r: &SearchResult, library_dir: &Path) -> PathBuf {
+pub fn photo_source(r: &SearchResult, library_dir: &Path) -> PathBuf {
     if r.thumbnails_generated
         && let Some(hash) = r
             .storage_path
@@ -536,7 +715,7 @@ fn blur_fill_filter(w: u32, h: u32) -> String {
 }
 
 /// Ken Burns for stills: cover-crop to the frame, then a slow centred
-/// push-in. `d` is in *output frames* (30fps x 3s).
+/// push-in. `d` is in *output frames* (30fps x hold seconds).
 fn ken_burns_filter(w: u32, h: u32, secs: f64) -> String {
     let frames = (secs * 30.0).round().max(1.0) as u32;
     // Zoom rate scales so the push-in always lands at ~1.15x regardless of
@@ -582,50 +761,48 @@ mod tests {
     fn plan_respects_target_duration() {
         // Ten strong photo hits at 3s each against a 10s target: 3 fit.
         let results: Vec<_> = (0..10).map(|_| hit(0.5, None, None)).collect();
-        let p = plan(&results, 10.0, &lib(), &HashMap::new());
-        assert_eq!(p.segments.len(), 3);
-        assert!((p.total_secs - 9.0).abs() < 1e-9);
+        let slots = plan(&results, 10.0, &lib(), &HashMap::new());
+        assert_eq!(slots.len(), 3);
+        assert!((total_secs(&slots) - 9.0).abs() < 1e-9);
     }
 
     #[test]
     fn plan_drops_weak_tail_even_with_room() {
         let results = vec![hit(0.5, None, None), hit(0.1, None, None)];
-        let p = plan(&results, 60.0, &lib(), &HashMap::new());
-        assert_eq!(p.segments.len(), 1, "0.1 < 35% of 0.5 is padding");
+        let slots = plan(&results, 60.0, &lib(), &HashMap::new());
+        assert_eq!(slots.len(), 1, "0.1 < 35% of 0.5 is padding");
     }
 
     #[test]
     fn plan_drops_non_positive_scores() {
         let results = vec![hit(0.0, None, None), hit(-0.2, None, None)];
-        assert!(
-            plan(&results, 30.0, &lib(), &HashMap::new())
-                .segments
-                .is_empty()
-        );
+        assert!(plan(&results, 30.0, &lib(), &HashMap::new()).is_empty());
     }
 
     #[test]
     fn video_clip_leads_into_the_moment_and_respects_bounds() {
         // Moment at 9s of a 10s video: start = 7.5, len clamped to 2.5.
         let results = vec![hit(0.5, Some(9.0), Some(10.0))];
-        let p = plan(&results, 30.0, &lib(), &HashMap::new());
-        match &p.segments[0] {
-            Segment::VideoClip(_, start, len) => {
-                assert!((start - 7.5).abs() < 1e-9);
-                assert!((len - 2.5).abs() < 1e-9);
-            }
-            _ => panic!("expected a video clip"),
-        }
+        let slots = plan(&results, 30.0, &lib(), &HashMap::new());
+        assert_eq!(slots[0].kind, SlotKind::Video);
+        assert!((slots[0].start - 7.5).abs() < 1e-9);
+        assert!((slots[0].duration - 2.5).abs() < 1e-9);
 
         // Moment at 0.5s: lead-in clamps to the file start.
         let results = vec![hit(0.5, Some(0.5), Some(10.0))];
-        match &plan(&results, 30.0, &lib(), &HashMap::new()).segments[0] {
-            Segment::VideoClip(_, start, len) => {
-                assert_eq!(*start, 0.0);
-                assert!((len - 4.0).abs() < 1e-9);
-            }
-            _ => panic!("expected a video clip"),
-        }
+        let slots = plan(&results, 30.0, &lib(), &HashMap::new());
+        assert_eq!(slots[0].start, 0.0);
+        assert!((slots[0].duration - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slots_carry_identity_and_score() {
+        let r = hit(0.7, Some(2.0), Some(30.0));
+        let slots = plan(std::slice::from_ref(&r), 30.0, &lib(), &HashMap::new());
+        assert_eq!(slots[0].asset, r.id);
+        assert!((slots[0].score - 0.7).abs() < 1e-6);
+        assert!(!slots[0].pinned);
+        assert_eq!(slots[0].transition_in, Transition::Cut);
     }
 
     #[test]
@@ -634,22 +811,16 @@ mod tests {
         let mut thumbed = hit(0.5, None, None);
         thumbed.storage_path = PathBuf::from(format!("/lib/ab/ab/{hash}.heic"));
         thumbed.thumbnails_generated = true;
-        let p = plan(&[thumbed], 30.0, &lib(), &HashMap::new());
-        match &p.segments[0] {
-            Segment::Photo(src, _) => {
-                let s = src.to_str().unwrap();
-                assert!(s.contains(".thumbs/m/"), "expected thumb path, got {s}");
-                assert!(s.ends_with(".jpg"));
-            }
-            _ => panic!("expected a photo"),
-        }
+        let slots = plan(&[thumbed], 30.0, &lib(), &HashMap::new());
+        assert_eq!(slots[0].kind, SlotKind::Photo);
+        let s = slots[0].source.to_str().unwrap();
+        assert!(s.contains(".thumbs/m/"), "expected thumb path, got {s}");
+        assert!(s.ends_with(".jpg"));
 
         // No thumbnail -> the original is used as-is.
         let raw = hit(0.5, None, None);
-        match &plan(&[raw], 30.0, &lib(), &HashMap::new()).segments[0] {
-            Segment::Photo(src, _) => assert_eq!(src, &PathBuf::from("/x")),
-            _ => panic!("expected a photo"),
-        }
+        let slots = plan(&[raw], 30.0, &lib(), &HashMap::new());
+        assert_eq!(slots[0].source, PathBuf::from("/x"));
     }
 
     #[test]
@@ -714,7 +885,7 @@ mod tests {
         let grid = grid_120bpm(30.0);
         // Two strong hits for many spans: reel ends after two spans.
         let results = vec![hit(0.5, Some(5.0), Some(60.0)), hit(0.5, None, None)];
-        let p = plan_synced(
+        let slots = plan_synced(
             &results,
             &grid,
             20.0,
@@ -722,24 +893,66 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert_eq!(p.segments.len(), 2);
-        assert!((p.segments[0].secs() - 2.0).abs() < 1e-9, "span-sized clip");
-        assert!((p.total_secs - 4.0).abs() < 1e-9);
-        match &p.segments[1] {
-            // No face data in the test fixtures, so the photo renders
-            // scenic (blur-fill) — the auto-framing default.
-            Segment::PhotoScenic(_, secs) => assert!((*secs - 2.0).abs() < 1e-9),
-            other => panic!("expected scenic photo, got {}", other.describe()),
-        }
+        assert_eq!(slots.len(), 2);
+        assert!((slots[0].duration - 2.0).abs() < 1e-9, "span-sized clip");
+        assert!((total_secs(&slots) - 4.0).abs() < 1e-9);
+        // No face data in the test fixtures, so the photo renders
+        // scenic (blur-fill) — the auto-framing default.
+        assert_eq!(slots[1].kind, SlotKind::PhotoScenic);
+        assert!((slots[1].duration - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plan_synced_marks_crossfades_at_section_boundaries() {
+        let mut grid = grid_120bpm(30.0);
+        // Sections: calm [0,4), hot [4,8), calm [8,...). At 120 BPM the
+        // spans are [0,2) [2,4) [4,5) [5,6) [6,7) [7,8) [8,10) ...
+        grid.high_energy = vec![(4.0, 8.0)];
+        let results: Vec<_> = (0..12).map(|_| hit(0.5, None, None)).collect();
+        let slots = plan_synced(
+            &results,
+            &grid,
+            12.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let spans = beat_spans(&grid, 12.0);
+        let fades: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s.transition_in, Transition::Crossfade { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // Exactly the two joints where the energy state flips.
+        let expected: Vec<usize> = (1..spans.len())
+            .filter(|&i| {
+                grid.is_high_energy((spans[i - 1].0 + spans[i - 1].1) / 2.0)
+                    != grid.is_high_energy((spans[i].0 + spans[i].1) / 2.0)
+            })
+            .collect();
+        assert_eq!(fades, expected);
+        assert_eq!(fades.len(), 2, "into the hot section and out of it");
     }
 
     #[test]
     fn plan_always_takes_at_least_one_strong_hit() {
         // Target shorter than the first segment still yields that segment.
         let results = vec![hit(0.5, Some(5.0), Some(60.0))];
-        assert_eq!(
-            plan(&results, 1.0, &lib(), &HashMap::new()).segments.len(),
-            1
-        );
+        assert_eq!(plan(&results, 1.0, &lib(), &HashMap::new()).len(), 1);
+    }
+
+    #[test]
+    fn slot_serde_round_trips() {
+        let r = hit(0.42, Some(3.0), Some(20.0));
+        let mut slots = plan(std::slice::from_ref(&r), 30.0, &lib(), &HashMap::new());
+        slots[0].pinned = true;
+        slots[0].transition_in = Transition::Crossfade { secs: 0.5 };
+        let json = serde_json::to_string(&slots).unwrap();
+        let back: Vec<Slot> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].asset, slots[0].asset);
+        assert_eq!(back[0].kind, SlotKind::Video);
+        assert!(back[0].pinned);
+        assert_eq!(back[0].transition_in, Transition::Crossfade { secs: 0.5 });
     }
 }

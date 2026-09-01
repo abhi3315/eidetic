@@ -1236,7 +1236,7 @@ async fn main() -> anyhow::Result<()> {
                 voiceover_pairs = Some(pairs);
             }
 
-            let plan = match (&voiceover_pairs, &grid) {
+            let slots = match (&voiceover_pairs, &grid) {
                 (Some(pairs), _) => {
                     // Framing and scene data for the chosen shots (they may
                     // not overlap the prompt's search results).
@@ -1266,7 +1266,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 (None, None) => reel::plan(&results, total, &config.paths.library_dir, &scenes),
             };
-            if plan.segments.is_empty() {
+            if slots.is_empty() {
                 anyhow::bail!(
                     "nothing in the library matches {prompt:?} confidently enough for a reel"
                 );
@@ -1274,11 +1274,11 @@ async fn main() -> anyhow::Result<()> {
 
             println!(
                 "Cut list for {prompt:?} ({:.1}s from {} segment(s)):",
-                plan.total_secs,
-                plan.segments.len()
+                reel::total_secs(&slots),
+                slots.len()
             );
-            for (i, seg) in plan.segments.iter().enumerate() {
-                println!("  {:>2}. {}", i + 1, seg.describe());
+            for (i, slot) in slots.iter().enumerate() {
+                println!("  {:>2}. {}", i + 1, slot.describe());
             }
             if dry_run {
                 return Ok(());
@@ -1287,8 +1287,16 @@ async fn main() -> anyhow::Result<()> {
             println!("Rendering {w}x{h} @ 30fps…");
             let render_output = output.clone();
             let audio_clone = audio.clone();
+            let render_slots = slots.clone();
             tokio::task::spawn_blocking(move || {
-                reel::render(&plan, &render_output, w, h, fit, audio_clone.as_deref())
+                reel::render(
+                    &render_slots,
+                    &render_output,
+                    w,
+                    h,
+                    fit,
+                    audio_clone.as_deref(),
+                )
             })
             .await
             .context("render thread panicked")??;
