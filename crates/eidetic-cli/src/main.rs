@@ -1194,9 +1194,10 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|(w, h)| *w > 0 && *h > 0)
                 .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
             let (w, h) = if portrait { (1080, 1920) } else { (w, h) };
-            let fit = parse_fit(&frame, portrait)?;
+            // Validate the frame style before doing any expensive work.
+            reel::Fit::parse(&frame, portrait)?;
             // With variations only the reel.vN.mp4 paths are written; they
-            // get their own overwrite checks once known.
+            // get their own overwrite checks once planned.
             if !dry_run && variations <= 1 && output.exists() {
                 anyhow::bail!(
                     "{} already exists; pass a different --output",
@@ -1205,346 +1206,57 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let config = Config::from_env();
-            let models_dir = config.paths.models_cache.clone();
-            let prompt_clone = prompt.clone();
-            let query_emb = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
-                let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-                embedder.embed_text(&prompt_clone)
-            })
-            .await
-            .context("embedder thread panicked")?
-            .context("text embedding failed")?;
-
-            let pool = eidetic_db::connect(&config)
-                .await
-                .context("failed to connect to database")?;
-            let repo = eidetic_db::AssetsRepo::new(pool);
-
-            // Over-fetch: the plan trims to the target duration and drops the
-            // weak tail, so more candidates only ever improve the cut.
-            let candidates = (duration / 2.0).ceil() as u32 + 10;
-            let results = repo
-                .search(
-                    &prompt,
-                    query_emb.as_slice(),
-                    candidates,
-                    &eidetic_db::SearchFilters::default(),
-                )
-                .await
-                .context("search failed")?;
-
-            // The sharpness gate (goals-v0.8.md phase 0): a quality floor
-            // for shots picked blind. If it would empty the pool entirely,
-            // a soft reel beats no reel — keep the ungated list.
-            let results = if min_sharpness > 0.0 {
-                let library_dir = config.paths.library_dir.clone();
-                tokio::task::spawn_blocking(move || {
-                    let gated: Vec<_> = results
-                        .iter()
-                        .filter(|r| reel::sharp_enough(r, &library_dir, min_sharpness))
-                        .cloned()
-                        .collect();
-                    if gated.is_empty() && !results.is_empty() {
-                        eprintln!("sharpness gate would drop every candidate; keeping them all");
-                        results
-                    } else {
-                        gated
-                    }
-                })
-                .await
-                .context("sharpness thread panicked")?
-            } else {
-                results
+            let spec = project::ReelSpec {
+                prompt,
+                duration,
+                output,
+                width: w,
+                height: h,
+                frame,
+                audio,
+                min_sharpness,
+                variations,
             };
-
-            // Scene boundaries per video hit, so cuts snap to shots. Missing
-            // detection (imported pre-v0.5, or ffmpeg-less embed) just means
-            // plain windows for that video.
-            let mut scenes = std::collections::HashMap::new();
-            for r in &results {
-                if r.frame_ts.is_some()
-                    && let Some(s) = repo
-                        .fetch_video_scenes(r.id)
-                        .await
-                        .context("failed to load scene boundaries")?
-                {
-                    scenes.insert(r.id, s);
-                }
-            }
-
-            // With --audio: detect beats and sync cuts to them; the reel
-            // runs at most as long as the track. A track with no stable
-            // tempo (or missing ffmpeg) falls back to the fixed-window plan.
-            let mut grid = None;
-            #[allow(unused_mut)]
-            let mut voiceover_segments: Option<Vec<(f64, f64, String)>> = None;
-            let mut total = duration;
-            if let Some(track) = &audio {
-                if !track.exists() {
-                    anyhow::bail!("audio file not found: {}", track.display());
-                }
-                let track_clone = track.clone();
-                let pcm = tokio::task::spawn_blocking(move || {
-                    eidetic_ingest::video::extract_audio_pcm(&track_clone)
-                })
-                .await
-                .context("audio thread panicked")?
-                .context("failed to decode the audio track")?
-                .ok_or_else(|| anyhow::anyhow!("ffmpeg is required for --audio"))?;
-                let audio_len = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
-                total = duration.min(audio_len);
-                let pcm_for_beats = pcm.clone();
-                grid = tokio::task::spawn_blocking(move || {
-                    eidetic_ingest::beats::track_beats(&pcm_for_beats)
-                })
-                .await
-                .context("beat thread panicked")?;
-                match &grid {
-                    Some(g) => println!(
-                        "Beat grid: {:.1} BPM, {} beats, {} high-energy section(s)",
-                        g.bpm,
-                        g.beats.len(),
-                        g.high_energy.len()
-                    ),
-                    None => {
-                        // Not music — maybe narration. With a speech build,
-                        // Whisper decides: spoken words drive the shot list
-                        // (voiceover mode); otherwise fixed-length cuts.
-                        #[cfg(feature = "speech")]
-                        {
-                            let models_dir = config.paths.models_cache.clone();
-                            let segments =
-                                tokio::task::spawn_blocking(move || -> eidetic_ml::Result<_> {
-                                    let t =
-                                        eidetic_ml::speech::SpeechTranscriber::load(&models_dir)?;
-                                    t.transcribe(&pcm)
-                                })
-                                .await
-                                .context("transcription thread panicked")?
-                                .context("failed to transcribe the audio track")?;
-                            if segments.is_empty() {
-                                eprintln!(
-                                    "No stable tempo and no speech in {}; using fixed-length cuts.",
-                                    track.display()
-                                );
-                            } else {
-                                println!(
-                                    "Voiceover mode: {} spoken segment(s) drive the shot list",
-                                    segments.len()
-                                );
-                                voiceover_segments = Some(
-                                    segments
-                                        .into_iter()
-                                        .map(|s| (s.start_secs, s.end_secs, s.text))
-                                        .collect::<Vec<_>>(),
-                                );
-                            }
-                        }
-                        #[cfg(not(feature = "speech"))]
-                        {
-                            let _unused = pcm;
-                            eprintln!(
-                                "No stable tempo found in {} (voiceover mode needs a \
-                                 --features speech build); using fixed-length cuts.",
-                                track.display()
-                            );
-                        }
+            let projects = project::plan_projects(&spec, &config).await?;
+            if !dry_run {
+                for p in projects.iter().filter(|p| p.output != spec.output) {
+                    if p.output.exists() {
+                        anyhow::bail!(
+                            "{} already exists; pass a different --output",
+                            p.output.display()
+                        );
                     }
-                }
-            }
-
-            let mut focus = framing_focus(&config, &repo, &results).await?;
-
-            // Voiceover: each spoken span becomes a search; its best
-            // un-recently-used hit becomes the shot for exactly that span.
-            let mut voiceover_pairs: Option<Vec<(f64, eidetic_db::SearchResult)>> = None;
-            if let Some(segments) = &voiceover_segments {
-                let spans = reel::speech_spans(segments, 2.5, 8.0, total);
-                let texts: Vec<String> = spans.iter().map(|s| s.2.clone()).collect();
-                let models_dir = config.paths.models_cache.clone();
-                let embs =
-                    tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<Vec<f32>>> {
-                        let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-                        texts.iter().map(|t| e.embed_text(t)).collect()
-                    })
-                    .await
-                    .context("embedder thread panicked")?
-                    .context("failed to embed narration")?;
-
-                let mut pairs = Vec::with_capacity(spans.len());
-                let mut prev: Option<eidetic_core::AssetId> = None;
-                for ((start, end, text), emb) in spans.iter().zip(&embs) {
-                    let hits = repo
-                        .search(text, emb, 5, &eidetic_db::SearchFilters::default())
-                        .await
-                        .context("voiceover search failed")?;
-                    let chosen = hits
-                        .iter()
-                        .find(|h| Some(h.id) != prev)
-                        .or_else(|| hits.first());
-                    if let Some(hit) = chosen {
-                        prev = Some(hit.id);
-                        pairs.push((end - start, hit.clone()));
-                    }
-                }
-                voiceover_pairs = Some(pairs);
-            }
-
-            let slots = match (&voiceover_pairs, &grid) {
-                (Some(pairs), _) => {
-                    // Framing and scene data for the chosen shots (they may
-                    // not overlap the prompt's search results).
-                    let chosen: Vec<eidetic_db::SearchResult> =
-                        pairs.iter().map(|(_, r)| r.clone()).collect();
-                    focus.extend(framing_focus(&config, &repo, &chosen).await?);
-                    let mut all_scenes = scenes.clone();
-                    for r in &chosen {
-                        if r.frame_ts.is_some()
-                            && let Some(s) = repo
-                                .fetch_video_scenes(r.id)
-                                .await
-                                .context("failed to load scene boundaries")?
-                        {
-                            all_scenes.insert(r.id, s);
-                        }
-                    }
-                    reel::plan_assigned(pairs, &config.paths.library_dir, &all_scenes, &focus)
-                }
-                (None, Some(g)) => reel::plan_synced(
-                    &results,
-                    g,
-                    total,
-                    &config.paths.library_dir,
-                    &scenes,
-                    &focus,
-                ),
-                (None, None) => reel::plan(&results, total, &config.paths.library_dir, &scenes),
-            };
-            if slots.is_empty() {
-                anyhow::bail!(
-                    "nothing in the library matches {prompt:?} confidently enough for a reel"
-                );
-            }
-
-            // --variations N (goals-v0.8.md phase 0.5): N candidate cut
-            // lists — the shot pool rotated so each opens differently, the
-            // joint style cycled — as half-res previews. The human picks
-            // with eyes; the winner's project file re-renders full-res.
-            let variants: Vec<(PathBuf, Vec<eidetic_db::SearchResult>, Vec<reel::Slot>)> =
-                if variations <= 1 {
-                    vec![(output.clone(), Vec::new(), slots)]
-                } else {
-                    anyhow::ensure!(
-                        voiceover_pairs.is_none(),
-                        "--variations needs music or silence; a voiceover shot \
-                         list is determined by the narration"
-                    );
-                    let strong = reel::strong_prefix(&results).to_vec();
-                    (1..=variations as usize)
-                        .map(|v| {
-                            let mut pool = strong.clone();
-                            if !pool.is_empty() {
-                                let k = (v - 1) % pool.len();
-                                pool.rotate_left(k);
-                            }
-                            let name = format!("v{v}.mp4");
-                            (output.with_extension(name), pool, Vec::new())
-                        })
-                        .collect()
-                };
-
-            for (out, _, _) in &variants {
-                if !dry_run && out.exists() {
-                    anyhow::bail!(
-                        "{} already exists; pass a different --output",
-                        out.display()
-                    );
                 }
             }
 
             // Previews trade pixels for speed; the project files remember
             // the real geometry so the winner re-renders full-res.
-            let (rw, rh) = if variations > 1 {
-                ((w / 2) & !1, (h / 2) & !1)
-            } else {
-                (w, h)
-            };
+            let preview = (variations > 1).then_some(((w / 2) & !1, (h / 2) & !1));
 
-            for (v, (out, pool, base_slots)) in variants.into_iter().enumerate() {
-                let slots = if variations <= 1 {
-                    base_slots
-                } else {
-                    let mut s = match &grid {
-                        Some(g) => reel::plan_synced(
-                            &pool,
-                            g,
-                            total,
-                            &config.paths.library_dir,
-                            &scenes,
-                            &focus,
-                        ),
-                        None => reel::plan(&pool, total, &config.paths.library_dir, &scenes),
-                    };
-                    reel::restyle(&mut s, v);
-                    s
-                };
-                if slots.is_empty() {
-                    anyhow::bail!(
-                        "nothing in the library matches {prompt:?} confidently enough for a reel"
-                    );
-                }
-
-                println!(
-                    "Cut list for {prompt:?} ({:.1}s from {} segment(s)):",
-                    reel::total_secs(&slots),
-                    slots.len()
-                );
-                for (i, slot) in slots.iter().enumerate() {
-                    println!("  {:>2}. {}", i + 1, slot.describe());
-                }
+            for proj in &projects {
+                proj.print_cut_list();
                 if dry_run {
                     continue;
                 }
-
+                let (rw, rh) = preview.unwrap_or((w, h));
                 println!("Rendering {rw}x{rh} @ 30fps…");
-                let render_output = out.clone();
-                let audio_clone = audio.clone();
-                let render_slots = slots.clone();
-                tokio::task::spawn_blocking(move || {
-                    reel::render(
-                        &render_slots,
-                        &render_output,
-                        rw,
-                        rh,
-                        fit,
-                        audio_clone.as_deref(),
-                    )
-                })
-                .await
-                .context("render thread panicked")??;
-                println!("Wrote {}", out.display());
+                project::render_project(proj, preview).await?;
+                println!("Wrote {}", proj.output.display());
 
                 // Every render persists its cut list (goals-v0.8.md phase
                 // 0): the project file is what `reel edit` and agents
                 // mutate.
-                let proj = project::ReelProject::new(
-                    prompt.clone(),
-                    (w, h),
-                    frame.clone(),
-                    audio.clone(),
-                    grid.clone(),
-                    &out,
-                    slots,
-                );
-                let proj_path = project::ReelProject::path_for(&out);
+                let proj_path = project::ReelProject::path_for(&proj.output);
                 proj.save(&proj_path)?;
                 println!("Project {}", proj_path.display());
-                if let Some(otio_path) = export_path(export.as_deref(), &out)? {
-                    otio::export(&proj, &otio_path)?;
+                if let Some(otio_path) = export_path(export.as_deref(), &proj.output)? {
+                    otio::export(proj, &otio_path)?;
                     println!("OTIO    {}", otio_path.display());
                 }
             }
-            if variations > 1 && !dry_run {
+            if let Some((rw, rh)) = preview
+                && !dry_run
+            {
                 println!(
                     "Previews are {rw}x{rh}; re-render the winner full-res with \
                      `eidetic reel edit <winner>.eidetic.json`"
@@ -2141,29 +1853,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse a frame style (--frame, or a project file's `frame` field).
-/// `portrait` picks what auto means: portrait output follows faces,
-/// landscape keeps the classic pad.
-fn parse_fit(frame: &str, portrait: bool) -> anyhow::Result<reel::Fit> {
-    Ok(match frame {
-        "auto" if portrait => reel::Fit::Auto,
-        // Landscape output fits landscape sources anyway; auto keeps
-        // the classic pad there.
-        "auto" => reel::Fit::Pad,
-        "cover" => reel::Fit::Cover,
-        "blur" => reel::Fit::Blur,
-        "pad" => reel::Fit::Pad,
-        other => {
-            anyhow::bail!("invalid frame style {other:?}; valid values: auto, cover, blur, pad")
-        }
-    })
-}
-
 /// `eidetic reel edit` (goals-v0.8.md phase 0): structured mutations of a
 /// persisted cut list, then a re-render. Slot numbers are 1-based against
-/// the cut list as last printed; every op is resolved against that
-/// numbering before anything is applied, so combined ops don't shift each
-/// other's targets.
+/// the cut list as last printed; combined ops are resolved against that
+/// same numbering, then applied as pin/unpin → retime → transition → swap
+/// → drop → reorder (see `project::apply_ops`).
 #[allow(clippy::too_many_arguments)]
 async fn reel_edit(
     project_path: &std::path::Path,
@@ -2178,218 +1872,56 @@ async fn reel_edit(
     export: Option<&str>,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    use anyhow::{Context, ensure};
-    use std::collections::HashSet;
+    use anyhow::Context;
+    use project::EditOp;
+
+    // Flag pairs → structured ops. Number parsing happens here; slot
+    // validation happens in apply_ops against the loaded project.
+    let parse_slot = |flag: &str, s: &str| -> anyhow::Result<usize> {
+        s.parse()
+            .with_context(|| format!("--{flag} expects a slot number, got {s:?}"))
+    };
+    let mut ops: Vec<EditOp> = Vec::new();
+    for &slot in pin {
+        ops.push(EditOp::Pin { slot });
+    }
+    for &slot in unpin {
+        ops.push(EditOp::Unpin { slot });
+    }
+    for c in retime.chunks(2) {
+        ops.push(EditOp::Retime {
+            slot: parse_slot("retime", &c[0])?,
+            secs: c[1]
+                .parse()
+                .with_context(|| format!("--retime expects seconds, got {:?}", c[1]))?,
+        });
+    }
+    for c in transition.chunks(2) {
+        ops.push(EditOp::Transition {
+            slot: parse_slot("transition", &c[0])?,
+            style: c[1].clone(),
+        });
+    }
+    for c in swap.chunks(2) {
+        ops.push(EditOp::Swap {
+            slot: parse_slot("swap", &c[0])?,
+            query: c[1].clone(),
+        });
+    }
+    for &slot in drop {
+        ops.push(EditOp::Drop { slot });
+    }
+    if let Some(spec) = reorder {
+        let order = spec
+            .split(',')
+            .map(|t| parse_slot("reorder", t.trim()))
+            .collect::<anyhow::Result<Vec<usize>>>()?;
+        ops.push(EditOp::Reorder { order });
+    }
 
     let mut proj = project::ReelProject::load(project_path)?;
-    let n = proj.slots.len();
-    let idx = |slot: usize| -> anyhow::Result<usize> {
-        ensure!(
-            (1..=n).contains(&slot),
-            "no slot {slot}; the cut list has {n} slot(s)"
-        );
-        Ok(slot - 1)
-    };
-
-    // Parse paired ops up front so a bad argument fails before any mutation.
-    let swaps: Vec<(usize, String)> = swap
-        .chunks(2)
-        .map(|c| {
-            let s: usize = c[0]
-                .parse()
-                .with_context(|| format!("--swap expects a slot number, got {:?}", c[0]))?;
-            Ok((idx(s)?, c[1].clone()))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let retimes: Vec<(usize, f64)> = retime
-        .chunks(2)
-        .map(|c| {
-            let s: usize = c[0]
-                .parse()
-                .with_context(|| format!("--retime expects a slot number, got {:?}", c[0]))?;
-            let secs: f64 = c[1]
-                .parse()
-                .with_context(|| format!("--retime expects seconds, got {:?}", c[1]))?;
-            ensure!(
-                secs >= 0.3,
-                "--retime {s} {secs}: slots shorter than 0.3s read as glitches"
-            );
-            Ok((idx(s)?, secs))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let transitions: Vec<(usize, reel::Transition)> = transition
-        .chunks(2)
-        .map(|c| {
-            let s: usize = c[0]
-                .parse()
-                .with_context(|| format!("--transition expects a slot number, got {:?}", c[0]))?;
-            Ok((idx(s)?, reel::Transition::parse(&c[1])?))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let drops: HashSet<usize> = drop
-        .iter()
-        .map(|&s| idx(s))
-        .collect::<anyhow::Result<_>>()?;
-
-    for &s in pin {
-        proj.slots[idx(s)?].pinned = true;
-    }
-    for &s in unpin {
-        proj.slots[idx(s)?].pinned = false;
-    }
-    for &i in &drops {
-        ensure!(
-            !proj.slots[i].pinned,
-            "slot {} is pinned; --unpin {} first if you really want to drop it",
-            i + 1,
-            i + 1
-        );
-    }
-
-    for (i, secs) in &retimes {
-        let slot = &mut proj.slots[*i];
-        let mut secs = *secs;
-        // Clamp a video to the media past its in-point; a shortened file
-        // would silently desync everything after it.
-        if slot.kind == reel::SlotKind::Video
-            && let Ok(Some(p)) = eidetic_ingest::video::probe(&slot.source)
-            && let Some(d) = p.duration_secs
-        {
-            let avail = (d - slot.start).max(0.3);
-            if secs > avail {
-                eprintln!(
-                    "slot {}: only {avail:.1}s of media past the in-point; clamping",
-                    i + 1
-                );
-                secs = avail;
-            }
-        }
-        slot.duration = secs;
-    }
-
-    for (i, t) in &transitions {
-        if *i == 0 {
-            eprintln!("slot 1 opens the reel and has no joint; --transition 1 ignored");
-            continue;
-        }
-        proj.slots[*i].transition_in = *t;
-    }
-
-    if !swaps.is_empty() {
-        let config = Config::from_env();
-        for (i, _) in &swaps {
-            ensure!(
-                !proj.slots[*i].pinned,
-                "slot {} is pinned; --unpin {} first if you really want to swap it",
-                i + 1,
-                i + 1
-            );
-        }
-        let queries: Vec<String> = swaps.iter().map(|(_, q)| q.clone()).collect();
-        let models_dir = config.paths.models_cache.clone();
-        let embs = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<Vec<f32>>> {
-            let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-            queries.iter().map(|q| e.embed_text(q)).collect()
-        })
-        .await
-        .context("embedder thread panicked")?
-        .context("failed to embed swap queries")?;
-
-        let pool = eidetic_db::connect(&config)
-            .await
-            .context("failed to connect to database")?;
-        let repo = eidetic_db::AssetsRepo::new(pool);
-        let mut used: HashSet<eidetic_core::AssetId> = proj.slots.iter().map(|s| s.asset).collect();
-
-        for ((i, query), emb) in swaps.iter().zip(&embs) {
-            let hits = repo
-                .search(query, emb, 10, &eidetic_db::SearchFilters::default())
-                .await
-                .context("swap search failed")?;
-            // Prefer something not already in the reel and sharp enough; a
-            // swap that hands back a shot the user is looking at (or a
-            // blurry one) helps nobody. Degrade gracefully: unused beats
-            // sharp beats give-up.
-            let lib = config.paths.library_dir.clone();
-            let hit = hits
-                .iter()
-                .find(|h| {
-                    h.score > 0.0
-                        && !used.contains(&h.id)
-                        && reel::sharp_enough(h, &lib, reel::MIN_SHARPNESS)
-                })
-                .or_else(|| hits.iter().find(|h| h.score > 0.0 && !used.contains(&h.id)))
-                .or_else(|| hits.iter().find(|h| h.score > 0.0))
-                .with_context(|| format!("nothing in the library matches {query:?}"))?;
-            let mut scenes = std::collections::HashMap::new();
-            if hit.frame_ts.is_some()
-                && let Some(s) = repo
-                    .fetch_video_scenes(hit.id)
-                    .await
-                    .context("failed to load scene boundaries")?
-            {
-                scenes.insert(hit.id, s);
-            }
-            let focus = framing_focus(&config, &repo, std::slice::from_ref(hit)).await?;
-            let old = &proj.slots[*i];
-            let mut slot = reel::fill_span(
-                hit,
-                old.duration,
-                &config.paths.library_dir,
-                &scenes,
-                &focus,
-            );
-            // The joint belongs to the timeline position, not the shot.
-            slot.transition_in = old.transition_in;
-            used.insert(slot.asset);
-            println!("slot {}: {} -> {}", i + 1, old.describe(), slot.describe());
-            proj.slots[*i] = slot;
-        }
-    }
-
-    // Drops and the reorder both work over ORIGINAL indices: --reorder must
-    // name each surviving slot exactly once.
-    let survivors: Vec<usize> = (0..n).filter(|i| !drops.contains(i)).collect();
-    let order: Vec<usize> = match reorder {
-        None => survivors,
-        Some(spec) => {
-            let idxs: Vec<usize> =
-                spec.split(',')
-                    .map(|t| {
-                        let s: usize = t.trim().parse().with_context(|| {
-                            format!("--reorder expects slot numbers, got {t:?}")
-                        })?;
-                        idx(s)
-                    })
-                    .collect::<anyhow::Result<_>>()?;
-            let mut sorted = idxs.clone();
-            sorted.sort_unstable();
-            ensure!(
-                sorted == survivors,
-                "--reorder must list each remaining slot exactly once ({} slot(s): {})",
-                survivors.len(),
-                survivors
-                    .iter()
-                    .map(|i| (i + 1).to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            idxs
-        }
-    };
-    ensure!(
-        !order.is_empty(),
-        "every slot was dropped; nothing left to render"
-    );
-    let mut old: Vec<Option<reel::Slot>> = proj.slots.drain(..).map(Some).collect();
-    proj.slots = order
-        .iter()
-        .map(|&i| {
-            old[i]
-                .take()
-                .expect("order is a permutation, so each index is taken exactly once")
-        })
-        .collect();
+    let config = Config::from_env();
+    project::apply_ops(&mut proj, &ops, &config).await?;
 
     let render_output = output.unwrap_or_else(|| proj.output.clone());
     let render_output =
@@ -2402,8 +1934,7 @@ async fn reel_edit(
             render_output.display()
         );
     }
-    proj.output = render_output.clone();
-    proj.modified = chrono::Utc::now();
+    proj.output = render_output;
     proj.save(project_path)?;
     proj.print_cut_list();
     if let Some(otio_path) = export_path(export, &proj.output)? {
@@ -2414,77 +1945,10 @@ async fn reel_edit(
         return Ok(());
     }
 
-    if let Some(track) = &proj.audio {
-        ensure!(
-            track.exists(),
-            "the project's audio track has moved: {}",
-            track.display()
-        );
-    }
-    let (w, h) = (proj.width, proj.height);
-    let fit = parse_fit(&proj.frame, h > w)?;
-    println!("Rendering {w}x{h} @ 30fps…");
-    let slots = proj.slots.clone();
-    let audio = proj.audio.clone();
-    tokio::task::spawn_blocking(move || {
-        reel::render(&slots, &render_output, w, h, fit, audio.as_deref())
-    })
-    .await
-    .context("render thread panicked")??;
+    println!("Rendering {}x{} @ 30fps…", proj.width, proj.height);
+    project::render_project(&proj, None).await?;
     println!("Wrote {}", proj.output.display());
     Ok(())
-}
-
-/// Face-aware framing data (goals-v0.7.md phase 1b): which assets have
-/// faces (auto framing: faces → follow them with a cover-crop; none →
-/// scenic blur-fill), and the weighted horizontal face centre for videos.
-async fn framing_focus(
-    config: &Config,
-    repo: &eidetic_db::AssetsRepo,
-    results: &[eidetic_db::SearchResult],
-) -> anyhow::Result<std::collections::HashMap<eidetic_core::AssetId, f64>> {
-    use anyhow::Context;
-    let mut focus = std::collections::HashMap::new();
-    let faces_repo = eidetic_db::FacesRepo::new(
-        eidetic_db::connect(config)
-            .await
-            .context("failed to connect to database")?,
-    );
-    for r in results {
-        if focus.contains_key(&r.id) {
-            continue;
-        }
-        let faces = faces_repo
-            .fetch_face_boxes_for_asset(r.id)
-            .await
-            .context("failed to load faces for framing")?;
-        if faces.is_empty() {
-            continue;
-        }
-        // Photos only need presence (Ken Burns centres itself); videos get
-        // a weighted horizontal centre when the pixel width is known.
-        let mut fx = 0.5;
-        if r.frame_ts.is_some()
-            && let Some(width) = repo
-                .fetch_by_id(r.id)
-                .await
-                .context("failed to load asset for framing")?
-                .and_then(|d| d.pixel_width)
-                .filter(|w| *w > 0)
-        {
-            let mut weight = 0.0f64;
-            let mut cx = 0.0f64;
-            for ((x, _, w, _), score) in &faces {
-                cx += (x + w / 2.0) as f64 * *score as f64;
-                weight += *score as f64;
-            }
-            if weight > 0.0 {
-                fx = (cx / weight / width as f64).clamp(0.0, 1.0);
-            }
-        }
-        focus.insert(r.id, fx);
-    }
-    Ok(focus)
 }
 
 /// Scene-aware sample timestamps for a video: detect scene boundaries once

@@ -361,6 +361,24 @@ pub enum Fit {
 }
 
 impl Fit {
+    /// Parse a frame style (--frame, or a project file's `frame` field).
+    /// `portrait` picks what auto means: portrait output follows faces,
+    /// landscape keeps the classic pad.
+    pub fn parse(frame: &str, portrait: bool) -> Result<Fit> {
+        Ok(match frame {
+            "auto" if portrait => Fit::Auto,
+            // Landscape output fits landscape sources anyway; auto keeps
+            // the classic pad there.
+            "auto" => Fit::Pad,
+            "cover" => Fit::Cover,
+            "blur" => Fit::Blur,
+            "pad" => Fit::Pad,
+            other => {
+                bail!("invalid frame style {other:?}; valid values: auto, cover, blur, pad")
+            }
+        })
+    }
+
     /// Resolve Auto per segment: `focused` = this clip has face data.
     fn resolve(self, focused: bool) -> Fit {
         match self {
