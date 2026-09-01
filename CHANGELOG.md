@@ -2,6 +2,33 @@
 
 All notable user-facing changes between Eidetic releases.
 
+## v0.8.0 — 2026-09-01
+
+The agentic edit engine (goals-v0.8 phases 0–2): the reel pipeline becomes an object an AI agent can inspect and mutate turn by turn, and `eidetic mcp` hands it to any MCP client — Claude Code, Codex, Cursor, or a fully local LM Studio/Ollama model. The founding anti-goal is reworded, deliberately: **no cloud required** (connecting a cloud agent is an explicit opt-in; tools never return pixels).
+
+### Added
+
+- **Reel project files** — every render writes `<output>.eidetic.json`: the cut list (each slot with asset id, source, in/out, focus, score, pin state, transition) plus prompt, geometry, audio and beat grid. Deterministic re-renders from the file; the object agents and edits mutate instead of regenerating.
+- **`eidetic reel edit`** — structured ops against a project file, then a re-render: `--swap N "query"` (SigLIP-resolved, keeps the slot length so beat sync survives, prefers unused + sharp hits), `--drop N`, `--pin/--unpin N`, `--retime N SECS` (videos clamp to real media), `--transition N STYLE[:secs]`, `--reorder 3,1,2`. All numbers resolve against the cut list as last printed; edits save before rendering so a failed render never loses one.
+- **Transition vocabulary** — cut, crossfade, dip-to-black, slide, whip (ffmpeg xfade chain with per-joint styles). Beat sync survives overlaps: the outgoing clip extends past its out-point by the fade length, clamped to real media, degrading to a cut. Auto rules stay austere — hard cuts on beats, crossfades where the music crosses an energy-section boundary, and musical reels fade the video tail out with the audio.
+- **Music-structure planning** — the first span of each high-energy section (the drop) takes the best remaining hit; the reel still opens strong, but its strongest moment lands where the song peaks.
+- **Sharpness gate** — Laplacian variance at 640px, measured on what would actually render (photo thumbnail / video frame at the matched moment); candidates under `--min-sharpness` (default 12, calibrated on real media) never enter a reel. Unmeasurable counts as sharp: the gate catches definite junk, it doesn't veto on doubt.
+- **`--variations N`** — N candidate reels from one prompt (rotated shot pools, cycled joint styles) as half-resolution previews with full project files; the human picks with eyes, the winner re-renders full-res from its project file. The LLM judges cut lists, the human judges pixels — that division is permanent.
+- **OpenTimelineIO export** — `--export otio` (also `reel edit`, also an MCP tool): plain-JSON OTIO with clip source ranges at each file's real frame rate, one video track of cuts + the music track. Opens with live clips in Kdenlive 25.04+ / DaVinci Resolve 18.5+; validated against the reference Python opentimelineio (parse + round-trip).
+- **`eidetic mcp`** — stdio MCP server on the official Rust SDK ([ADR-0012](docs/adr/0012-mcp-agent-pairing.md)): context tools (`search_library` with filters, `list_persons`, `faces_in`, `scenes`, `beats`, `transcript`, `library_stats`) and edit tools (`create_reel` plans + saves without rendering, `edit_reel` applies op batches, `render` with `preview:true` at half-res, `export_otio`). Compact metadata-only JSON throughout. Register: `claude mcp add eidetic -- eidetic mcp`.
+- **The director playbook** — [docs/director-playbook.md](docs/director-playbook.md): the editing conventions an agent should follow (hook first, never end weak, hero on the drop, transitions as punctuation, iterate-before-render, cost discipline).
+
+### Verified on the real-media corpus
+
+- Beat-synced portrait reel with a dynamic click track: crossfades landed exactly at the energy-section boundaries, total duration exact to the beat grid (20.000s), dissolves visually confirmed frame-by-frame.
+- Edit ops end-to-end: pinned slots refused drop/swap; swap kept span length; reorder + retime + transitions re-rendered to the same beat-true duration.
+- Sharpness gate: σ3-blurred photo (9.6) and blurred video frame (4.0) dropped, soft-but-usable (19+) kept.
+- MCP server driven over raw stdio JSON-RPC: initialize → tools/list (11 tools) → search/persons/beats → create → edit (including the pinned-slot refusal surfacing as a tool error) → half-res render → OTIO export → clean shutdown.
+
+### Internals
+
+- `Segment` enum → serializable `Slot` struct; generation extracted to `project::plan_projects` and edits to `project::apply_ops` (shared by CLI and MCP; stdout is reserved for the MCP protocol). `VideoProbe` gains `avg_frame_rate`; `eidetic-db` gains `fetch_transcript`. New deps: `rmcp` 3.2 (official MCP SDK) + `schemars`; xfade chains normalise timebases (`settb=AVTB`).
+
 ## v0.7.0 — 2026-09-01
 
 The reel studio (goals-v0.7 phases 1 + 1b) plus the library stewardship a completeness audit demanded before the v0.8 agent work.

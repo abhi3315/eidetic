@@ -1,6 +1,6 @@
 # Goals: v0.8 — the agentic edit engine
 
-Status: proposed (2026-08-22)
+Status: shipped in v0.8.0 (2026-09-01) — phases 0, 0.5, 1 and 2 complete; phase 3 validated at the protocol level (raw stdio JSON-RPC), full local-LLM session pending a machine with LM Studio/Ollama. Two scoping notes from implementation: labeled song sections (intro/verse/chorus) were dropped as redundant — `high_energy` spans + duration carry the same information, and the hero-shot-on-the-drop assignment uses them directly; lyrics-over-music moved from "persist at plan time" to "the MCP `beats`/`transcript` tools + a speech build transcribe on demand", so nothing speculative is stored in project files.
 
 The pivot, in the owner's words: eidetic started as an Immich alternative; it should become a production-level reel/editing tool — and instead of growing its own intelligence, it should **pair with an AI agent** (Claude Code, Codex, or a local LLM) that directs the editing with full context of the library. Market-validated on 2026-08-22.
 
