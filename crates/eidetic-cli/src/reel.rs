@@ -615,6 +615,12 @@ const SECTION_FADE_SECS: f64 = 0.5;
 /// Joints where the music crosses an energy-section boundary are marked as
 /// crossfades (the cut vocabulary's one softener): the eye reads the
 /// dissolve as "the song changed here".
+///
+/// Music structure shapes the assignment (goals-v0.8.md phase 0.5): the
+/// hero shots are saved for the drops. The first span of each high-energy
+/// section gets the best remaining hit; every other span takes the rest in
+/// score order — so the reel still opens strong, but its strongest moment
+/// lands where the song peaks.
 pub fn plan_synced(
     results: &[SearchResult],
     grid: &BeatGrid,
@@ -631,19 +637,37 @@ pub fn plan_synced(
         .take_while(|r| r.score > 0.0 && (r.score as f64) >= floor)
         .collect();
 
+    let n = spans.len().min(strong.len());
+    let hot: Vec<bool> = spans
+        .iter()
+        .map(|(a, b)| grid.is_high_energy((a + b) / 2.0))
+        .collect();
+    // Which hit fills which span: drops first (best hits), rest in order.
+    let mut hit_for_span = vec![usize::MAX; n];
+    let mut next = 0usize;
+    for i in 0..n {
+        if hot[i] && (i == 0 || !hot[i - 1]) {
+            hit_for_span[i] = next;
+            next += 1;
+        }
+    }
+    for h in &mut hit_for_span {
+        if *h == usize::MAX {
+            *h = next;
+            next += 1;
+        }
+    }
+
     let mut slots = Vec::new();
     let mut total = 0.0;
-    for ((_, end), r) in spans.iter().zip(&strong) {
+    for (i, (_, end)) in spans.iter().enumerate().take(n) {
         let span = end - total;
-        let slot = fill_span(r, span, library_dir, scenes, focus);
+        let slot = fill_span(strong[hit_for_span[i]], span, library_dir, scenes, focus);
         total += slot.duration;
         slots.push(slot);
     }
     for i in 1..slots.len() {
-        let (a, b) = (spans[i - 1], spans[i]);
-        let before = grid.is_high_energy((a.0 + a.1) / 2.0);
-        let after = grid.is_high_energy((b.0 + b.1) / 2.0);
-        if before != after {
+        if hot[i - 1] != hot[i] {
             slots[i].transition_in = Transition::Crossfade {
                 secs: SECTION_FADE_SECS,
             };
@@ -1058,6 +1082,31 @@ mod tests {
             .collect();
         assert_eq!(fades, expected);
         assert_eq!(fades.len(), 2, "into the hot section and out of it");
+    }
+
+    #[test]
+    fn plan_synced_saves_the_hero_shot_for_the_drop() {
+        let mut grid = grid_120bpm(30.0);
+        grid.high_energy = vec![(4.0, 8.0)];
+        // Distinct descending scores so slots are traceable to hits.
+        let results: Vec<_> = (0..12)
+            .map(|i| hit(0.5 - i as f32 * 0.01, None, None))
+            .collect();
+        let slots = plan_synced(
+            &results,
+            &grid,
+            12.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        // Spans: [0,2) [2,4) | hot [4,5) [5,6) [6,7) [7,8) | [8,10) [10,12).
+        // The first hot span (index 2) is the drop: it gets the best hit.
+        assert!((slots[2].score - 0.5).abs() < 1e-6, "hero on the drop");
+        // The reel still opens with the best remaining hit.
+        assert!((slots[0].score - 0.49).abs() < 1e-6);
+        // Everything else keeps score order down the timeline.
+        assert!(slots[3].score > slots[4].score);
     }
 
     #[test]
