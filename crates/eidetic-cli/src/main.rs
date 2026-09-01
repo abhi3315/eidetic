@@ -96,6 +96,26 @@ enum Command {
         /// Output results as a JSON array with all fields.
         #[arg(long)]
         json: bool,
+
+        /// Only assets containing this (named) person.
+        #[arg(long)]
+        person: Option<String>,
+
+        /// Only assets taken on/after this date (YYYY-MM-DD).
+        #[arg(long)]
+        after: Option<String>,
+
+        /// Only assets taken before this date (YYYY-MM-DD, exclusive).
+        #[arg(long)]
+        before: Option<String>,
+
+        /// Only assets whose place/state/country matches this substring.
+        #[arg(long)]
+        place: Option<String>,
+
+        /// Only this kind of asset: image or video.
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Cut a short reel from the library for a prompt (needs ffmpeg).
     Reel {
@@ -146,6 +166,21 @@ enum Command {
         #[arg(long, default_value_t = dupes::PHOTO_THRESHOLD)]
         threshold: f32,
     },
+    /// Remove assets from the library: the database rows, the stored
+    /// original, thumbnails, playback copies and face crops. Without
+    /// --force this only prints what would be removed.
+    Rm {
+        /// Asset references: id, content hash, storage path, or an
+        /// unambiguous original filename.
+        refs: Vec<String>,
+
+        /// Actually delete. The default is a dry run.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Verify library integrity: re-hash every stored original against the
+    /// database and report corruption, missing files and orphans.
+    Verify,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1059,7 +1094,12 @@ async fn main() -> anyhow::Result<()> {
             // weak tail, so more candidates only ever improve the cut.
             let candidates = (duration / 2.0).ceil() as u32 + 10;
             let results = repo
-                .search(&prompt, query_emb.as_slice(), candidates)
+                .search(
+                    &prompt,
+                    query_emb.as_slice(),
+                    candidates,
+                    &eidetic_db::SearchFilters::default(),
+                )
                 .await
                 .context("search failed")?;
 
@@ -1181,7 +1221,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut prev: Option<eidetic_core::AssetId> = None;
                 for ((start, end, text), emb) in spans.iter().zip(&embs) {
                     let hits = repo
-                        .search(text, emb, 5)
+                        .search(text, emb, 5, &eidetic_db::SearchFilters::default())
                         .await
                         .context("voiceover search failed")?;
                     let chosen = hits
@@ -1554,11 +1594,187 @@ async fn main() -> anyhow::Result<()> {
             println!("Nothing was changed; review and delete by hand if warranted.");
         }
 
+        Command::Rm { refs, force } => {
+            if refs.is_empty() {
+                anyhow::bail!("nothing to remove; pass asset ids, hashes or paths");
+            }
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::AssetsRepo::new(pool);
+
+            let mut manifests = Vec::new();
+            for needle in &refs {
+                let id = repo
+                    .resolve_asset(needle)
+                    .await
+                    .with_context(|| format!("failed to resolve {needle:?}"))?
+                    .with_context(|| format!("no asset matches {needle:?}"))?;
+                let manifest = repo
+                    .fetch_removal_manifest(id)
+                    .await?
+                    .with_context(|| format!("asset {id} vanished mid-run"))?;
+                manifests.push(manifest);
+            }
+
+            for m in &manifests {
+                println!(
+                    "{}  {}  ({} face(s){})",
+                    m.id,
+                    m.original_filename,
+                    m.face_ids.len(),
+                    if m.playback_path.is_some() {
+                        ", playback copy"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            if !force {
+                println!(
+                    "Dry run: {} asset(s) listed. Re-run with --force to delete them, \
+                     their thumbnails, playback copies and face crops.",
+                    manifests.len()
+                );
+                return Ok(());
+            }
+
+            let lib = &config.paths.library_dir;
+            let mut removed = 0u32;
+            for m in manifests {
+                // DB first: if this fails nothing on disk is touched; if a
+                // file removal fails afterwards, verify will report the
+                // orphan rather than the library lying about a half-gone
+                // asset.
+                if !repo.delete_asset(m.id).await? {
+                    eprintln!("  {} was already gone from the database", m.id);
+                    continue;
+                }
+                let mut paths = vec![
+                    m.storage_path.clone(),
+                    eidetic_ingest::thumbnail::thumbnail_path(
+                        lib,
+                        &m.hash,
+                        eidetic_ingest::thumbnail::ThumbSize::Small,
+                    ),
+                    eidetic_ingest::thumbnail::thumbnail_path(
+                        lib,
+                        &m.hash,
+                        eidetic_ingest::thumbnail::ThumbSize::Medium,
+                    ),
+                ];
+                if let Some(p) = &m.playback_path {
+                    paths.push(p.clone());
+                }
+                for f in &m.face_ids {
+                    paths.push(lib.join(".faces").join(format!("{}.jpg", f.as_uuid())));
+                }
+                for p in paths {
+                    match std::fs::remove_file(&p) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => eprintln!("  warning: could not remove {}: {e}", p.display()),
+                    }
+                }
+                println!("Removed {} ({})", m.id, m.original_filename);
+                removed += 1;
+            }
+            println!("Done. Removed {removed} asset(s).");
+        }
+
+        Command::Verify => {
+            let config = Config::from_env();
+            let pool = eidetic_db::connect(&config)
+                .await
+                .context("failed to connect to database")?;
+            let repo = eidetic_db::AssetsRepo::new(pool);
+
+            let assets = repo
+                .fetch_all_hashes()
+                .await
+                .context("failed to list assets")?;
+            let total = assets.len();
+            println!("Verifying {total} asset(s)…");
+
+            let mut known = std::collections::HashSet::new();
+            let (mut ok, mut corrupt, mut missing) = (0u32, 0u32, 0u32);
+            for (id, expected, path) in assets {
+                known.insert(expected.clone());
+                let p = path.clone();
+                let hashed = tokio::task::spawn_blocking(move || eidetic_ingest::hash_file(&p))
+                    .await
+                    .context("hash thread panicked")?;
+                match hashed {
+                    Ok(actual) if actual.to_string() == expected => ok += 1,
+                    Ok(actual) => {
+                        eprintln!(
+                            "CORRUPT  {id}  {}\n  expected {expected}\n  actual   {actual}",
+                            path.display()
+                        );
+                        corrupt += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("MISSING  {id}  {} ({e})", path.display());
+                        missing += 1;
+                    }
+                }
+            }
+
+            // Orphans: CAS files (two-level hash shards) whose stem no row
+            // claims. Derived trees (.thumbs/.playback/.faces) are skipped —
+            // they are regenerable and cleaned by rm.
+            let mut orphans = 0u32;
+            let lib = &config.paths.library_dir;
+            if lib.is_dir() {
+                for shard in std::fs::read_dir(lib).into_iter().flatten().flatten() {
+                    let name = shard.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with('.') || !shard.path().is_dir() || name.len() != 2 {
+                        continue;
+                    }
+                    for sub in std::fs::read_dir(shard.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        for file in std::fs::read_dir(sub.path())
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                        {
+                            let path = file.path();
+                            let stem = path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if !known.contains(&stem) {
+                                eprintln!("ORPHAN   {}", path.display());
+                                orphans += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!(
+                "Done. {ok} ok, {corrupt} corrupt, {missing} missing, {orphans} orphan file(s)."
+            );
+            if corrupt > 0 || missing > 0 {
+                std::process::exit(1);
+            }
+        }
+
         Command::Search {
             query,
             limit,
             fields,
             json,
+            person,
+            after,
+            before,
+            place,
+            kind,
         } => {
             // Validate fields early to fail fast before any model loading.
             if let Some(ref f) = fields {
@@ -1589,8 +1805,37 @@ async fn main() -> anyhow::Result<()> {
                 .context("failed to connect to database")?;
             let repo = eidetic_db::AssetsRepo::new(pool);
 
+            let parse_day =
+                |s: &str, label: &str| -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+                    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .with_context(|| format!("invalid --{label} {s:?}, expected YYYY-MM-DD"))?;
+                    Ok(chrono::DateTime::from_naive_utc_and_offset(
+                        date.and_hms_opt(0, 0, 0).expect("midnight exists"),
+                        chrono::Utc,
+                    ))
+                };
+            if let Some(k) = &kind
+                && k != "image"
+                && k != "video"
+            {
+                anyhow::bail!("invalid --kind {k:?}; valid values: image, video");
+            }
+            let filters = eidetic_db::SearchFilters {
+                person,
+                after: after
+                    .as_deref()
+                    .map(|s| parse_day(s, "after"))
+                    .transpose()?,
+                before: before
+                    .as_deref()
+                    .map(|s| parse_day(s, "before"))
+                    .transpose()?,
+                place,
+                kind,
+            };
+
             let results = repo
-                .search(&query, query_emb.as_slice(), limit)
+                .search(&query, query_emb.as_slice(), limit, &filters)
                 .await
                 .context("search failed")?;
 

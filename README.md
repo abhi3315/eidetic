@@ -16,6 +16,7 @@ Written in Rust.
   - Videos are probed with ffprobe ([ADR-0011](docs/adr/0011-video-pipeline.md)): duration, codec, rotation-aware dimensions, creation date, and the QuickTime GPS tag iPhones write — which geocodes offline exactly like photo EXIF. A representative frame becomes the thumbnail. ffmpeg is a *runtime* dependency: without it videos still import, and one warning tells you what to install.
 - `eidetic embed`: generate SigLIP 2 embeddings for all imported images and videos (~1.4 GiB model download on first run). Videos are scene-detected once (ffmpeg), then sampled one frame per shot (duration-scaled, up to 24) with each frame stored under its timestamp; single-shot clips fall back to even sampling.
 - `eidetic search "dog on beach"`: find photos *and video moments* by natural-language description
+  - Structured filters combine with semantic ranking: `--person "Maa"`, `--after 2025-01-01`, `--before 2025-06-01`, `--place kashmir`, `--kind image|video`
   - Video results carry the timestamp of the best-matching frame (`@7.0s` on default output, `ts` as a field)
   - `--limit N`: number of results (default 10)
   - `--fields score,ts,date,path`: tab-separated column output
@@ -38,6 +39,8 @@ Written in Rust.
 - `eidetic transcribe`: transcribe speech in videos with Whisper (needs a `--features speech` build), so search finds spoken words — "ask not what your country" returns the video where it's said, at the moment it's said, ranked above visual matches. Transcripts are recall fuel, never displayed as subtitles: casual home audio transcribes too roughly to show. Silent tracks are skipped by an energy gate
 - `eidetic transcode`: generate browser-playable H.264 copies of videos whose codec or container browsers can't stream (HEVC iPhone footage, MKV). Cheap remux when only the container is wrong; originals never touched; the web player picks the copy automatically
 - `eidetic serve`: localhost web viewer — thumbnail grid (videos play inline with seeking), semantic search, per-asset detail, and a People section with face-crop grids per person (naming stays in the CLI). Also exposes the library read-only over **WebDAV** at `/dav/` in a virtual `year/month/filename` tree — mount it from any file manager (`dav://127.0.0.1:8080/dav/`)
+- `eidetic rm <id|hash|path>…`: remove assets — the database rows plus the stored original, thumbnails, playback copies and face crops. Dry-run by default; `--force` deletes
+- `eidetic verify`: integrity check — re-hashes every stored original against the database, reports corruption, missing files and orphans; exits non-zero on damage
 - `eidetic dupes`: report perceptual duplicates — re-exported photos, re-encoded/remuxed/truncated copies of videos — by comparing the SigLIP embeddings the library already stores. Reporting only; nothing is deleted
 - `eidetic stats`: library summary (asset counts, size, date range, embedding coverage)
 - `eidetic hash <file>`: SHA-256 a file, no setup needed

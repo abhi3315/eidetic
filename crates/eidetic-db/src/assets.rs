@@ -92,6 +92,43 @@ pub struct SearchResult {
     pub longitude: Option<f64>,
 }
 
+/// Filesystem residue of one asset, for `eidetic rm`.
+#[derive(Debug)]
+pub struct RemovalManifest {
+    pub id: AssetId,
+    pub hash: eidetic_core::Sha256,
+    pub original_filename: String,
+    pub storage_path: PathBuf,
+    pub playback_path: Option<PathBuf>,
+    pub face_ids: Vec<eidetic_core::FaceId>,
+}
+
+/// Structured search filters combined with semantic ranking (v0.7.1).
+#[derive(Debug, Default)]
+pub struct SearchFilters {
+    /// Person name substring (matches named persons whose faces are in the
+    /// asset).
+    pub person: Option<String>,
+    /// RFC3339 lower bound on date_taken (falling back to import time).
+    pub after: Option<DateTime<Utc>>,
+    /// RFC3339 upper bound, exclusive.
+    pub before: Option<DateTime<Utc>>,
+    /// Substring over place / state / country.
+    pub place: Option<String>,
+    /// "image" or "video".
+    pub kind: Option<String>,
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        self.person.is_none()
+            && self.after.is_none()
+            && self.before.is_none()
+            && self.place.is_none()
+            && self.kind.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DavAsset {
     pub id: AssetId,
@@ -353,7 +390,17 @@ impl AssetsRepo {
         Ok(())
     }
 
-    pub async fn fetch_recent(&self, limit: u32) -> crate::Result<Vec<RecentAsset>> {
+    /// Total browsable assets — drives grid pagination.
+    pub async fn count_assets(&self) -> crate::Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM assets WHERE mime_type IS NOT NULL")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
+        Ok(n)
+    }
+
+    pub async fn fetch_recent(&self, limit: u32, offset: u32) -> crate::Result<Vec<RecentAsset>> {
         type Row = (
             String,
             String,
@@ -368,9 +415,10 @@ impl AssetsRepo {
              FROM assets \
              WHERE mime_type IS NOT NULL \
              ORDER BY imported_at DESC \
-             LIMIT ?",
+             LIMIT ? OFFSET ?",
         )
         .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -632,6 +680,7 @@ impl AssetsRepo {
         &self,
         query_text: &str,
         limit: u32,
+        allowed: Option<&std::collections::HashSet<AssetId>>,
     ) -> crate::Result<Vec<(AssetId, f64, String)>> {
         // FTS5 has its own query syntax; quoting each token neutralises it.
         let fts_query = query_text
@@ -661,6 +710,11 @@ impl AssetsRepo {
         let mut out = Vec::new();
         for (id, ts, text) in rows {
             let asset = parse_id(&id);
+            if let Some(allowed) = allowed
+                && !allowed.contains(&asset)
+            {
+                continue;
+            }
             if seen.insert(asset) {
                 out.push((asset, ts, text));
                 if out.len() == limit as usize {
@@ -682,11 +736,17 @@ impl AssetsRepo {
         query_text: &str,
         query_vec: &[f32],
         limit: u32,
+        filters: &SearchFilters,
     ) -> crate::Result<Vec<SearchResult>> {
         const SPEECH_SCORE: f32 = 0.35;
 
-        let semantic = self.search_similar(query_vec, limit).await?;
-        let spoken = self.search_transcripts(query_text, limit).await?;
+        let allowed = self.fetch_filtered_ids(filters).await?;
+        let semantic = self
+            .search_similar(query_vec, limit, allowed.as_ref())
+            .await?;
+        let spoken = self
+            .search_transcripts(query_text, limit, allowed.as_ref())
+            .await?;
         if spoken.is_empty() {
             return Ok(semantic);
         }
@@ -816,6 +876,150 @@ impl AssetsRepo {
             .collect())
     }
 
+    /// Resolve a user-supplied asset reference: a hyphenated UUID, a 64-hex
+    /// content hash, a storage path, or an original filename (which must be
+    /// unambiguous).
+    pub async fn resolve_asset(&self, needle: &str) -> crate::Result<Option<AssetId>> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(needle) {
+            let id = AssetId::from(uuid);
+            return Ok(self.fetch_by_id(id).await?.map(|d| d.id));
+        }
+        if needle.len() == 64 && needle.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return self.find_by_hash(&needle.to_lowercase()).await;
+        }
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM assets WHERE storage_path = ?1 OR original_filename = ?1",
+        )
+        .bind(needle)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [(id,)] => Ok(Some(parse_id(id))),
+            many => Err(crate::Error::CorruptRow {
+                table: "assets",
+                column: "original_filename",
+                detail: format!(
+                    "{needle:?} matches {} assets; use the id or content hash",
+                    many.len()
+                ),
+            }),
+        }
+    }
+
+    /// Everything `eidetic rm` must clean off the filesystem for one asset,
+    /// gathered BEFORE the row (and its cascading children) is deleted.
+    pub async fn fetch_removal_manifest(
+        &self,
+        id: AssetId,
+    ) -> crate::Result<Option<RemovalManifest>> {
+        let Some(detail) = self.fetch_by_id(id).await? else {
+            return Ok(None);
+        };
+        let face_ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM faces WHERE asset_id = ?")
+            .bind(id_text(id))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(Some(RemovalManifest {
+            id,
+            hash: detail.hash,
+            original_filename: detail.original_filename,
+            storage_path: detail.storage_path,
+            playback_path: detail.playback_path,
+            face_ids: face_ids
+                .into_iter()
+                .map(|(f,)| {
+                    eidetic_core::FaceId::from(
+                        uuid::Uuid::parse_str(&f)
+                            .expect("face id column holds hyphenated UUID text"),
+                    )
+                })
+                .collect(),
+        }))
+    }
+
+    /// Delete the asset row; every dependent table (embeddings, frames,
+    /// faces, transcripts, scenes, run markers) follows via ON DELETE
+    /// CASCADE, which `connect` enforces with foreign_keys=ON.
+    pub async fn delete_asset(&self, id: AssetId) -> crate::Result<bool> {
+        let result = sqlx::query("DELETE FROM assets WHERE id = ?")
+            .bind(id_text(id))
+            .execute(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// (id, hash, storage_path) for every asset — the `verify` input.
+    pub async fn fetch_all_hashes(&self) -> crate::Result<Vec<(AssetId, String, PathBuf)>> {
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, hash, storage_path FROM assets ORDER BY id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, hash, path)| (parse_id(&id), hash, PathBuf::from(path)))
+            .collect())
+    }
+
+    /// Asset ids passing the structured filters, or `None` when no filter is
+    /// set (meaning: don't restrict). Combines with semantic ranking in
+    /// `search`.
+    pub async fn fetch_filtered_ids(
+        &self,
+        filters: &SearchFilters,
+    ) -> crate::Result<Option<std::collections::HashSet<AssetId>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let mut sql = String::from("SELECT DISTINCT a.id FROM assets a");
+        if filters.person.is_some() {
+            sql.push_str(
+                " JOIN faces f ON f.asset_id = a.id \
+                  JOIN persons p ON p.id = f.person_id",
+            );
+        }
+        sql.push_str(" WHERE 1=1");
+        if filters.person.is_some() {
+            sql.push_str(" AND p.name LIKE ?");
+        }
+        if filters.after.is_some() {
+            sql.push_str(" AND COALESCE(a.date_taken, a.imported_at) >= ?");
+        }
+        if filters.before.is_some() {
+            sql.push_str(" AND COALESCE(a.date_taken, a.imported_at) < ?");
+        }
+        if filters.place.is_some() {
+            sql.push_str(" AND (a.place LIKE ? OR a.admin1 LIKE ? OR a.country_name LIKE ?)");
+        }
+        if let Some(kind) = &filters.kind {
+            match kind.as_str() {
+                "image" => sql.push_str(" AND a.mime_type LIKE 'image/%'"),
+                "video" => sql.push_str(" AND a.mime_type LIKE 'video/%'"),
+                _ => {}
+            }
+        }
+        let mut q = sqlx::query_as::<_, (String,)>(&sql);
+        if let Some(p) = &filters.person {
+            q = q.bind(format!("%{p}%"));
+        }
+        if let Some(a) = &filters.after {
+            q = q.bind(a);
+        }
+        if let Some(b) = &filters.before {
+            q = q.bind(b);
+        }
+        if let Some(pl) = &filters.place {
+            let like = format!("%{pl}%");
+            q = q.bind(like.clone()).bind(like.clone()).bind(like);
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(crate::Error::Query)?;
+        Ok(Some(rows.into_iter().map(|(id,)| parse_id(&id)).collect()))
+    }
+
     /// Rank every stored embedding against `query_vec` and hydrate the top hits.
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.
@@ -824,6 +1028,7 @@ impl AssetsRepo {
         &self,
         query_vec: &[f32],
         limit: u32,
+        allowed: Option<&std::collections::HashSet<AssetId>>,
     ) -> crate::Result<Vec<SearchResult>> {
         // Image embeddings and video frame embeddings rank in one pool; a
         // frame row carries its timestamp so the winning moment survives.
@@ -872,6 +1077,11 @@ impl AssetsRepo {
             ranked = Vec::new();
             for (row_idx, score) in ranked_rows {
                 let (asset_id, ts) = keys[row_idx];
+                if let Some(allowed) = allowed
+                    && !allowed.contains(&asset_id)
+                {
+                    continue;
+                }
                 if seen.insert(asset_id) {
                     ranked.push((asset_id, score, ts));
                     if ranked.len() == limit as usize {

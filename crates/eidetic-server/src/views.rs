@@ -139,6 +139,7 @@ header a.nav { font-weight: 400; color: #555; margin-left: 1rem; }
 .face-grid a { display: block; }
 .face-grid img.face-crop { width: 112px; height: 112px; object-fit: cover; border-radius: 4px; background: #eee; display: block; }
 .face-link { position: relative; display: inline-block; }
+.pages { display: flex; justify-content: space-between; margin: 16px 0; color: #666; }
 .face-link .face-play { position: absolute; right: 4px; bottom: 4px; font-size: 11px; color: #fff; background: rgba(0,0,0,.55); border-radius: 3px; padding: 0 4px; pointer-events: none; }
 .people-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.5rem; }
 .person-chip { display: flex; flex-direction: column; align-items: center; gap: 0.2rem; text-decoration: none; color: #111; font-size: 0.75rem; }
@@ -161,6 +162,27 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                     a class="nav" href="/persons" { "People" }
                 }
                 main { (body) }
+            }
+        }
+    }
+}
+
+/// Prev/next pagination for the home grid.
+pub(crate) fn page_nav(page: u32, pages: u32) -> Markup {
+    html! {
+        @if pages > 1 {
+            nav class="pages" {
+                @if page > 1 {
+                    a href=(format!("/?page={}", page - 1)) { "← newer" }
+                } @else {
+                    span {}
+                }
+                span { "page " (page) " / " (pages) }
+                @if page < pages {
+                    a href=(format!("/?page={}", page + 1)) { "older →" }
+                } @else {
+                    span {}
+                }
             }
         }
     }

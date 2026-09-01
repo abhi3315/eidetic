@@ -216,7 +216,7 @@ async fn index_with_empty_db_renders_empty_grid() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8_lossy(&body);
-    assert!(body_str.contains("Recent imports"));
+    assert!(body_str.contains("Library (0 assets)"), "{body_str}");
     assert!(body_str.contains("No results."));
 }
 

@@ -10,13 +10,31 @@ pub(crate) struct SearchQuery {
     pub limit: Option<u32>,
 }
 
-pub(crate) async fn index(State(state): State<AppState>) -> Result<Html<String>, ServerError> {
-    use crate::views::{GridTile, asset_grid, layout, search_form};
+#[derive(serde::Deserialize)]
+pub(crate) struct IndexQuery {
+    page: Option<u32>,
+}
+
+pub(crate) async fn index(
+    State(state): State<AppState>,
+    Query(q): Query<IndexQuery>,
+) -> Result<Html<String>, ServerError> {
+    use crate::views::{GridTile, asset_grid, layout, page_nav, search_form};
     use maud::html;
+
+    const PER_PAGE: u32 = 48;
+    let page = q.page.unwrap_or(1).max(1);
+    let total = state
+        .repo
+        .count_assets()
+        .await
+        .map_err(ServerError::DbFailed)?;
+    let pages = ((total as u32).div_ceil(PER_PAGE)).max(1);
+    let page = page.min(pages);
 
     let recent = state
         .repo
-        .fetch_recent(24)
+        .fetch_recent(PER_PAGE, (page - 1) * PER_PAGE)
         .await
         .map_err(ServerError::DbFailed)?;
 
@@ -35,8 +53,9 @@ pub(crate) async fn index(State(state): State<AppState>) -> Result<Html<String>,
 
     let body = html! {
         (search_form(""))
-        h2 { "Recent imports" }
+        h2 { "Library (" (total) " assets)" }
         (asset_grid(&tiles))
+        (page_nav(page, pages))
     };
 
     Ok(Html(layout("Home", body).into_string()))
@@ -80,7 +99,12 @@ pub(crate) async fn search(
 
     let results = state
         .repo
-        .search(&query_text, &query_vec, limit)
+        .search(
+            &query_text,
+            &query_vec,
+            limit,
+            &eidetic_db::SearchFilters::default(),
+        )
         .await
         .map_err(ServerError::DbFailed)?;
 

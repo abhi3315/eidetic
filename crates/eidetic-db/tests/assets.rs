@@ -324,7 +324,7 @@ async fn search_similar_orders_by_cosine_similarity() {
 
     // Query with e1: asset A should come first (score ~1.0), B second (score ~0.0).
     let query = emb_a.clone();
-    let results = repo.search_similar(&query, 10).await.expect("search");
+    let results = repo.search_similar(&query, 10, None).await.expect("search");
 
     assert_eq!(results.len(), 2);
     assert!(
@@ -588,7 +588,7 @@ async fn fetch_recent_orders_by_imported_at_desc() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let recent = repo.fetch_recent(10).await.expect("fetch_recent");
+    let recent = repo.fetch_recent(10, 0).await.expect("fetch_recent");
     assert_eq!(recent.len(), 3);
     assert_eq!(recent[0].original_filename, "img2.jpg");
     assert_eq!(recent[1].original_filename, "img1.jpg");
