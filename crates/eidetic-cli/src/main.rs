@@ -240,6 +240,12 @@ enum ReelAction {
         #[arg(long, num_args = 2, value_names = ["SLOT", "SECS"])]
         retime: Vec<String>,
 
+        /// Set the transition INTO slot N: --transition N crossfade.
+        /// Styles: cut, crossfade, dip, slide, whip — optionally with
+        /// :secs (e.g. crossfade:0.8). Repeatable. Slot 1 has no joint.
+        #[arg(long, num_args = 2, value_names = ["SLOT", "STYLE"])]
+        transition: Vec<String>,
+
         /// Reorder the (surviving) slots: a comma-separated permutation
         /// using the printed numbers, e.g. --reorder 3,1,2.
         #[arg(long)]
@@ -1136,6 +1142,7 @@ async fn main() -> anyhow::Result<()> {
                     pin,
                     unpin,
                     retime,
+                    transition,
                     reorder,
                     output,
                     export,
@@ -1150,6 +1157,7 @@ async fn main() -> anyhow::Result<()> {
                 &pin,
                 &unpin,
                 &retime,
+                &transition,
                 reorder,
                 output,
                 export.as_deref(),
@@ -2071,6 +2079,7 @@ async fn reel_edit(
     pin: &[usize],
     unpin: &[usize],
     retime: &[String],
+    transition: &[String],
     reorder: Option<String>,
     output: Option<PathBuf>,
     export: Option<&str>,
@@ -2115,6 +2124,15 @@ async fn reel_edit(
             Ok((idx(s)?, secs))
         })
         .collect::<anyhow::Result<_>>()?;
+    let transitions: Vec<(usize, reel::Transition)> = transition
+        .chunks(2)
+        .map(|c| {
+            let s: usize = c[0]
+                .parse()
+                .with_context(|| format!("--transition expects a slot number, got {:?}", c[0]))?;
+            Ok((idx(s)?, reel::Transition::parse(&c[1])?))
+        })
+        .collect::<anyhow::Result<_>>()?;
     let drops: HashSet<usize> = drop
         .iter()
         .map(|&s| idx(s))
@@ -2154,6 +2172,14 @@ async fn reel_edit(
             }
         }
         slot.duration = secs;
+    }
+
+    for (i, t) in &transitions {
+        if *i == 0 {
+            eprintln!("slot 1 opens the reel and has no joint; --transition 1 ignored");
+            continue;
+        }
+        proj.slots[*i].transition_in = *t;
     }
 
     if !swaps.is_empty() {

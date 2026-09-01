@@ -107,16 +107,91 @@ pub enum SlotKind {
     PhotoScenic,
 }
 
-/// The joint between a slot and its predecessor.
+/// The joint between a slot and its predecessor — the curated transition
+/// vocabulary (goals-v0.8.md phase 0.5). Overlap transitions (everything
+/// but Cut) consume media the outgoing clip supplies by extending past its
+/// out-point; render clamps to what actually exists there and falls back
+/// to a cut when almost none does.
+///
+/// The auto rules stay austere: hard cut on beats, crossfade across
+/// section changes, dip-to-black never mid-reel (the render fades the tail
+/// out instead). Slide and whip exist for explicit direction — a human's
+/// `--transition`, or an agent with an opinion.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Transition {
     #[default]
     Cut,
-    /// Crossfade over `secs`. The outgoing clip supplies the overlap by
-    /// extending past its out-point; render clamps to the media that
-    /// actually exists there and falls back to a cut when almost none does.
+    /// A dissolve — the section-change softener.
     Crossfade { secs: f64 },
+    /// Fade to black, then in from black. Heavy punctuation.
+    DipToBlack { secs: f64 },
+    /// The incoming shot slides in over the outgoing one.
+    Slide { secs: f64 },
+    /// A fast slide the eye reads as a whip pan.
+    Whip { secs: f64 },
+}
+
+impl Transition {
+    /// Overlap seconds this joint needs (0 for a hard cut).
+    pub fn secs(self) -> f64 {
+        match self {
+            Transition::Cut => 0.0,
+            Transition::Crossfade { secs }
+            | Transition::DipToBlack { secs }
+            | Transition::Slide { secs }
+            | Transition::Whip { secs } => secs,
+        }
+    }
+
+    /// The ffmpeg xfade `transition` name.
+    fn xfade_name(self) -> &'static str {
+        match self {
+            Transition::Cut => "fade", // unreachable in practice; secs() == 0
+            Transition::Crossfade { .. } => "fade",
+            Transition::DipToBlack { .. } => "fadeblack",
+            Transition::Slide { .. } => "slideleft",
+            Transition::Whip { .. } => "slideright",
+        }
+    }
+
+    /// Parse an edit-op style name, e.g. `crossfade` or `crossfade:0.8`
+    /// (seconds suffix optional; each style has a tasteful default).
+    pub fn parse(spec: &str) -> Result<Transition> {
+        let (name, secs) =
+            match spec.split_once(':') {
+                Some((n, s)) => (
+                    n,
+                    Some(s.parse::<f64>().map_err(|_| {
+                        anyhow::anyhow!("bad transition duration {s:?} in {spec:?}")
+                    })?),
+                ),
+                None => (spec, None),
+            };
+        let t = match name {
+            "cut" => Transition::Cut,
+            "crossfade" | "fade" => Transition::Crossfade {
+                secs: secs.unwrap_or(0.5),
+            },
+            "dip" | "dip-to-black" => Transition::DipToBlack {
+                secs: secs.unwrap_or(0.7),
+            },
+            "slide" => Transition::Slide {
+                secs: secs.unwrap_or(0.4),
+            },
+            "whip" => Transition::Whip {
+                secs: secs.unwrap_or(0.2),
+            },
+            other => bail!(
+                "unknown transition {other:?}; valid: cut, crossfade, dip, slide, whip \
+                 (optionally with :secs, e.g. crossfade:0.8)"
+            ),
+        };
+        if t.secs() < 0.0 || t.secs() > 3.0 {
+            bail!("transition duration {:.2}s is outside 0..3s", t.secs());
+        }
+        Ok(t)
+    }
 }
 
 impl Slot {
@@ -145,8 +220,15 @@ impl Slot {
                 )
             }
         };
-        if let Transition::Crossfade { secs } = self.transition_in {
-            s.push_str(&format!(" [xfade {secs:.1}s in]"));
+        if self.transition_in.secs() > 0.0 {
+            let name = match self.transition_in {
+                Transition::Cut => unreachable!("cut has no duration"),
+                Transition::Crossfade { .. } => "xfade",
+                Transition::DipToBlack { .. } => "dip-to-black",
+                Transition::Slide { .. } => "slide",
+                Transition::Whip { .. } => "whip",
+            };
+            s.push_str(&format!(" [{name} {:.1}s in]", self.transition_in.secs()));
         }
         if self.pinned {
             s.push_str(" [pinned]");
@@ -282,16 +364,16 @@ pub fn render(
     let mut seg_paths = Vec::with_capacity(slots.len());
 
     for (i, slot) in slots.iter().enumerate() {
-        // A crossfade into the NEXT slot needs this slot to run `fade` secs
-        // past its out-point — the overlap the dissolve consumes. Clamped to
-        // the media that exists there; near-zero falls back to a hard cut.
-        let fade = match slots.get(i + 1).map(|n| n.transition_in) {
-            Some(Transition::Crossfade { secs }) => extendable_secs(ffmpeg, slot, secs),
+        // An overlap transition into the NEXT slot needs this slot to run
+        // `fade` secs past its out-point — the media the joint consumes.
+        // Clamped to what exists there; near-zero falls back to a hard cut.
+        let fade = match slots.get(i + 1).map(|n| n.transition_in.secs()) {
+            Some(secs) if secs > 0.0 => extendable_secs(ffmpeg, slot, secs),
             _ => 0.0,
         };
         let seg_path = workdir.path().join(format!("seg_{i:03}.mp4"));
         let rendered = slot.duration + fade;
-        let vf = match slot.kind {
+        let mut vf = match slot.kind {
             SlotKind::Video => match slot.focus_x {
                 Some(fx) => focus_filter(width, height, fit.resolve(true), fx),
                 None => normalize_filter(width, height, fit.resolve(false)),
@@ -299,6 +381,14 @@ pub fn render(
             SlotKind::Photo => ken_burns_filter(width, height, rendered),
             SlotKind::PhotoScenic => blur_fill_filter(width, height),
         };
+        // Dip-to-black as an ENDING is the one place it always earns its
+        // keep: with music, the video tail fades with the audio's fade.
+        if i + 1 == slots.len() && audio.is_some() && slot.duration > 1.0 {
+            vf.push_str(&format!(
+                ",fade=t=out:st={:.3}:d=0.5",
+                (slot.duration - 0.5).max(0.0)
+            ));
+        }
         let mut cmd = Command::new(ffmpeg);
         cmd.args(["-y", "-v", "error"]);
         match slot.kind {
@@ -423,8 +513,9 @@ fn xfade_chain(
         let out = format!("v{i}");
         let fade = seg_paths[i - 1].1;
         if fade > 0.0 {
+            let name = slots[i].transition_in.xfade_name();
             graph.push_str(&format!(
-                "[{acc}][s{i}]xfade=transition=fade:duration={fade:.3}:offset={offset:.3}[{out}];"
+                "[{acc}][s{i}]xfade=transition={name}:duration={fade:.3}:offset={offset:.3}[{out}];"
             ));
         } else {
             graph.push_str(&format!("[{acc}][s{i}]concat=n=2:v=1:a=0[{out}];"));
@@ -974,6 +1065,30 @@ mod tests {
         // Target shorter than the first segment still yields that segment.
         let results = vec![hit(0.5, Some(5.0), Some(60.0))];
         assert_eq!(plan(&results, 1.0, &lib(), &HashMap::new()).len(), 1);
+    }
+
+    #[test]
+    fn transition_parse_names_and_durations() {
+        assert_eq!(Transition::parse("cut").unwrap(), Transition::Cut);
+        assert_eq!(
+            Transition::parse("crossfade").unwrap(),
+            Transition::Crossfade { secs: 0.5 }
+        );
+        assert_eq!(
+            Transition::parse("crossfade:0.8").unwrap(),
+            Transition::Crossfade { secs: 0.8 }
+        );
+        assert_eq!(
+            Transition::parse("dip").unwrap(),
+            Transition::DipToBlack { secs: 0.7 }
+        );
+        assert_eq!(
+            Transition::parse("whip").unwrap(),
+            Transition::Whip { secs: 0.2 }
+        );
+        assert!(Transition::parse("zoom").is_err());
+        assert!(Transition::parse("slide:9").is_err(), "outside 0..3s");
+        assert!(Transition::parse("slide:x").is_err());
     }
 
     #[test]
