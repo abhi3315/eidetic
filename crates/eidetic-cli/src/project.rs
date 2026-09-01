@@ -491,7 +491,7 @@ pub(crate) async fn framing_focus(
 /// One structured mutation of a cut list. `slot` numbers are 1-based
 /// against the cut list as last printed; a batch resolves every number
 /// against that same numbering before anything is applied.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOp {
     /// Protect a slot from swap/drop.

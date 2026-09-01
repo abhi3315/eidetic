@@ -1,5 +1,6 @@
 mod dupes;
 mod eval;
+mod mcp;
 mod otio;
 mod project;
 mod reel;
@@ -211,6 +212,11 @@ enum Command {
     /// Verify library integrity: re-hash every stored original against the
     /// database and report corruption, missing files and orphans.
     Verify,
+    /// Serve the library to an AI agent over MCP on stdio (goals-v0.8.md).
+    /// Tools return metadata only — paths, timecodes, scores, transcripts —
+    /// never pixels. Register in Claude Code with:
+    ///   claude mcp add eidetic -- eidetic mcp
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -1262,6 +1268,10 @@ async fn main() -> anyhow::Result<()> {
                      `eidetic reel edit <winner>.eidetic.json`"
                 );
             }
+        }
+
+        Command::Mcp => {
+            mcp::serve().await?;
         }
 
         Command::Transcode => {

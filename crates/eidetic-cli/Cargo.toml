@@ -33,6 +33,8 @@ eidetic-ml = { path = "../eidetic-ml", default-features = false }
 eidetic-server = { path = "../eidetic-server", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
 csv = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

@@ -656,3 +656,62 @@ async fn fetch_by_id_returns_full_row_or_none() {
         .expect("fetch");
     assert!(missing.is_none());
 }
+
+#[tokio::test]
+async fn transcript_round_trips_in_order() {
+    let (_tmp, config) = temp_db();
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = AssetsRepo::new(pool);
+
+    let asset = NewAsset {
+        hash: "1111aaaa2222bbbb3333cccc4444dddd5555eeee6666ffff7777aaaa8888bbbb".to_string(),
+        original_filename: "talk.mp4".to_string(),
+        storage_path: PathBuf::from("/library/11/11/1111aaaa.mp4"),
+        file_size: 1,
+        mime_type: Some("video/mp4".to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        lens_make: None,
+        lens_model: None,
+        focal_length: None,
+        focal_length_35mm: None,
+        aperture: None,
+        shutter: None,
+        iso: None,
+        orientation: None,
+        altitude: None,
+        gps_direction: None,
+        exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
+        thumbnails_generated: false,
+        duration_secs: Some(12.0),
+        video_codec: Some("h264".to_string()),
+        pixel_width: None,
+        pixel_height: None,
+    };
+    let id = match repo.insert_asset(asset).await.expect("insert") {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected Inserted"),
+    };
+
+    assert!(repo.fetch_transcript(id).await.expect("empty").is_empty());
+
+    // Stored out of order; fetch returns playback order.
+    let segments = vec![
+        (5.0, 8.0, "second thing said".to_string()),
+        (0.5, 4.0, "first thing said".to_string()),
+    ];
+    repo.store_transcript(id, &segments).await.expect("store");
+    let back = repo.fetch_transcript(id).await.expect("fetch");
+    assert_eq!(back.len(), 2);
+    assert_eq!(back[0].2, "first thing said");
+    assert!((back[0].0 - 0.5).abs() < 1e-9);
+    assert_eq!(back[1].2, "second thing said");
+}

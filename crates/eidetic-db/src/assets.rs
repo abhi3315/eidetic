@@ -673,6 +673,21 @@ impl AssetsRepo {
         Ok(())
     }
 
+    /// The full stored transcript of one asset, in playback order:
+    /// (start secs, end secs, text) per segment. Empty when the asset was
+    /// never transcribed (or has no speech).
+    pub async fn fetch_transcript(&self, id: AssetId) -> crate::Result<Vec<(f64, f64, String)>> {
+        let rows: Vec<(f64, f64, String)> = sqlx::query_as(
+            "SELECT ts_secs, end_secs, text FROM transcripts \
+             WHERE asset_id = ? ORDER BY ts_secs",
+        )
+        .bind(id_text(id))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(rows)
+    }
+
     /// Full-text search over spoken words. Query tokens are OR-combined and
     /// bm25-ranked, so hits matching more of the query float up. Returns the
     /// best segment per asset: (asset, segment start, snippet).
