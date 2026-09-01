@@ -172,6 +172,13 @@ enum Command {
         #[arg(long, default_value_t = reel::MIN_SHARPNESS)]
         min_sharpness: f64,
 
+        /// Cut N candidate reels instead of one — different shot pools and
+        /// transition styles, rendered as half-resolution previews
+        /// (reel.v1.mp4 …). Pick with your eyes, then re-render the winner
+        /// full-res: `eidetic reel edit reel.v2.eidetic.json`.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=9))]
+        variations: u32,
+
         /// Print the cut list without rendering.
         #[arg(long)]
         dry_run: bool,
@@ -1177,6 +1184,7 @@ async fn main() -> anyhow::Result<()> {
             frame,
             export,
             min_sharpness,
+            variations,
             dry_run,
         } => {
             let prompt = prompt.expect("clap enforces a prompt when no reel subcommand is given");
@@ -1187,7 +1195,9 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
             let (w, h) = if portrait { (1080, 1920) } else { (w, h) };
             let fit = parse_fit(&frame, portrait)?;
-            if !dry_run && output.exists() {
+            // With variations only the reel.vN.mp4 paths are written; they
+            // get their own overwrite checks once known.
+            if !dry_run && variations <= 1 && output.exists() {
                 anyhow::bail!(
                     "{} already exists; pass a different --output",
                     output.display()
@@ -1416,46 +1426,129 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            println!(
-                "Cut list for {prompt:?} ({:.1}s from {} segment(s)):",
-                reel::total_secs(&slots),
-                slots.len()
-            );
-            for (i, slot) in slots.iter().enumerate() {
-                println!("  {:>2}. {}", i + 1, slot.describe());
-            }
-            if dry_run {
-                return Ok(());
+            // --variations N (goals-v0.8.md phase 0.5): N candidate cut
+            // lists — the shot pool rotated so each opens differently, the
+            // joint style cycled — as half-res previews. The human picks
+            // with eyes; the winner's project file re-renders full-res.
+            let variants: Vec<(PathBuf, Vec<eidetic_db::SearchResult>, Vec<reel::Slot>)> =
+                if variations <= 1 {
+                    vec![(output.clone(), Vec::new(), slots)]
+                } else {
+                    anyhow::ensure!(
+                        voiceover_pairs.is_none(),
+                        "--variations needs music or silence; a voiceover shot \
+                         list is determined by the narration"
+                    );
+                    let strong = reel::strong_prefix(&results).to_vec();
+                    (1..=variations as usize)
+                        .map(|v| {
+                            let mut pool = strong.clone();
+                            if !pool.is_empty() {
+                                let k = (v - 1) % pool.len();
+                                pool.rotate_left(k);
+                            }
+                            let name = format!("v{v}.mp4");
+                            (output.with_extension(name), pool, Vec::new())
+                        })
+                        .collect()
+                };
+
+            for (out, _, _) in &variants {
+                if !dry_run && out.exists() {
+                    anyhow::bail!(
+                        "{} already exists; pass a different --output",
+                        out.display()
+                    );
+                }
             }
 
-            println!("Rendering {w}x{h} @ 30fps…");
-            let render_output = output.clone();
-            let audio_clone = audio.clone();
-            let render_slots = slots.clone();
-            tokio::task::spawn_blocking(move || {
-                reel::render(
-                    &render_slots,
-                    &render_output,
-                    w,
-                    h,
-                    fit,
-                    audio_clone.as_deref(),
-                )
-            })
-            .await
-            .context("render thread panicked")??;
-            println!("Wrote {}", output.display());
+            // Previews trade pixels for speed; the project files remember
+            // the real geometry so the winner re-renders full-res.
+            let (rw, rh) = if variations > 1 {
+                ((w / 2) & !1, (h / 2) & !1)
+            } else {
+                (w, h)
+            };
 
-            // Every render persists its cut list (goals-v0.8.md phase 0):
-            // the project file is what `reel edit` and agents mutate.
-            let proj =
-                project::ReelProject::new(prompt, (w, h), frame, audio, grid, &output, slots);
-            let proj_path = project::ReelProject::path_for(&output);
-            proj.save(&proj_path)?;
-            println!("Project {}", proj_path.display());
-            if let Some(otio_path) = export_path(export.as_deref(), &output)? {
-                otio::export(&proj, &otio_path)?;
-                println!("OTIO    {}", otio_path.display());
+            for (v, (out, pool, base_slots)) in variants.into_iter().enumerate() {
+                let slots = if variations <= 1 {
+                    base_slots
+                } else {
+                    let mut s = match &grid {
+                        Some(g) => reel::plan_synced(
+                            &pool,
+                            g,
+                            total,
+                            &config.paths.library_dir,
+                            &scenes,
+                            &focus,
+                        ),
+                        None => reel::plan(&pool, total, &config.paths.library_dir, &scenes),
+                    };
+                    reel::restyle(&mut s, v);
+                    s
+                };
+                if slots.is_empty() {
+                    anyhow::bail!(
+                        "nothing in the library matches {prompt:?} confidently enough for a reel"
+                    );
+                }
+
+                println!(
+                    "Cut list for {prompt:?} ({:.1}s from {} segment(s)):",
+                    reel::total_secs(&slots),
+                    slots.len()
+                );
+                for (i, slot) in slots.iter().enumerate() {
+                    println!("  {:>2}. {}", i + 1, slot.describe());
+                }
+                if dry_run {
+                    continue;
+                }
+
+                println!("Rendering {rw}x{rh} @ 30fps…");
+                let render_output = out.clone();
+                let audio_clone = audio.clone();
+                let render_slots = slots.clone();
+                tokio::task::spawn_blocking(move || {
+                    reel::render(
+                        &render_slots,
+                        &render_output,
+                        rw,
+                        rh,
+                        fit,
+                        audio_clone.as_deref(),
+                    )
+                })
+                .await
+                .context("render thread panicked")??;
+                println!("Wrote {}", out.display());
+
+                // Every render persists its cut list (goals-v0.8.md phase
+                // 0): the project file is what `reel edit` and agents
+                // mutate.
+                let proj = project::ReelProject::new(
+                    prompt.clone(),
+                    (w, h),
+                    frame.clone(),
+                    audio.clone(),
+                    grid.clone(),
+                    &out,
+                    slots,
+                );
+                let proj_path = project::ReelProject::path_for(&out);
+                proj.save(&proj_path)?;
+                println!("Project {}", proj_path.display());
+                if let Some(otio_path) = export_path(export.as_deref(), &out)? {
+                    otio::export(&proj, &otio_path)?;
+                    println!("OTIO    {}", otio_path.display());
+                }
+            }
+            if variations > 1 && !dry_run {
+                println!(
+                    "Previews are {rw}x{rh}; re-render the winner full-res with \
+                     `eidetic reel edit <winner>.eidetic.json`"
+                );
             }
         }
 

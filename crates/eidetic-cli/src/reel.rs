@@ -289,15 +289,9 @@ pub fn plan(
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
 ) -> Vec<Slot> {
-    let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
-    let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
-
     let mut slots: Vec<Slot> = Vec::new();
     let mut total = 0.0f64;
-    for r in results {
-        if (r.score as f64) < floor || r.score <= 0.0 {
-            break; // results are sorted; everything after is weaker
-        }
+    for r in strong_prefix(results) {
         let slot = match r.frame_ts {
             Some(ts) => {
                 let empty = Vec::new();
@@ -314,6 +308,41 @@ pub fn plan(
         slots.push(slot);
     }
     slots
+}
+
+/// The prefix of (score-sorted) `results` that clears the weak-tail rules:
+/// positive score, at least [`RELATIVE_SCORE_FLOOR`] of the top hit. This
+/// is the pool every planner consumes — exposed so `--variations` can
+/// rotate it without re-deriving the floor from a rotated (weaker) top.
+pub fn strong_prefix(results: &[SearchResult]) -> &[SearchResult] {
+    let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
+    let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
+    let n = results
+        .iter()
+        .take_while(|r| r.score > 0.0 && (r.score as f64) >= floor)
+        .count();
+    &results[..n]
+}
+
+/// Re-style a variation's joints (goals-v0.8.md phase 0.5): style 0 keeps
+/// the planned austere joints, 1 dissolves every joint (soft), 2 turns the
+/// section crossfades into whips (punchy). Styles cycle for higher counts.
+pub fn restyle(slots: &mut [Slot], style: usize) {
+    match style % 3 {
+        0 => {}
+        1 => {
+            for s in slots.iter_mut().skip(1) {
+                s.transition_in = Transition::Crossfade { secs: 0.4 };
+            }
+        }
+        _ => {
+            for s in slots.iter_mut().skip(1) {
+                if matches!(s.transition_in, Transition::Crossfade { .. }) {
+                    s.transition_in = Transition::Whip { secs: 0.2 };
+                }
+            }
+        }
+    }
 }
 
 /// How segments are fitted to the frame.
@@ -630,12 +659,7 @@ pub fn plan_synced(
     focus: &HashMap<AssetId, f64>,
 ) -> Vec<Slot> {
     let spans = beat_spans(grid, total_secs);
-    let top = results.first().map(|r| r.score as f64).unwrap_or(0.0);
-    let floor = (top * RELATIVE_SCORE_FLOOR).max(0.0);
-    let strong: Vec<&SearchResult> = results
-        .iter()
-        .take_while(|r| r.score > 0.0 && (r.score as f64) >= floor)
-        .collect();
+    let strong = strong_prefix(results);
 
     let n = spans.len().min(strong.len());
     let hot: Vec<bool> = spans
@@ -662,7 +686,7 @@ pub fn plan_synced(
     let mut total = 0.0;
     for (i, (_, end)) in spans.iter().enumerate().take(n) {
         let span = end - total;
-        let slot = fill_span(strong[hit_for_span[i]], span, library_dir, scenes, focus);
+        let slot = fill_span(&strong[hit_for_span[i]], span, library_dir, scenes, focus);
         total += slot.duration;
         slots.push(slot);
     }
