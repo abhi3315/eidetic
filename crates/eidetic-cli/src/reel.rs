@@ -428,6 +428,11 @@ pub fn render(
             SlotKind::Photo => ken_burns_filter(width, height, rendered),
             SlotKind::PhotoScenic => blur_fill_filter(width, height),
         };
+        // Real phone footage carries non-square sample aspect ratios; the
+        // concat/xfade filters refuse inputs whose SARs differ, so every
+        // segment is squared here (found dogfooding on real trip media —
+        // synthetic test sources are always 1:1 already).
+        vf.push_str(",setsar=1");
         // Dip-to-black as an ENDING is the one place it always earns its
         // keep: with music, the video tail fades with the audio's fade.
         if i + 1 == slots.len() && audio.is_some() && slot.duration > 1.0 {
