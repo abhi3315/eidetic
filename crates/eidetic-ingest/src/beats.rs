@@ -232,8 +232,18 @@ fn dp_beats(env: &[f64], period: f64) -> Vec<usize> {
     beats
 }
 
-/// Spans where short-term RMS runs well above the track median — the
-/// chorus/drop sections where cuts should get denser.
+/// Spans where short-term RMS runs well above the track's quiet sections —
+/// the chorus/drop sections where cuts should get denser.
+///
+/// The rule is contrast-based, not floor-based. The first version used
+/// "1.3 x the 40th-percentile RMS", which worked on synthetic clicks but
+/// went blind on real masters: an Instagram-style track spends ~80% of its
+/// runtime in the loud section, so *any* mid percentile lands inside the
+/// chorus and nothing clears 1.3x it (found dogfooding v0.8 on real trip
+/// media). Instead: take the 10th percentile as the quiet reference and
+/// the 80th as the loud one; if they differ by less than 1.3x the track is
+/// genuinely flat (club-style constant bangers — correctly no sections);
+/// otherwise split the two levels at their geometric mean.
 fn high_energy_spans(pcm: &[f32]) -> Vec<(f64, f64)> {
     let win = SAMPLE_RATE as usize; // 1 s windows
     if pcm.len() < win * 4 {
@@ -245,17 +255,17 @@ fn high_energy_spans(pcm: &[f32]) -> Vec<(f64, f64)> {
         .collect();
     let mut sorted = rms.clone();
     sorted.sort_by(f64::total_cmp);
-    // 40th percentile, not median: choruses can be half the track, and a
-    // median that already sits in the loud section would flag nothing.
-    let floor = sorted[sorted.len() * 2 / 5];
-    if floor <= 1e-9 {
+    let quiet = sorted[sorted.len() / 10];
+    let loud = sorted[sorted.len() * 4 / 5];
+    if quiet <= 1e-9 || loud < quiet * 1.3 {
         return Vec::new();
     }
+    let threshold = (quiet * loud).sqrt();
 
     let mut spans = Vec::new();
     let mut start: Option<usize> = None;
     for (i, r) in rms.iter().enumerate() {
-        let hot = *r > floor * 1.3;
+        let hot = *r > threshold;
         match (hot, start) {
             (true, None) => start = Some(i),
             (false, Some(s)) => {
@@ -367,5 +377,32 @@ mod tests {
         let spans = high_energy_spans(&pcm);
         assert_eq!(spans.len(), 1, "{spans:?}");
         assert!(spans[0].0 >= 9.0 && spans[0].0 <= 11.0, "{spans:?}");
+    }
+
+    /// The real-master regression (v0.8 dogfooding): a short quiet intro
+    /// and a drop that runs ~80% of the track. Any mid-percentile floor
+    /// sits inside the loud section and flags nothing; the contrast rule
+    /// must still find the drop.
+    #[test]
+    fn high_energy_finds_a_drop_that_dominates_the_track() {
+        // 12 s intro at ~0.16 RMS, 48 s drop at ~0.5 — the shape of the
+        // actual Instagram-style track that exposed the bug.
+        let mut pcm = vec![0.16f32; 12 * 16_000];
+        pcm.extend(vec![0.5f32; 48 * 16_000]);
+        let spans = high_energy_spans(&pcm);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!(spans[0].0 >= 11.0 && spans[0].0 <= 13.0, "{spans:?}");
+        assert!(
+            (spans[0].1 - 60.0).abs() <= 1.0,
+            "runs to the end: {spans:?}"
+        );
+    }
+
+    /// A loudness-flat track (constant club banger) has no sections at all
+    /// — dense cuts throughout would be the wrong call to force.
+    #[test]
+    fn high_energy_stays_silent_on_flat_tracks() {
+        let pcm = vec![0.4f32; 40 * 16_000];
+        assert!(high_energy_spans(&pcm).is_empty());
     }
 }
