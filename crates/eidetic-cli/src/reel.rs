@@ -383,17 +383,23 @@ fn xfade_chain(
         cmd.arg("-i").arg(p);
     }
     let mut graph = String::new();
-    let mut acc = "0:v".to_string();
+    // xfade refuses inputs with mismatched timebases (mp4 segments carry
+    // 1/15360 while filter outputs carry 1/1000000), so every input is
+    // normalised to AVTB first.
+    for i in 0..seg_paths.len() {
+        graph.push_str(&format!("[{i}:v]settb=AVTB[s{i}];"));
+    }
+    let mut acc = "s0".to_string();
     let mut offset = slots[0].duration;
     for i in 1..seg_paths.len() {
         let out = format!("v{i}");
         let fade = seg_paths[i - 1].1;
         if fade > 0.0 {
             graph.push_str(&format!(
-                "[{acc}][{i}:v]xfade=transition=fade:duration={fade:.3}:offset={offset:.3}[{out}];"
+                "[{acc}][s{i}]xfade=transition=fade:duration={fade:.3}:offset={offset:.3}[{out}];"
             ));
         } else {
-            graph.push_str(&format!("[{acc}][{i}:v]concat=n=2:v=1:a=0[{out}];"));
+            graph.push_str(&format!("[{acc}][s{i}]concat=n=2:v=1:a=0[{out}];"));
         }
         offset += slots[i].duration;
         acc = out;
