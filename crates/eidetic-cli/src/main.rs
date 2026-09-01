@@ -1,5 +1,6 @@
 mod dupes;
 mod eval;
+mod project;
 mod reel;
 
 use anyhow::Context;
@@ -118,9 +119,16 @@ enum Command {
         kind: Option<String>,
     },
     /// Cut a short reel from the library for a prompt (needs ffmpeg).
+    /// Every render writes a project file next to the output; `reel edit`
+    /// mutates it.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Reel {
+        #[command(subcommand)]
+        action: Option<ReelAction>,
+
         /// What the reel is about, e.g. "sunset at the beach".
-        prompt: String,
+        #[arg(required = true)]
+        prompt: Option<String>,
 
         /// Target length in seconds.
         #[arg(long, default_value = "30")]
@@ -181,6 +189,57 @@ enum Command {
     /// Verify library integrity: re-hash every stored original against the
     /// database and report corruption, missing files and orphans.
     Verify,
+}
+
+#[derive(Subcommand)]
+enum ReelAction {
+    /// Edit a reel project file and re-render it. All slot numbers refer
+    /// to the cut list as last printed (1-based); when several ops are
+    /// combined in one call they are resolved against that same numbering,
+    /// then applied as pin/unpin → retime → swap → drop → reorder.
+    Edit {
+        /// The project file a previous render wrote (reel.eidetic.json).
+        project: PathBuf,
+
+        /// Replace slot N with the best library hit for a fresh query:
+        /// --swap N "the beach clip". Repeatable. Keeps the slot's length,
+        /// so beat sync survives. Refuses pinned slots.
+        #[arg(long, num_args = 2, value_names = ["SLOT", "QUERY"])]
+        swap: Vec<String>,
+
+        /// Remove slot N (later cuts move earlier). Repeatable. Refuses
+        /// pinned slots.
+        #[arg(long)]
+        drop: Vec<usize>,
+
+        /// Pin slot N: --swap and --drop refuse to touch it. Repeatable.
+        #[arg(long)]
+        pin: Vec<usize>,
+
+        /// Unpin slot N. Repeatable.
+        #[arg(long)]
+        unpin: Vec<usize>,
+
+        /// Set slot N's length in seconds: --retime N 2.5. Repeatable.
+        /// Video slots are clamped to the media past their in-point.
+        #[arg(long, num_args = 2, value_names = ["SLOT", "SECS"])]
+        retime: Vec<String>,
+
+        /// Reorder the (surviving) slots: a comma-separated permutation
+        /// using the printed numbers, e.g. --reorder 3,1,2.
+        #[arg(long)]
+        reorder: Option<String>,
+
+        /// Render target. Defaults to overwriting the project's own
+        /// output; any other existing path is refused.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Apply and save the edits and print the new cut list, but skip
+        /// the render.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1040,6 +1099,28 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Reel {
+            action:
+                Some(ReelAction::Edit {
+                    project,
+                    swap,
+                    drop,
+                    pin,
+                    unpin,
+                    retime,
+                    reorder,
+                    output,
+                    dry_run,
+                }),
+            ..
+        } => {
+            reel_edit(
+                &project, &swap, &drop, &pin, &unpin, &retime, reorder, output, dry_run,
+            )
+            .await?;
+        }
+
+        Command::Reel {
+            action: None,
             prompt,
             duration,
             output,
@@ -1049,24 +1130,14 @@ async fn main() -> anyhow::Result<()> {
             frame,
             dry_run,
         } => {
+            let prompt = prompt.expect("clap enforces a prompt when no reel subcommand is given");
             let (w, h) = size
                 .split_once('x')
                 .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
                 .filter(|(w, h)| *w > 0 && *h > 0)
                 .with_context(|| format!("invalid --size {size:?}, expected e.g. 1920x1080"))?;
             let (w, h) = if portrait { (1080, 1920) } else { (w, h) };
-            let fit = match frame.as_str() {
-                "auto" if portrait => reel::Fit::Auto,
-                // Landscape output fits landscape sources anyway; auto keeps
-                // the classic pad there.
-                "auto" => reel::Fit::Pad,
-                "cover" => reel::Fit::Cover,
-                "blur" => reel::Fit::Blur,
-                "pad" => reel::Fit::Pad,
-                other => {
-                    anyhow::bail!("invalid --frame {other:?}; valid values: auto, cover, blur, pad")
-                }
-            };
+            let fit = parse_fit(&frame, portrait)?;
             if !dry_run && output.exists() {
                 anyhow::bail!(
                     "{} already exists; pass a different --output",
@@ -1301,6 +1372,14 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("render thread panicked")??;
             println!("Wrote {}", output.display());
+
+            // Every render persists its cut list (goals-v0.8.md phase 0):
+            // the project file is what `reel edit` and agents mutate.
+            let proj =
+                project::ReelProject::new(prompt, (w, h), frame, audio, grid, &output, slots);
+            let proj_path = project::ReelProject::path_for(&output);
+            proj.save(&proj_path)?;
+            println!("Project {}", proj_path.display());
         }
 
         Command::Transcode => {
@@ -1889,6 +1968,269 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Parse a frame style (--frame, or a project file's `frame` field).
+/// `portrait` picks what auto means: portrait output follows faces,
+/// landscape keeps the classic pad.
+fn parse_fit(frame: &str, portrait: bool) -> anyhow::Result<reel::Fit> {
+    Ok(match frame {
+        "auto" if portrait => reel::Fit::Auto,
+        // Landscape output fits landscape sources anyway; auto keeps
+        // the classic pad there.
+        "auto" => reel::Fit::Pad,
+        "cover" => reel::Fit::Cover,
+        "blur" => reel::Fit::Blur,
+        "pad" => reel::Fit::Pad,
+        other => {
+            anyhow::bail!("invalid frame style {other:?}; valid values: auto, cover, blur, pad")
+        }
+    })
+}
+
+/// `eidetic reel edit` (goals-v0.8.md phase 0): structured mutations of a
+/// persisted cut list, then a re-render. Slot numbers are 1-based against
+/// the cut list as last printed; every op is resolved against that
+/// numbering before anything is applied, so combined ops don't shift each
+/// other's targets.
+#[allow(clippy::too_many_arguments)]
+async fn reel_edit(
+    project_path: &std::path::Path,
+    swap: &[String],
+    drop: &[usize],
+    pin: &[usize],
+    unpin: &[usize],
+    retime: &[String],
+    reorder: Option<String>,
+    output: Option<PathBuf>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::collections::HashSet;
+
+    let mut proj = project::ReelProject::load(project_path)?;
+    let n = proj.slots.len();
+    let idx = |slot: usize| -> anyhow::Result<usize> {
+        ensure!(
+            (1..=n).contains(&slot),
+            "no slot {slot}; the cut list has {n} slot(s)"
+        );
+        Ok(slot - 1)
+    };
+
+    // Parse paired ops up front so a bad argument fails before any mutation.
+    let swaps: Vec<(usize, String)> = swap
+        .chunks(2)
+        .map(|c| {
+            let s: usize = c[0]
+                .parse()
+                .with_context(|| format!("--swap expects a slot number, got {:?}", c[0]))?;
+            Ok((idx(s)?, c[1].clone()))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let retimes: Vec<(usize, f64)> = retime
+        .chunks(2)
+        .map(|c| {
+            let s: usize = c[0]
+                .parse()
+                .with_context(|| format!("--retime expects a slot number, got {:?}", c[0]))?;
+            let secs: f64 = c[1]
+                .parse()
+                .with_context(|| format!("--retime expects seconds, got {:?}", c[1]))?;
+            ensure!(
+                secs >= 0.3,
+                "--retime {s} {secs}: slots shorter than 0.3s read as glitches"
+            );
+            Ok((idx(s)?, secs))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let drops: HashSet<usize> = drop
+        .iter()
+        .map(|&s| idx(s))
+        .collect::<anyhow::Result<_>>()?;
+
+    for &s in pin {
+        proj.slots[idx(s)?].pinned = true;
+    }
+    for &s in unpin {
+        proj.slots[idx(s)?].pinned = false;
+    }
+    for &i in &drops {
+        ensure!(
+            !proj.slots[i].pinned,
+            "slot {} is pinned; --unpin {} first if you really want to drop it",
+            i + 1,
+            i + 1
+        );
+    }
+
+    for (i, secs) in &retimes {
+        let slot = &mut proj.slots[*i];
+        let mut secs = *secs;
+        // Clamp a video to the media past its in-point; a shortened file
+        // would silently desync everything after it.
+        if slot.kind == reel::SlotKind::Video
+            && let Ok(Some(p)) = eidetic_ingest::video::probe(&slot.source)
+            && let Some(d) = p.duration_secs
+        {
+            let avail = (d - slot.start).max(0.3);
+            if secs > avail {
+                eprintln!(
+                    "slot {}: only {avail:.1}s of media past the in-point; clamping",
+                    i + 1
+                );
+                secs = avail;
+            }
+        }
+        slot.duration = secs;
+    }
+
+    if !swaps.is_empty() {
+        let config = Config::from_env();
+        for (i, _) in &swaps {
+            ensure!(
+                !proj.slots[*i].pinned,
+                "slot {} is pinned; --unpin {} first if you really want to swap it",
+                i + 1,
+                i + 1
+            );
+        }
+        let queries: Vec<String> = swaps.iter().map(|(_, q)| q.clone()).collect();
+        let models_dir = config.paths.models_cache.clone();
+        let embs = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<Vec<f32>>> {
+            let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+            queries.iter().map(|q| e.embed_text(q)).collect()
+        })
+        .await
+        .context("embedder thread panicked")?
+        .context("failed to embed swap queries")?;
+
+        let pool = eidetic_db::connect(&config)
+            .await
+            .context("failed to connect to database")?;
+        let repo = eidetic_db::AssetsRepo::new(pool);
+        let mut used: HashSet<eidetic_core::AssetId> = proj.slots.iter().map(|s| s.asset).collect();
+
+        for ((i, query), emb) in swaps.iter().zip(&embs) {
+            let hits = repo
+                .search(query, emb, 10, &eidetic_db::SearchFilters::default())
+                .await
+                .context("swap search failed")?;
+            // Prefer something not already in the reel; a swap that hands
+            // back a shot the user is looking at helps nobody.
+            let hit = hits
+                .iter()
+                .find(|h| h.score > 0.0 && !used.contains(&h.id))
+                .or_else(|| hits.iter().find(|h| h.score > 0.0))
+                .with_context(|| format!("nothing in the library matches {query:?}"))?;
+            let mut scenes = std::collections::HashMap::new();
+            if hit.frame_ts.is_some()
+                && let Some(s) = repo
+                    .fetch_video_scenes(hit.id)
+                    .await
+                    .context("failed to load scene boundaries")?
+            {
+                scenes.insert(hit.id, s);
+            }
+            let focus = framing_focus(&config, &repo, std::slice::from_ref(hit)).await?;
+            let old = &proj.slots[*i];
+            let mut slot = reel::fill_span(
+                hit,
+                old.duration,
+                &config.paths.library_dir,
+                &scenes,
+                &focus,
+            );
+            // The joint belongs to the timeline position, not the shot.
+            slot.transition_in = old.transition_in;
+            used.insert(slot.asset);
+            println!("slot {}: {} -> {}", i + 1, old.describe(), slot.describe());
+            proj.slots[*i] = slot;
+        }
+    }
+
+    // Drops and the reorder both work over ORIGINAL indices: --reorder must
+    // name each surviving slot exactly once.
+    let survivors: Vec<usize> = (0..n).filter(|i| !drops.contains(i)).collect();
+    let order: Vec<usize> = match reorder {
+        None => survivors,
+        Some(spec) => {
+            let idxs: Vec<usize> =
+                spec.split(',')
+                    .map(|t| {
+                        let s: usize = t.trim().parse().with_context(|| {
+                            format!("--reorder expects slot numbers, got {t:?}")
+                        })?;
+                        idx(s)
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+            let mut sorted = idxs.clone();
+            sorted.sort_unstable();
+            ensure!(
+                sorted == survivors,
+                "--reorder must list each remaining slot exactly once ({} slot(s): {})",
+                survivors.len(),
+                survivors
+                    .iter()
+                    .map(|i| (i + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            idxs
+        }
+    };
+    ensure!(
+        !order.is_empty(),
+        "every slot was dropped; nothing left to render"
+    );
+    let mut old: Vec<Option<reel::Slot>> = proj.slots.drain(..).map(Some).collect();
+    proj.slots = order
+        .iter()
+        .map(|&i| {
+            old[i]
+                .take()
+                .expect("order is a permutation, so each index is taken exactly once")
+        })
+        .collect();
+
+    let render_output = output.unwrap_or_else(|| proj.output.clone());
+    let render_output =
+        std::path::absolute(&render_output).unwrap_or_else(|_| render_output.clone());
+    // Overwriting THIS project's previous render is the whole point of an
+    // edit; anything else existing is protected like `reel -o` protects it.
+    if render_output != proj.output && render_output.exists() {
+        anyhow::bail!(
+            "{} already exists; pass a different --output",
+            render_output.display()
+        );
+    }
+    proj.output = render_output.clone();
+    proj.modified = chrono::Utc::now();
+    proj.save(project_path)?;
+    proj.print_cut_list();
+    if dry_run {
+        return Ok(());
+    }
+
+    if let Some(track) = &proj.audio {
+        ensure!(
+            track.exists(),
+            "the project's audio track has moved: {}",
+            track.display()
+        );
+    }
+    let (w, h) = (proj.width, proj.height);
+    let fit = parse_fit(&proj.frame, h > w)?;
+    println!("Rendering {w}x{h} @ 30fps…");
+    let slots = proj.slots.clone();
+    let audio = proj.audio.clone();
+    tokio::task::spawn_blocking(move || {
+        reel::render(&slots, &render_output, w, h, fit, audio.as_deref())
+    })
+    .await
+    .context("render thread panicked")??;
+    println!("Wrote {}", proj.output.display());
     Ok(())
 }
 

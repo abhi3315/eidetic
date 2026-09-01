@@ -28,6 +28,7 @@ image = { workspace = true }
 libheif-rs = { workspace = true, optional = true }
 infer = { workspace = true }
 kamadak-exif = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 rustfft = { workspace = true }

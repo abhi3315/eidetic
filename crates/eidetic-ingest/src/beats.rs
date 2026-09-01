@@ -15,6 +15,7 @@
 //! intervals.
 
 use rustfft::{FftPlanner, num_complex::Complex};
+use serde::{Deserialize, Serialize};
 
 /// Input sample rate — the 16 kHz mono PCM `video::extract_audio_pcm`
 /// produces. Onsets only need content below ~8 kHz, so this is plenty.
@@ -32,8 +33,9 @@ const BPM_MAX: f64 = 180.0;
 /// the estimated period.
 const TIGHTNESS: f64 = 100.0;
 
-/// A track's rhythm, as the reel planner consumes it.
-#[derive(Debug, Clone)]
+/// A track's rhythm, as the reel planner consumes it. Serializable because
+/// reel project files persist it (goals-v0.8.md phase 0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeatGrid {
     pub bpm: f64,
     /// Beat times in seconds, ascending.
