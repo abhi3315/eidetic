@@ -136,7 +136,7 @@ Eidetic uses `libheif` to decode HEIC/HEIF photos (the format iPhones produce by
 
 The x265 plugin is only needed if you run the test suite (which encodes synthetic HEIC fixtures at setup). The libde265 plugin is needed any time you decode an existing HEIC file. macOS Homebrew's `libheif` bundles both directly, so no extra step there.
 
-If `libheif` isn't installed, Eidetic builds fine but fails at runtime with a dynamic-linker error when a HEIC file is encountered.
+If `libheif` isn't installed, a default-features Eidetic fails at *startup*, not on first HEIC file: the library is linked dynamically, so the loader resolves it before `main` runs and every command — `eidetic --version` included — dies with a dynamic-linker error. This applies to the released Linux/macOS archives too, which ship with HEIC on ([ADR-0009](docs/adr/0009-distribution.md)). Build or download `--no-default-features` if you want a binary with no such requirement (and no HEIC).
 
 Video features (thumbnails, frame embeddings, reels) shell out to **ffmpeg/ffprobe** at runtime — no build dependency at all ([ADR-0011](docs/adr/0011-video-pipeline.md)). Install with `brew install ffmpeg` / `sudo apt install ffmpeg`, or point `EIDETIC_FFMPEG_PATH` / `EIDETIC_FFPROBE_PATH` at binaries elsewhere. Without ffmpeg everything else works; videos import but stay un-thumbnailed and un-searchable until you install it and run `eidetic thumbnail` + `eidetic embed`.
 
@@ -159,7 +159,7 @@ cargo test --workspace
 |---|---|---|
 | `heic` | **on** | HEIC/HEIF decoding via libheif. Needs the libheif C library installed at build time (`libheif-dev` / `libheif-devel`). |
 | `cuda` | off | NVIDIA GPU inference via the ONNX Runtime CUDA execution provider. Requires an ONNX Runtime ≥ 1.27 CUDA build supplied at runtime through `ORT_DYLIB_PATH`, plus CUDA 13 + cuDNN 9 on the host. See [ADR-0006](docs/adr/0006-gpu-execution-provider.md). |
-| `speech` | off | Speech-to-text over video audio via whisper.cpp (`eidetic transcribe` + spoken-word search). Off by default because whisper-rs compiles C through cmake — the default build keeps its no-native-build-deps guarantee. Model (~466 MB, `EIDETIC_SPEECH_MODEL`: `base`, `small` default, `large-v3-turbo`) downloads on first run. |
+| `speech` | off | Speech-to-text over video audio via whisper.cpp (`eidetic transcribe` + spoken-word search). Off by default because whisper-rs compiles C through cmake, which is a heavier build dependency than the libheif linkage `heic` already brings in. Model (~466 MB, `EIDETIC_SPEECH_MODEL`: `base`, `small` default, `large-v3-turbo`) downloads on first run. |
 | `speech-cuda` | off | `speech` with whisper.cpp's CUDA kernels — GPU transcription. Needs nvcc at build time with a host compiler your CUDA toolkit supports: nvcc 12.9 cannot parse gcc 16 headers (Fedora 44+), so install a compat gcc (`sudo dnf install gcc14-c++`) and build with `CUDAHOSTCXX=$(which g++-14)`, or use a CUDA 13 toolkit. |
 
 ```bash

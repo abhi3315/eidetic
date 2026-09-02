@@ -96,6 +96,16 @@ jobs:
             echo "eidetic ${{ github.ref_name }} — ${{ matrix.name }}"
             echo "HEIC support: ${{ matrix.heic }}"
             echo "cargo flags: ${{ matrix.features }}"
+            if [ "${{ matrix.heic }}" = "true" ]; then
+              echo ""
+              echo "REQUIRED: libheif must be installed on this machine."
+              echo "It is linked dynamically, so without it *every* command"
+              echo "fails at startup — not just ones touching a HEIC file."
+              echo "  Debian/Ubuntu: sudo apt install libheif1"
+              echo "  Fedora:        sudo dnf install libheif"
+              echo "  macOS:         brew install libheif"
+              echo "See docs/adr/0009-distribution.md"
+            fi
             if [ -n "${{ matrix.features }}" ] && [ "${{ matrix.features }}" = "--features cuda" ]; then
               echo ""
               echo "This build needs an ONNX Runtime >= 1.27 CUDA build at runtime."
@@ -106,6 +116,35 @@ jobs:
           } > "$STAGE/BUILD-INFO.txt"
           tar czf "$STAGE.tar.gz" "$STAGE"
           shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      # Nothing else in this pipeline ever launches what it publishes, so a
+      # binary that cannot start — a missing runtime library, a bad path, a
+      # broken build — shipped silently. `--version` exits before any config
+      # or database work but still goes through the dynamic loader, which is
+      # exactly where that class of failure lands.
+      - name: Smoke-test staged archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="eidetic-${{ matrix.name }}"
+          rm -rf smoke && mkdir smoke
+          tar xzf "$STAGE.tar.gz" -C smoke
+          ./smoke/"$STAGE"/eidetic --version
+
+          # Record the runtime dependencies in the job log, and hold the one
+          # invariant worth asserting: a build with HEIC compiled out must not
+          # drag libheif back in, or the "no system dependency" promise for
+          # that flavour silently stops being true.
+          if [ "$(uname)" = "Linux" ]; then
+            ldd ./smoke/"$STAGE"/eidetic || true
+            if [ "${{ matrix.heic }}" != "true" ]; then
+              if ldd ./smoke/"$STAGE"/eidetic | grep -qi heif; then
+                echo "::error::${{ matrix.name }} builds without HEIC but links libheif"
+                exit 1
+              fi
+            fi
+          fi
 
       - name: Stage archive (Windows)
         if: runner.os == 'Windows'
@@ -122,6 +161,16 @@ jobs:
           } > "$STAGE/BUILD-INFO.txt"
           7z a "$STAGE.zip" "$STAGE" > /dev/null
           certutil -hashfile "$STAGE.zip" SHA256 > "$STAGE.zip.sha256"
+
+      - name: Smoke-test staged archive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="eidetic-${{ matrix.name }}"
+          rm -rf smoke && mkdir smoke
+          7z x "$STAGE.zip" -osmoke > /dev/null
+          ./smoke/"$STAGE"/eidetic.exe --version
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
