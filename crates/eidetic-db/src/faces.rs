@@ -159,10 +159,16 @@ impl FacesRepo {
     /// The run row is written even when `faces` is empty, so a photo with no
     /// faces is not re-scanned forever. Both writes share a transaction: a
     /// crash must not leave a "scanned" marker with no faces behind it.
+    ///
+    /// `detector_id` marks the run, `embedder_id` marks each face row: the
+    /// two models change independently, and neither is identifiable from the
+    /// row itself (auraface and buffalo_l are both 512-dim).
     pub async fn record_detection(
         &self,
         asset_id: AssetId,
         faces: &[NewFace],
+        detector_id: &str,
+        embedder_id: &str,
     ) -> crate::Result<Vec<FaceId>> {
         let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
 
@@ -175,8 +181,9 @@ impl FacesRepo {
                    id, asset_id, bbox_x, bbox_y, bbox_w, bbox_h, \
                    lm_left_eye_x, lm_left_eye_y, lm_right_eye_x, lm_right_eye_y, \
                    lm_nose_x, lm_nose_y, lm_left_mouth_x, lm_left_mouth_y, \
-                   lm_right_mouth_x, lm_right_mouth_y, score, embedding, dim, ts_secs\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   lm_right_mouth_x, lm_right_mouth_y, score, embedding, dim, ts_secs, \
+                   model_id\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id_text(id))
             .bind(id_text(face.asset_id))
@@ -198,6 +205,7 @@ impl FacesRepo {
             .bind(vector::encode(&face.embedding))
             .bind(face.embedding.len() as i64)
             .bind(face.ts_secs)
+            .bind(embedder_id)
             .execute(&mut *tx)
             .await
             .map_err(crate::Error::Query)?;
@@ -205,12 +213,14 @@ impl FacesRepo {
         }
 
         sqlx::query(
-            "INSERT INTO face_detection_runs (asset_id, face_count) VALUES (?, ?) \
+            "INSERT INTO face_detection_runs (asset_id, face_count, model_id) VALUES (?, ?, ?) \
              ON CONFLICT(asset_id) DO UPDATE SET \
-               face_count = excluded.face_count, detected_at = excluded.detected_at",
+               face_count = excluded.face_count, detected_at = excluded.detected_at, \
+               model_id = excluded.model_id",
         )
         .bind(id_text(asset_id))
         .bind(faces.len() as i64)
+        .bind(detector_id)
         .execute(&mut *tx)
         .await
         .map_err(crate::Error::Query)?;
@@ -219,17 +229,22 @@ impl FacesRepo {
         Ok(ids)
     }
 
-    /// Images that have never been through face detection.
+    /// Images the *active detector* has never been run over.
     ///
     /// An anti-join on `face_detection_runs`, not on `faces` — otherwise every
-    /// photo containing no people would be rescanned on every run.
-    pub async fn fetch_undetected(&self) -> crate::Result<Vec<(AssetId, std::path::PathBuf)>> {
+    /// photo containing no people would be rescanned on every run. A run left
+    /// by a different detector counts as work, not completion.
+    pub async fn fetch_undetected(
+        &self,
+        detector_id: &str,
+    ) -> crate::Result<Vec<(AssetId, std::path::PathBuf)>> {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT a.id, a.storage_path FROM assets a \
              LEFT JOIN face_detection_runs r ON r.asset_id = a.id \
-             WHERE r.asset_id IS NULL AND a.mime_type LIKE 'image/%' \
+             WHERE (r.asset_id IS NULL OR r.model_id != ?) AND a.mime_type LIKE 'image/%' \
              ORDER BY a.id",
         )
+        .bind(detector_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -250,13 +265,15 @@ impl FacesRepo {
     /// sampling; None means imported without ffprobe.
     pub async fn fetch_videos_undetected(
         &self,
+        detector_id: &str,
     ) -> crate::Result<Vec<(AssetId, std::path::PathBuf, Option<f64>)>> {
         let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
             "SELECT a.id, a.storage_path, a.duration_secs FROM assets a \
              LEFT JOIN face_detection_runs r ON r.asset_id = a.id \
-             WHERE r.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
+             WHERE (r.asset_id IS NULL OR r.model_id != ?) AND a.mime_type LIKE 'video/%' \
              ORDER BY a.id",
         )
+        .bind(detector_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -274,16 +291,22 @@ impl FacesRepo {
     }
 
     /// Load faces for clustering, optionally only the unassigned ones.
+    ///
+    /// Filtered to one recognition model: cosine distance between two models'
+    /// embeddings is noise even at the same width, so clustering must never
+    /// see a mixed set.
     pub async fn fetch_embeddings(
         &self,
         unassigned_only: bool,
+        embedder_id: &str,
     ) -> crate::Result<Vec<FaceEmbedding>> {
         let sql = if unassigned_only {
             "SELECT id, asset_id, person_id, score, embedding, assignment_source, ts_secs \
-             FROM faces WHERE embedding IS NOT NULL AND person_id IS NULL ORDER BY id"
+             FROM faces WHERE embedding IS NOT NULL AND model_id = ? AND person_id IS NULL \
+             ORDER BY id"
         } else {
             "SELECT id, asset_id, person_id, score, embedding, assignment_source, ts_secs \
-             FROM faces WHERE embedding IS NOT NULL ORDER BY id"
+             FROM faces WHERE embedding IS NOT NULL AND model_id = ? ORDER BY id"
         };
 
         type Row = (
@@ -296,6 +319,7 @@ impl FacesRepo {
             Option<f64>,
         );
         let rows: Vec<Row> = sqlx::query_as(sql)
+            .bind(embedder_id)
             .fetch_all(&self.pool)
             .await
             .map_err(crate::Error::Query)?;

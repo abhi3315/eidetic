@@ -7,7 +7,7 @@ pub mod speech;
 
 pub use error::{Error, Result};
 pub use face::{AnalyzedFace, BoundingBox, Detection, FaceAnalyzer, Landmarks};
-pub use siglip::SiglipEmbedder;
+pub use siglip::{SiglipEmbedder, active_model};
 
 /// Register libheif as a decoder hook on the `image` crate.
 ///

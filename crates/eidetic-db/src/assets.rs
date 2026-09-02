@@ -292,13 +292,19 @@ impl AssetsRepo {
         })
     }
 
-    pub async fn fetch_unembedded(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
+    /// Images the *active model* has not embedded.
+    ///
+    /// Keyed on `model_id` (migration 009), not row existence: keying purely
+    /// on existence is what let an `EIDETIC_MODEL` change look like an empty
+    /// queue while search silently skipped the whole library.
+    pub async fn fetch_unembedded(&self, model_id: &str) -> crate::Result<Vec<(AssetId, PathBuf)>> {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT a.id, a.storage_path FROM assets a \
              LEFT JOIN embeddings e ON e.asset_id = a.id \
-             WHERE e.asset_id IS NULL AND a.mime_type LIKE 'image/%' \
+             WHERE (e.asset_id IS NULL OR e.model_id != ?) AND a.mime_type LIKE 'image/%' \
              ORDER BY a.id",
         )
+        .bind(model_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -309,19 +315,25 @@ impl AssetsRepo {
             .collect())
     }
 
-    /// Videos with no sampled-frame embeddings yet (ADR-0011). Duration
-    /// rides along so the caller can pick sample timestamps without
-    /// re-probing; None means the import ran without ffprobe.
+    /// Videos the *active model* has no sampled-frame embeddings for
+    /// (ADR-0011). Duration rides along so the caller can pick sample
+    /// timestamps without re-probing; None means the import ran without
+    /// ffprobe.
+    ///
+    /// See [`Self::fetch_unembedded`] for why `model_id` is part of the
+    /// question.
     pub async fn fetch_videos_unembedded(
         &self,
+        model_id: &str,
     ) -> crate::Result<Vec<(AssetId, PathBuf, Option<f64>)>> {
         let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
             "SELECT a.id, a.storage_path, a.duration_secs FROM assets a \
-             LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings) fe \
+             LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings WHERE model_id = ?) fe \
                     ON fe.asset_id = a.id \
              WHERE fe.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
              ORDER BY a.id",
         )
+        .bind(model_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -457,14 +469,21 @@ impl AssetsRepo {
         Ok(row.map(DetailRow::into_detail))
     }
 
-    pub async fn store_embedding(&self, id: AssetId, embedding: &[f32]) -> crate::Result<()> {
+    pub async fn store_embedding(
+        &self,
+        id: AssetId,
+        embedding: &[f32],
+        model_id: &str,
+    ) -> crate::Result<()> {
         sqlx::query(
-            "INSERT INTO embeddings (asset_id, dim, vector) VALUES (?, ?, ?) \
-             ON CONFLICT(asset_id) DO UPDATE SET dim = excluded.dim, vector = excluded.vector",
+            "INSERT INTO embeddings (asset_id, dim, vector, model_id) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(asset_id) DO UPDATE SET dim = excluded.dim, \
+               vector = excluded.vector, model_id = excluded.model_id",
         )
         .bind(id_text(id))
         .bind(embedding.len() as i64)
         .bind(vector::encode(embedding))
+        .bind(model_id)
         .execute(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -478,6 +497,7 @@ impl AssetsRepo {
         &self,
         id: AssetId,
         frames: &[(f64, Vec<f32>)],
+        model_id: &str,
     ) -> crate::Result<()> {
         let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
         sqlx::query("DELETE FROM frame_embeddings WHERE asset_id = ?")
@@ -487,13 +507,14 @@ impl AssetsRepo {
             .map_err(crate::Error::Query)?;
         for (ts, vector) in frames {
             sqlx::query(
-                "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector) \
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector, model_id) \
+                 VALUES (?, ?, ?, ?, ?)",
             )
             .bind(id_text(id))
             .bind(ts)
             .bind(vector.len() as i64)
             .bind(vector::encode(vector))
+            .bind(model_id)
             .execute(&mut *tx)
             .await
             .map_err(crate::Error::Query)?;
@@ -617,14 +638,19 @@ impl AssetsRepo {
         ))
     }
 
-    /// Videos never transcribed (anti-join on `transcript_runs`).
-    pub async fn fetch_videos_untranscribed(&self) -> crate::Result<Vec<(AssetId, PathBuf)>> {
+    /// Videos the *active speech model* has never transcribed (anti-join on
+    /// `transcript_runs`, keyed on `model_id` like the embedding queues).
+    pub async fn fetch_videos_untranscribed(
+        &self,
+        model_id: &str,
+    ) -> crate::Result<Vec<(AssetId, PathBuf)>> {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT a.id, a.storage_path FROM assets a \
              LEFT JOIN transcript_runs r ON r.asset_id = a.id \
-             WHERE r.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
+             WHERE (r.asset_id IS NULL OR r.model_id != ?) AND a.mime_type LIKE 'video/%' \
              ORDER BY a.id",
         )
+        .bind(model_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -640,6 +666,7 @@ impl AssetsRepo {
         &self,
         id: AssetId,
         segments: &[(f64, f64, String)],
+        model_id: &str,
     ) -> crate::Result<()> {
         let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
         sqlx::query("DELETE FROM transcripts WHERE asset_id = ?")
@@ -661,11 +688,13 @@ impl AssetsRepo {
             .map_err(crate::Error::Query)?;
         }
         sqlx::query(
-            "INSERT INTO transcript_runs (asset_id, segment_count) VALUES (?, ?) \
-             ON CONFLICT(asset_id) DO UPDATE SET segment_count = excluded.segment_count",
+            "INSERT INTO transcript_runs (asset_id, segment_count, model_id) VALUES (?, ?, ?) \
+             ON CONFLICT(asset_id) DO UPDATE SET \
+               segment_count = excluded.segment_count, model_id = excluded.model_id",
         )
         .bind(id_text(id))
         .bind(segments.len() as i64)
+        .bind(model_id)
         .execute(&mut *tx)
         .await
         .map_err(crate::Error::Query)?;
@@ -707,37 +736,50 @@ impl AssetsRepo {
             return Ok(Vec::new());
         }
 
-        let rows: Vec<(String, f64, String)> = sqlx::query_as(
-            "SELECT t.asset_id, t.ts_secs, t.text \
-             FROM transcripts_fts f \
-             JOIN transcripts t ON t.rowid = f.rowid \
-             WHERE transcripts_fts MATCH ? \
-             ORDER BY bm25(transcripts_fts) \
-             LIMIT ?",
-        )
-        .bind(&fts_query)
-        .bind((limit * 5) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
+        // One asset can own many matching segments, and a person/date/place
+        // filter is applied to the *rows this query returns* — so a fixed
+        // prefix silently hides matches that exist. Over-fetch and escalate
+        // until the page fills or FTS runs out, the same way `search_similar`
+        // handles its own filtered ranking.
+        let mut over_fetch = (limit as usize).saturating_mul(5);
+        loop {
+            let rows: Vec<(String, f64, String)> = sqlx::query_as(
+                "SELECT t.asset_id, t.ts_secs, t.text \
+                 FROM transcripts_fts f \
+                 JOIN transcripts t ON t.rowid = f.rowid \
+                 WHERE transcripts_fts MATCH ? \
+                 ORDER BY bm25(transcripts_fts) \
+                 LIMIT ?",
+            )
+            .bind(&fts_query)
+            .bind(over_fetch as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+            let exhausted = rows.len() < over_fetch;
 
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for (id, ts, text) in rows {
-            let asset = parse_id(&id);
-            if let Some(allowed) = allowed
-                && !allowed.contains(&asset)
-            {
-                continue;
-            }
-            if seen.insert(asset) {
-                out.push((asset, ts, text));
-                if out.len() == limit as usize {
-                    break;
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for (id, ts, text) in rows {
+                let asset = parse_id(&id);
+                if let Some(allowed) = allowed
+                    && !allowed.contains(&asset)
+                {
+                    continue;
+                }
+                if seen.insert(asset) {
+                    out.push((asset, ts, text));
+                    if out.len() == limit as usize {
+                        break;
+                    }
                 }
             }
+
+            if out.len() == limit as usize || exhausted {
+                return Ok(out);
+            }
+            over_fetch = over_fetch.saturating_mul(2);
         }
-        Ok(out)
     }
 
     /// Semantic + spoken-word search in one ranking (goals-v0.5.md #4).
@@ -1076,6 +1118,25 @@ impl AssetsRepo {
                 vector::decode(&blob).ok_or_else(|| corrupt("frame_embeddings", &id, &blob))?;
             keys.push((parse_id(&id), Some(ts)));
             vectors.push(decoded);
+        }
+
+        // Ranking drops rows whose width doesn't match the query, which is
+        // right mid-migration but indistinguishable from an empty library if
+        // *nothing* matches. Say so instead: this is the state an
+        // `EIDETIC_MODEL` change leaves behind, and it needs re-embedding,
+        // not a different search term.
+        if !vectors.is_empty() && !vectors.iter().any(|v| v.len() == query_vec.len()) {
+            let mut dims: Vec<usize> = vectors.iter().map(Vec::len).collect();
+            dims.sort_unstable();
+            dims.dedup();
+            return Err(crate::Error::ModelMismatch {
+                query_dim: query_vec.len(),
+                stored_dims: dims
+                    .iter()
+                    .map(|d| format!("{d}-dim"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+            });
         }
 
         // A video contributes several frame rows, so over-fetch and collapse

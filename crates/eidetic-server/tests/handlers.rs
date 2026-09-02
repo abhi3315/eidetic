@@ -523,7 +523,12 @@ async fn persons_index_lists_people_with_cover_crops() {
     let asset = seed_asset(&repo, &tmp, "group.jpg", "image/jpeg", &jpeg, 0x23).await;
 
     let ids = faces
-        .record_detection(asset, &[test_face(asset, 0.9)])
+        .record_detection(
+            asset,
+            &[test_face(asset, 0.9)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     let person = faces.create_person().await.expect("person");
@@ -573,7 +578,12 @@ async fn person_page_links_faces_to_their_assets() {
     let asset = seed_asset(&repo, &tmp, "trip.jpg", "image/jpeg", &jpeg, 0x24).await;
 
     let ids = faces
-        .record_detection(asset, &[test_face(asset, 0.9)])
+        .record_detection(
+            asset,
+            &[test_face(asset, 0.9)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     let person = faces.create_person().await.expect("person");
@@ -622,7 +632,12 @@ async fn face_crop_renders_112px_jpeg_and_caches_it() {
     let asset = seed_asset(&repo, &tmp, "portrait.jpg", "image/jpeg", &jpeg, 0x25).await;
 
     let ids = faces
-        .record_detection(asset, &[test_face(asset, 0.9)])
+        .record_detection(
+            asset,
+            &[test_face(asset, 0.9)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
 
@@ -690,7 +705,12 @@ async fn asset_detail_lists_people_in_the_photo() {
     let asset = seed_asset(&repo, &tmp, "friends.jpg", "image/jpeg", &jpeg, 0x26).await;
 
     let ids = faces
-        .record_detection(asset, &[test_face(asset, 0.9)])
+        .record_detection(
+            asset,
+            &[test_face(asset, 0.9)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     let person = faces.create_person().await.expect("person");

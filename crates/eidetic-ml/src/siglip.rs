@@ -50,6 +50,13 @@ const PAD_TOKEN_ID: i64 = 1;
 
 #[derive(Debug)]
 struct ModelVariant {
+    /// Stable identity written into every row this variant produces.
+    ///
+    /// Deliberately not the HuggingFace repo path: a repo can be renamed or
+    /// re-exported, and rows already on disk have to keep meaning what they
+    /// meant. Changing one of these strings orphans existing rows, which is
+    /// correct only when the weights genuinely changed.
+    id: &'static str,
     repo: &'static str,
     vision_model: &'static str,
     text_model: &'static str,
@@ -63,6 +70,7 @@ struct ModelVariant {
 }
 
 const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
+    id: "siglip2-base-patch16-256",
     repo: "onnx-community/siglip2-base-patch16-256-ONNX",
     vision_model: "onnx/vision_model.onnx",
     text_model: "onnx/text_model.onnx",
@@ -72,6 +80,7 @@ const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
 };
 
 const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
+    id: "siglip2-large-patch16-384",
     repo: "onnx-community/siglip2-large-patch16-384-ONNX",
     vision_model: "onnx/vision_model.onnx",
     text_model: "onnx/text_model.onnx",
@@ -86,6 +95,7 @@ const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
 /// text-to-image job. Not yet the default: ADR-0007 requires the switch be
 /// justified by measured recall from `eidetic eval`, not assumed.
 const SIGLIP2_SO400M_384: ModelVariant = ModelVariant {
+    id: "siglip2-so400m-patch14-384",
     repo: "onnx-community/siglip2-so400m-patch14-384-ONNX",
     vision_model: "onnx/vision_model.onnx",
     text_model: "onnx/text_model.onnx",
@@ -112,6 +122,21 @@ fn variant_for(raw: Option<&str>) -> Result<&'static ModelVariant> {
 
 fn current_variant() -> Result<&'static ModelVariant> {
     variant_for(std::env::var("EIDETIC_MODEL").ok().as_deref())
+}
+
+/// Identity and width of the variant `EIDETIC_MODEL` currently selects,
+/// without loading the model.
+///
+/// Callers need this *before* deciding whether there is work to do, so it
+/// must not touch the model: asking a loaded embedder would mean paying a
+/// 1.4 GiB download only to discover there is nothing to embed.
+///
+/// The id is the authority on "which model produced this row"; the width is
+/// carried alongside it because ranking still has to reject vectors it cannot
+/// compare, and two different models can share a width.
+pub fn active_model() -> Result<(&'static str, usize)> {
+    let v = current_variant()?;
+    Ok((v.id, v.embed_dim))
 }
 
 /// Produces L2-normalised embeddings for images and text. Variant selected

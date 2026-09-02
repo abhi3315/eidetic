@@ -306,6 +306,55 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
     Ok(Some(()))
 }
 
+/// Does this file carry an audio stream at all?
+///
+/// Header-only ffprobe, so it costs nothing next to a decode. Split out
+/// because "no audio" and "audio we failed to decode" need opposite
+/// treatment and ffmpeg's exit status alone cannot tell them apart.
+/// `Ok(None)` when ffprobe is missing.
+fn has_audio_stream(path: &Path) -> Result<Option<bool>> {
+    let Some(ffprobe) = ffprobe() else {
+        return Ok(None);
+    };
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-print_format",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::VideoProbe {
+            path: path.to_path_buf(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| Error::VideoProbe {
+            path: path.to_path_buf(),
+            detail: format!("unparseable ffprobe JSON: {e}"),
+        })?;
+    Ok(Some(parse_has_audio(&json)))
+}
+
+/// Pull the audio-stream verdict out of ffprobe's JSON. Split from
+/// [`has_audio_stream`] so it is testable without running ffprobe.
+fn parse_has_audio(json: &serde_json::Value) -> bool {
+    json["streams"]
+        .as_array()
+        .is_some_and(|streams| !streams.is_empty())
+}
+
 /// Decode a video's audio track to 16 kHz mono f32 PCM — whisper's input
 /// format. `Ok(Some(vec![]))` for a video with no (or empty) audio stream;
 /// `Ok(None)` when ffmpeg is missing.
@@ -313,6 +362,19 @@ pub fn extract_audio_pcm(path: &Path) -> Result<Option<Vec<f32>>> {
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
+
+    // Settle "is there audio here?" before decoding. Deciding it afterwards
+    // from ffmpeg's exit status is what made a corrupt or unsupported file
+    // indistinguishable from a genuinely silent one: both exit non-zero with
+    // nothing on stdout, and the caller stored the failure as a completed
+    // zero-segment transcript that no later run would ever retry.
+    // Without ffprobe there is no way to make that distinction, so fall
+    // through and let a no-audio file fail: it stays pending and retries,
+    // which is the recoverable direction to be wrong in.
+    if has_audio_stream(path)? == Some(false) {
+        return Ok(Some(Vec::new()));
+    }
+
     let output = Command::new(ffmpeg)
         .args(["-v", "error", "-i"])
         .arg(path)
@@ -322,10 +384,9 @@ pub fn extract_audio_pcm(path: &Path) -> Result<Option<Vec<f32>>> {
             path: path.to_path_buf(),
             source,
         })?;
-    // "no audio stream" is a normal outcome, not an error: ffmpeg fails the
-    // map when -vn leaves nothing, so treat failure-with-empty-stdout as
-    // silence and only real decode errors as errors.
-    if !output.status.success() && !output.stdout.is_empty() {
+    // Past the probe, any non-zero exit is a real decode failure: it must
+    // surface so the asset stays pending and a later run can retry it.
+    if !output.status.success() {
         return Err(Error::VideoProbe {
             path: path.to_path_buf(),
             detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -549,6 +610,20 @@ mod tests {
         assert_eq!(p.video_codec, None);
         assert_eq!((p.width, p.height), (None, None));
         assert_eq!(p.duration_secs, Some(3.0));
+    }
+
+    #[test]
+    fn parse_has_audio_separates_silence_from_a_real_track() {
+        // `-select_streams a` returns only audio streams, so an empty array
+        // is the genuine no-audio case — the only one allowed to be stored
+        // as a completed zero-segment transcript.
+        let none: serde_json::Value = serde_json::json!({ "streams": [] });
+        assert!(!parse_has_audio(&none), "no audio stream");
+
+        let some: serde_json::Value = serde_json::json!({
+            "streams": [{"codec_type": "audio"}]
+        });
+        assert!(parse_has_audio(&some), "one audio stream");
     }
 
     #[test]

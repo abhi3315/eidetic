@@ -8,9 +8,14 @@ use std::path::PathBuf;
 /// outlive the test body, or the database file is deleted mid-test.
 fn temp_db() -> (tempfile::TempDir, Config) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Every path lives under the tempdir: these tests must not depend on
+    // the host having a home directory, and never touch a real library.
     let config = Config {
         database_path: dir.path().join("eidetic.db"),
-        ..Default::default()
+        paths: eidetic_core::Paths {
+            library_dir: dir.path().join("library"),
+            models_cache: dir.path().join("models"),
+        },
     };
     (dir, config)
 }
@@ -90,12 +95,20 @@ async fn record_detection_stores_faces_and_round_trips_embeddings() {
 
     let embedding = vec![0.5f32, 0.5, 0.5, 0.5];
     let ids = faces
-        .record_detection(asset, &[face(asset, embedding.clone())])
+        .record_detection(
+            asset,
+            &[face(asset, embedding.clone())],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     assert_eq!(ids.len(), 1);
 
-    let stored = faces.fetch_embeddings(false).await.expect("fetch");
+    let stored = faces
+        .fetch_embeddings(false, "auraface-v1")
+        .await
+        .expect("fetch");
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].id, ids[0]);
     assert_eq!(stored[0].asset_id, asset);
@@ -114,16 +127,83 @@ async fn asset_with_zero_faces_is_not_rescanned() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 2).await;
 
-    assert_eq!(faces.fetch_undetected().await.expect("before").len(), 1);
+    assert_eq!(
+        faces
+            .fetch_undetected("yunet-2023mar")
+            .await
+            .expect("before")
+            .len(),
+        1
+    );
 
     faces
-        .record_detection(asset, &[])
+        .record_detection(asset, &[], "yunet-2023mar", "auraface-v1")
         .await
         .expect("record empty run");
 
     assert!(
-        faces.fetch_undetected().await.expect("after").is_empty(),
+        faces
+            .fetch_undetected("yunet-2023mar")
+            .await
+            .expect("after")
+            .is_empty(),
         "a scanned asset with no faces must not come back as undetected"
+    );
+}
+
+/// Model identity is what separates two same-width embedding spaces: auraface
+/// and buffalo_l are both 512-dim, so nothing else in the row can. A detector
+/// change must re-queue the asset, and clustering must never see the other
+/// model's vectors.
+#[tokio::test]
+async fn a_model_change_requeues_work_and_isolates_embeddings() {
+    let (_tmp, assets, faces) = setup().await;
+    let asset = insert_asset(&assets, 3).await;
+
+    faces
+        .record_detection(
+            asset,
+            &[face(asset, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
+        .await
+        .expect("record");
+
+    // Same detector: done. Different detector: pending again.
+    assert!(
+        faces
+            .fetch_undetected("yunet-2023mar")
+            .await
+            .expect("same detector")
+            .is_empty()
+    );
+    assert_eq!(
+        faces
+            .fetch_undetected("scrfd-buffalo-l")
+            .await
+            .expect("other detector")
+            .len(),
+        1,
+        "a run left by another detector is work, not completion"
+    );
+
+    // Clustering reads are scoped to one recognition model.
+    assert_eq!(
+        faces
+            .fetch_embeddings(false, "auraface-v1")
+            .await
+            .expect("same embedder")
+            .len(),
+        1
+    );
+    assert!(
+        faces
+            .fetch_embeddings(false, "arcface-buffalo-l")
+            .await
+            .expect("other embedder")
+            .is_empty(),
+        "another model's same-width vectors must never reach clustering"
     );
 }
 
@@ -134,11 +214,19 @@ async fn fetch_undetected_only_returns_unscanned_assets() {
     let _b = insert_asset(&assets, 4).await;
 
     faces
-        .record_detection(a, &[face(a, vec![1.0, 0.0])])
+        .record_detection(
+            a,
+            &[face(a, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
 
-    let pending = faces.fetch_undetected().await.expect("fetch");
+    let pending = faces
+        .fetch_undetected("yunet-2023mar")
+        .await
+        .expect("fetch");
     assert_eq!(pending.len(), 1, "only the unscanned asset should remain");
     assert_ne!(pending[0].0, a);
 }
@@ -150,7 +238,12 @@ async fn auto_assignment_cannot_overwrite_a_user_pinned_face() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 5).await;
     let ids = faces
-        .record_detection(asset, &[face(asset, vec![1.0, 0.0])])
+        .record_detection(
+            asset,
+            &[face(asset, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     let face_id = ids[0];
@@ -168,7 +261,10 @@ async fn auto_assignment_cannot_overwrite_a_user_pinned_face() {
         .await
         .expect("auto assign is a no-op here");
 
-    let stored = faces.fetch_embeddings(false).await.expect("fetch");
+    let stored = faces
+        .fetch_embeddings(false, "auraface-v1")
+        .await
+        .expect("fetch");
     assert_eq!(
         stored[0].person_id,
         Some(alice),
@@ -182,7 +278,12 @@ async fn auto_assignment_does_update_an_auto_face() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 6).await;
     let ids = faces
-        .record_detection(asset, &[face(asset, vec![1.0, 0.0])])
+        .record_detection(
+            asset,
+            &[face(asset, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
 
@@ -194,7 +295,10 @@ async fn auto_assignment_does_update_an_auto_face() {
         .await
         .expect("auto");
 
-    let stored = faces.fetch_embeddings(false).await.expect("fetch");
+    let stored = faces
+        .fetch_embeddings(false, "auraface-v1")
+        .await
+        .expect("fetch");
     assert_eq!(stored[0].person_id, Some(second));
 }
 
@@ -203,7 +307,12 @@ async fn rejecting_a_face_clears_it_and_is_recorded() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 7).await;
     let ids = faces
-        .record_detection(asset, &[face(asset, vec![1.0, 0.0])])
+        .record_detection(
+            asset,
+            &[face(asset, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     let person = faces.create_person().await.expect("person");
@@ -214,7 +323,10 @@ async fn rejecting_a_face_clears_it_and_is_recorded() {
         .expect("assign");
     faces.reject_face(ids[0], person).await.expect("reject");
 
-    let stored = faces.fetch_embeddings(false).await.expect("fetch");
+    let stored = faces
+        .fetch_embeddings(false, "auraface-v1")
+        .await
+        .expect("fetch");
     assert!(
         stored[0].person_id.is_none(),
         "rejection must clear the attribution"
@@ -232,6 +344,8 @@ async fn unassigned_only_filter_excludes_assigned_faces() {
         .record_detection(
             asset,
             &[face(asset, vec![1.0, 0.0]), face(asset, vec![0.0, 1.0])],
+            "yunet-2023mar",
+            "auraface-v1",
         )
         .await
         .expect("record");
@@ -242,8 +356,18 @@ async fn unassigned_only_filter_excludes_assigned_faces() {
         .await
         .expect("assign");
 
-    assert_eq!(faces.fetch_embeddings(false).await.expect("all").len(), 2);
-    let pending = faces.fetch_embeddings(true).await.expect("unassigned");
+    assert_eq!(
+        faces
+            .fetch_embeddings(false, "auraface-v1")
+            .await
+            .expect("all")
+            .len(),
+        2
+    );
+    let pending = faces
+        .fetch_embeddings(true, "auraface-v1")
+        .await
+        .expect("unassigned");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, ids[1]);
 }
@@ -260,6 +384,8 @@ async fn links_are_stored_symmetrically_and_split_by_kind() {
                 face(asset, vec![0.0, 1.0]),
                 face(asset, vec![0.5, 0.5]),
             ],
+            "yunet-2023mar",
+            "auraface-v1",
         )
         .await
         .expect("record");
@@ -285,6 +411,8 @@ async fn changing_a_link_kind_updates_in_place() {
         .record_detection(
             asset,
             &[face(asset, vec![1.0, 0.0]), face(asset, vec![0.0, 1.0])],
+            "yunet-2023mar",
+            "auraface-v1",
         )
         .await
         .expect("record");
@@ -308,6 +436,8 @@ async fn merging_persons_moves_faces_and_hides_the_source() {
         .record_detection(
             asset,
             &[face(asset, vec![1.0, 0.0]), face(asset, vec![0.0, 1.0])],
+            "yunet-2023mar",
+            "auraface-v1",
         )
         .await
         .expect("record");
@@ -343,6 +473,8 @@ async fn list_persons_names_and_counts() {
                 face(asset, vec![0.0, 1.0]),
                 face(asset, vec![0.5, 0.5]),
             ],
+            "yunet-2023mar",
+            "auraface-v1",
         )
         .await
         .expect("record");
@@ -378,11 +510,20 @@ async fn faces_are_removed_with_their_asset() {
 
     let asset = insert_asset(&assets, 13).await;
     faces
-        .record_detection(asset, &[face(asset, vec![1.0, 0.0])])
+        .record_detection(
+            asset,
+            &[face(asset, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
     assert_eq!(
-        faces.fetch_embeddings(false).await.expect("before").len(),
+        faces
+            .fetch_embeddings(false, "auraface-v1")
+            .await
+            .expect("before")
+            .len(),
         1
     );
 
@@ -394,7 +535,7 @@ async fn faces_are_removed_with_their_asset() {
 
     assert!(
         faces
-            .fetch_embeddings(false)
+            .fetch_embeddings(false, "auraface-v1")
             .await
             .expect("after")
             .is_empty(),
@@ -415,7 +556,12 @@ async fn list_persons_picks_highest_score_face_as_cover() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 14).await;
     let ids = faces
-        .record_detection(asset, &[scored_face(asset, 0.60), scored_face(asset, 0.99)])
+        .record_detection(
+            asset,
+            &[scored_face(asset, 0.60), scored_face(asset, 0.99)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
 
@@ -437,7 +583,12 @@ async fn fetch_person_returns_person_with_cover_and_count() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 15).await;
     let ids = faces
-        .record_detection(asset, &[scored_face(asset, 0.70), scored_face(asset, 0.90)])
+        .record_detection(
+            asset,
+            &[scored_face(asset, 0.70), scored_face(asset, 0.90)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
 
@@ -462,7 +613,12 @@ async fn fetch_person_unknown_and_merged_return_none() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 16).await;
     let ids = faces
-        .record_detection(asset, &[scored_face(asset, 0.9)])
+        .record_detection(
+            asset,
+            &[scored_face(asset, 0.9)],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record");
 
@@ -493,11 +649,11 @@ async fn fetch_faces_for_person_joins_paths_and_orders_by_score() {
     let b = insert_asset(&assets, 18).await;
 
     let low = faces
-        .record_detection(a, &[scored_face(a, 0.60)])
+        .record_detection(a, &[scored_face(a, 0.60)], "yunet-2023mar", "auraface-v1")
         .await
         .expect("record a")[0];
     let high = faces
-        .record_detection(b, &[scored_face(b, 0.95)])
+        .record_detection(b, &[scored_face(b, 0.95)], "yunet-2023mar", "auraface-v1")
         .await
         .expect("record b")[0];
 
@@ -547,7 +703,12 @@ async fn fetch_face_round_trips_geometry() {
         ts_secs: None,
     };
     let id = faces
-        .record_detection(asset, std::slice::from_ref(&new_face))
+        .record_detection(
+            asset,
+            std::slice::from_ref(&new_face),
+            "yunet-2023mar",
+            "auraface-v1",
+        )
         .await
         .expect("record")[0];
 
@@ -584,6 +745,8 @@ async fn fetch_faces_for_asset_lists_only_attributed_faces() {
                 scored_face(asset, 0.80),
                 scored_face(asset, 0.70),
             ],
+            "yunet-2023mar",
+            "auraface-v1",
         )
         .await
         .expect("record");

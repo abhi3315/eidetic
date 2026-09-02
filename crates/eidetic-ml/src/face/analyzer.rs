@@ -19,6 +19,13 @@ const MIN_FACE_PIXELS: f32 = 32.0;
 
 #[derive(Debug)]
 struct ModelPair {
+    /// Stable identity of the recognition model, written into every face row
+    /// it embeds. Needed because width does not identify the model here:
+    /// AuraFace and buffalo_l are both 512-dim from unrelated weights.
+    embedder_id: &'static str,
+    /// Stable identity of the detector, written into every detection run.
+    /// Tracked separately because the two halves change independently.
+    detector_id: &'static str,
     detector_repo: &'static str,
     detector_file: &'static str,
     embedder_repo: &'static str,
@@ -28,6 +35,8 @@ struct ModelPair {
 
 /// Permissive default: YuNet (MIT) + SFace (Apache-2.0), both OpenCV Zoo.
 const YUNET_SFACE: ModelPair = ModelPair {
+    embedder_id: "sface-2021dec",
+    detector_id: "yunet-2023mar",
     detector_repo: "opencv/face_detection_yunet",
     detector_file: "face_detection_yunet_2023mar.onnx",
     embedder_repo: "opencv/face_recognition_sface",
@@ -49,6 +58,8 @@ const YUNET_SFACE: ModelPair = ModelPair {
 /// not state which weights fal trained. We use only the recognition model,
 /// which is the one they claim as their own.
 const YUNET_AURAFACE: ModelPair = ModelPair {
+    embedder_id: "auraface-v1",
+    detector_id: "yunet-2023mar",
     detector_repo: "opencv/face_detection_yunet",
     detector_file: "face_detection_yunet_2023mar.onnx",
     embedder_repo: "fal/AuraFace-v1",
@@ -59,6 +70,8 @@ const YUNET_AURAFACE: ModelPair = ModelPair {
 /// Opt-in: InsightFace SCRFD + ArcFace. Better accuracy, but the weights are
 /// licensed for non-commercial research only — the user chooses this knowingly.
 const BUFFALO_L: ModelPair = ModelPair {
+    embedder_id: "arcface-buffalo-l",
+    detector_id: "scrfd-buffalo-l",
     detector_repo: "immich-app/buffalo_l",
     detector_file: "detection/model.onnx",
     embedder_repo: "immich-app/buffalo_l",
@@ -75,6 +88,17 @@ fn pair_for(raw: Option<&str>) -> Result<&'static ModelPair> {
             "Unknown EIDETIC_FACE_MODEL={other:?}; valid values: auraface, sface, buffalo_l"
         ))),
     }
+}
+
+/// Detector and recognizer identity for the pair `EIDETIC_FACE_MODEL`
+/// currently selects, without loading either model.
+///
+/// Returned as `(detector_id, embedder_id)`. Detection runs and face rows are
+/// keyed on different halves because the two change independently — a new
+/// detector does not invalidate embeddings, and vice versa.
+pub fn active_models() -> Result<(&'static str, &'static str)> {
+    let pair = pair_for(std::env::var("EIDETIC_FACE_MODEL").ok().as_deref())?;
+    Ok((pair.detector_id, pair.embedder_id))
 }
 
 /// A detected face plus its embedding.

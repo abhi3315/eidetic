@@ -31,6 +31,19 @@ fn model_file(raw: Option<&str>) -> Result<&'static str> {
     }
 }
 
+/// Stable identity of the whisper model `EIDETIC_SPEECH_MODEL` currently
+/// selects, without loading it. Written into every transcript run so a model
+/// change turns the library back into pending work instead of leaving stale
+/// transcripts looking finished.
+pub fn active_model() -> Result<&'static str> {
+    match model_file(std::env::var("EIDETIC_SPEECH_MODEL").ok().as_deref())? {
+        "ggml-base.bin" => Ok("whisper-base"),
+        "ggml-small.bin" => Ok("whisper-small"),
+        "ggml-large-v3-turbo-q5_0.bin" => Ok("whisper-large-v3-turbo-q5_0"),
+        other => Err(Error::ModelLoad(format!("unmapped speech model {other}"))),
+    }
+}
+
 /// Owns a loaded whisper model. Synchronous like the other model wrappers:
 /// drive it from a blocking worker.
 pub struct SpeechTranscriber {

@@ -26,17 +26,30 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use tokio::sync::{OnceCell, mpsc, oneshot};
+
+/// A text-embedding request and the channel its vector comes back on.
+type EmbedJob = (String, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>);
 
 pub struct EideticMcp {
     config: Config,
     repo: AssetsRepo,
     faces: FacesRepo,
+    /// Handle to a resident SigLIP worker, started on the first semantic
+    /// query and kept for the life of the session.
+    ///
+    /// Loading the model costs ~1.4 GiB and several seconds, so it must
+    /// happen at most once per session — but lazily, because an agent that
+    /// only reads metadata (`scenes`, `transcript`, `faces_in`) should never
+    /// pay for it at all. Same resident-worker shape as `eidetic-server`,
+    /// with the eager load traded for a `OnceCell`.
+    embedder: OnceCell<mpsc::Sender<EmbedJob>>,
 }
 
 /// Serve the library over stdio until the client disconnects.
 pub async fn serve() -> anyhow::Result<()> {
     use anyhow::Context;
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     let pool = eidetic_db::connect(&config)
         .await
         .context("failed to connect to database")?;
@@ -45,6 +58,7 @@ pub async fn serve() -> anyhow::Result<()> {
         config,
         repo: AssetsRepo::new(pool),
         faces,
+        embedder: OnceCell::new(),
     };
     let service = server
         .serve(rmcp::transport::stdio())
@@ -172,14 +186,41 @@ impl EideticMcp {
 
     async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
         use anyhow::Context;
-        let models_dir = self.config.paths.models_cache.clone();
-        tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
-            let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-            e.embed_text(&text)
-        })
-        .await
-        .context("embedder thread panicked")?
-        .context("text embedding failed")
+
+        // First semantic query in the session pays the model load; every
+        // later one is a channel round trip to the worker that already owns
+        // the session. Reloading per call made an agent's second search cost
+        // as much as its first.
+        let tx = self
+            .embedder
+            .get_or_try_init(|| async {
+                let models_dir = self.config.paths.models_cache.clone();
+                let embedder = tokio::task::spawn_blocking(move || {
+                    eidetic_ml::SiglipEmbedder::load(&models_dir)
+                })
+                .await
+                .context("embedder thread panicked")?
+                .context("failed to load SigLIP 2 model")?;
+
+                let (tx, mut rx) = mpsc::channel::<EmbedJob>(8);
+                tokio::task::spawn_blocking(move || {
+                    let mut embedder = embedder;
+                    while let Some((text, reply)) = rx.blocking_recv() {
+                        let _ = reply.send(embedder.embed_text(&text));
+                    }
+                });
+                Ok::<_, anyhow::Error>(tx)
+            })
+            .await?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send((text, reply_tx))
+            .await
+            .context("embed worker is gone")?;
+        reply_rx
+            .await
+            .context("embed worker panicked or died mid-job")?
+            .context("text embedding failed")
     }
 
     #[tool(

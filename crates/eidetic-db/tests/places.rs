@@ -7,9 +7,14 @@ use std::path::PathBuf;
 /// outlive the test body, or the database file is deleted mid-test.
 fn temp_db() -> (tempfile::TempDir, Config) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Every path lives under the tempdir: these tests must not depend on
+    // the host having a home directory, and never touch a real library.
     let config = Config {
         database_path: dir.path().join("eidetic.db"),
-        ..Default::default()
+        paths: eidetic_core::Paths {
+            library_dir: dir.path().join("library"),
+            models_cache: dir.path().join("models"),
+        },
     };
     (dir, config)
 }

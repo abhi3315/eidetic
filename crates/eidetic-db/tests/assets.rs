@@ -8,9 +8,14 @@ use std::path::PathBuf;
 /// deletes the directory and the database file along with it.
 fn temp_db() -> (tempfile::TempDir, Config) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Every path lives under the tempdir: these tests must not depend on
+    // the host having a home directory, and never touch a real library.
     let config = Config {
         database_path: dir.path().join("eidetic.db"),
-        ..Default::default()
+        paths: eidetic_core::Paths {
+            library_dir: dir.path().join("library"),
+            models_cache: dir.path().join("models"),
+        },
     };
     (dir, config)
 }
@@ -219,14 +224,31 @@ async fn fetch_unembedded_returns_only_null_embedding_images() {
     };
 
     // Embed asset_a. Now only asset_b should be in the unembedded list.
-    repo.store_embedding(id_a, &[0.1f32; 768])
+    repo.store_embedding(id_a, &[0.1f32; 768], "siglip2-base-patch16-256")
         .await
         .expect("store embedding");
 
-    let unembedded = repo.fetch_unembedded().await.expect("fetch unembedded");
+    let unembedded = repo
+        .fetch_unembedded("siglip2-base-patch16-256")
+        .await
+        .expect("fetch unembedded");
     assert_eq!(unembedded.len(), 1);
     let (_, path) = &unembedded[0];
     assert!(path.to_str().unwrap().contains("b.jpg"));
+
+    // Switching EIDETIC_MODEL changes the id the caller asks for, and
+    // asset_a's row was produced by the old model — so it is work again.
+    // Keying on row existence alone reported an empty queue here while
+    // search skipped the whole library.
+    let after_model_change = repo
+        .fetch_unembedded("siglip2-so400m-patch14-384")
+        .await
+        .expect("fetch unembedded");
+    assert_eq!(
+        after_model_change.len(),
+        2,
+        "a row from another model is pending work, not a finished asset"
+    );
 }
 
 #[tokio::test]
@@ -319,8 +341,12 @@ async fn search_similar_orders_by_cosine_similarity() {
         _ => panic!(),
     };
 
-    repo.store_embedding(id_a, &emb_a).await.expect("embed a");
-    repo.store_embedding(id_b, &emb_b).await.expect("embed b");
+    repo.store_embedding(id_a, &emb_a, "siglip2-base-patch16-256")
+        .await
+        .expect("embed a");
+    repo.store_embedding(id_b, &emb_b, "siglip2-base-patch16-256")
+        .await
+        .expect("embed b");
 
     // Query with e1: asset A should come first (score ~1.0), B second (score ~0.0).
     let query = emb_a.clone();
@@ -708,7 +734,9 @@ async fn transcript_round_trips_in_order() {
         (5.0, 8.0, "second thing said".to_string()),
         (0.5, 4.0, "first thing said".to_string()),
     ];
-    repo.store_transcript(id, &segments).await.expect("store");
+    repo.store_transcript(id, &segments, "whisper-small")
+        .await
+        .expect("store");
     let back = repo.fetch_transcript(id).await.expect("fetch");
     assert_eq!(back.len(), 2);
     assert_eq!(back[0].2, "first thing said");

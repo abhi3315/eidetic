@@ -23,7 +23,7 @@ pub fn run(csv_path: &Path, images_dir: &Path, limit: Option<usize>) -> Result<(
         csv_path.display()
     );
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     println!("Loading model (downloads ~1.4 GiB on first run)…");
     let mut embedder = SiglipEmbedder::load(&config.paths.models_cache)
         .context("failed to load SigLIP 2 model")?;

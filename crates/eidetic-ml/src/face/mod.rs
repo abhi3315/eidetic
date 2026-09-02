@@ -10,7 +10,7 @@ mod analyzer;
 mod detect;
 
 pub use align::{ALIGNED_SIZE, align_face};
-pub use analyzer::{AnalyzedFace, FaceAnalyzer};
+pub use analyzer::{AnalyzedFace, FaceAnalyzer, active_models};
 pub use detect::Detection;
 
 /// A face box in original-image pixel coordinates.

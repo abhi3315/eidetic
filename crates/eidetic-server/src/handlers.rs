@@ -391,10 +391,16 @@ pub(crate) async fn face_crop(
 
     // Cache on disk: write to a temp name, then rename, so a concurrent
     // request can never read a half-written file.
+    //
+    // The temp name must be unique per *request*, not per process: two
+    // concurrent cold requests for the same face would otherwise pick the
+    // same path, and the second writer would keep writing into the inode the
+    // first one had already renamed into place — publishing a truncated JPEG
+    // that the read-first cache then serves forever.
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(ServerError::Io)?;
-    let tmp_path = cache_dir.join(format!("{face_id}.jpg.tmp-{}", std::process::id()));
+    let tmp_path = cache_dir.join(format!("{face_id}.jpg.tmp-{}", Uuid::new_v4()));
     if tokio::fs::write(&tmp_path, &bytes).await.is_ok() {
         let _ = tokio::fs::rename(&tmp_path, &cache_path).await;
     }
@@ -580,7 +586,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let config = eidetic_core::Config {
             database_path: tmp.path().join("eidetic.db"),
-            ..Default::default()
+            paths: eidetic_core::Paths {
+                library_dir: tmp.path().join("library"),
+                models_cache: tmp.path().join("models"),
+            },
         };
         let pool = eidetic_db::connect(&config).await.expect("connect");
         let assets = eidetic_db::AssetsRepo::new(pool.clone());
@@ -647,6 +656,8 @@ mod tests {
                     embedding: vec![1.0, 0.0],
                     ts_secs: None,
                 }],
+                "yunet-2023mar",
+                "auraface-v1",
             )
             .await
             .expect("record");

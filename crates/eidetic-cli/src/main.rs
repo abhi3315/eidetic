@@ -391,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} is not a file or directory", path.display());
             }
 
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -442,7 +442,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Stats => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -475,7 +475,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Embed => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
 
             let models_dir = config.paths.models_cache.clone();
 
@@ -484,12 +484,19 @@ async fn main() -> anyhow::Result<()> {
                 .context("failed to connect to database")?;
             let repo = eidetic_db::AssetsRepo::new(pool);
 
+            // Resolved from EIDETIC_MODEL without loading the model: a row
+            // produced by another model is pending work, not a finished
+            // asset, and only the id — not the width — can say which is
+            // which.
+            let (model_id, _dim) = eidetic_ml::active_model()
+                .context("failed to resolve the active embedding model")?;
+
             let unembedded = repo
-                .fetch_unembedded()
+                .fetch_unembedded(model_id)
                 .await
                 .context("failed to fetch unembedded assets")?;
             let videos_unembedded = repo
-                .fetch_videos_unembedded()
+                .fetch_videos_unembedded(model_id)
                 .await
                 .context("failed to fetch unembedded videos")?;
 
@@ -603,7 +610,7 @@ async fn main() -> anyhow::Result<()> {
                 )?;
 
                 match result {
-                    Ok(emb) => match repo.store_embedding(id, &emb).await {
+                    Ok(emb) => match repo.store_embedding(id, &emb, model_id).await {
                         Ok(()) => {
                             println!("[{}/{}] {}", i + 1, total, path.display());
                             embedded += 1;
@@ -671,7 +678,7 @@ async fn main() -> anyhow::Result<()> {
                 )?;
 
                 match result {
-                    Ok(frames) => match repo.store_frame_embeddings(id, &frames).await {
+                    Ok(frames) => match repo.store_frame_embeddings(id, &frames, model_id).await {
                         Ok(()) => {
                             println!(
                                 "[{}/{}] {} ({} frame(s))",
@@ -715,7 +722,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Thumbnail => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -847,7 +854,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Faces { cluster_only } => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let models_dir = config.paths.models_cache.clone();
 
             let pool = eidetic_db::connect(&config)
@@ -856,13 +863,21 @@ async fn main() -> anyhow::Result<()> {
             let assets_repo = eidetic_db::AssetsRepo::new(pool.clone());
             let faces_repo = eidetic_db::FacesRepo::new(pool);
 
+            // Detector and recognizer identity, resolved from
+            // EIDETIC_FACE_MODEL without loading either model. Runs and rows
+            // are keyed on these so a model change turns the library back
+            // into pending work instead of silently mixing two embedding
+            // spaces (auraface and buffalo_l are both 512-dim).
+            let (detector_id, embedder_id) = eidetic_ml::face::active_models()
+                .context("failed to resolve the active face models")?;
+
             if !cluster_only {
                 let pending = faces_repo
-                    .fetch_undetected()
+                    .fetch_undetected(detector_id)
                     .await
                     .context("failed to fetch undetected assets")?;
                 let videos = faces_repo
-                    .fetch_videos_undetected()
+                    .fetch_videos_undetected(detector_id)
                     .await
                     .context("failed to fetch undetected videos")?;
                 let ffmpeg_ok = eidetic_ingest::video::ffmpeg().is_some()
@@ -977,7 +992,15 @@ async fn main() -> anyhow::Result<()> {
                                     })
                                     .collect();
 
-                                match faces_repo.record_detection(asset_id, &new_faces).await {
+                                match faces_repo
+                                    .record_detection(
+                                        asset_id,
+                                        &new_faces,
+                                        detector_id,
+                                        embedder_id,
+                                    )
+                                    .await
+                                {
                                     Ok(_) => {
                                         println!(
                                             "[{}/{}] {} — {} face(s)",
@@ -1033,7 +1056,15 @@ async fn main() -> anyhow::Result<()> {
                         match result {
                             Ok(per_ts) => {
                                 let new_faces = video_faces_to_record(asset_id, &per_ts);
-                                match faces_repo.record_detection(asset_id, &new_faces).await {
+                                match faces_repo
+                                    .record_detection(
+                                        asset_id,
+                                        &new_faces,
+                                        detector_id,
+                                        embedder_id,
+                                    )
+                                    .await
+                                {
                                     Ok(_) => {
                                         println!(
                                             "[{}/{}] {} — {} face(s)",
@@ -1083,7 +1114,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Persons => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -1104,7 +1135,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::NamePerson { id, name } => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -1121,7 +1152,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { bind } => {
             use std::net::SocketAddr;
 
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let addr_str = bind
                 .or_else(|| std::env::var("EIDETIC_BIND").ok())
                 .unwrap_or_else(|| "127.0.0.1:8080".to_string());
@@ -1211,7 +1242,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let spec = project::ReelSpec {
                 prompt,
                 duration,
@@ -1275,7 +1306,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Transcode => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -1396,7 +1427,7 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(feature = "speech")]
             {
-                let config = Config::from_env();
+                let config = Config::from_env()?;
                 let models_dir = config.paths.models_cache.clone();
                 let pool = eidetic_db::connect(&config)
                     .await
@@ -1409,8 +1440,14 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                // Written into every run so switching EIDETIC_SPEECH_MODEL
+                // re-queues the library instead of leaving stale transcripts
+                // looking finished.
+                let speech_model = eidetic_ml::speech::active_model()
+                    .context("failed to resolve the active speech model")?;
+
                 let pending = repo
-                    .fetch_videos_untranscribed()
+                    .fetch_videos_untranscribed(speech_model)
                     .await
                     .context("failed to fetch videos")?;
                 if pending.is_empty() {
@@ -1458,7 +1495,7 @@ async fn main() -> anyhow::Result<()> {
                     // zero segments — whisper hallucinates on silence, so it
                     // never sees them.
                     if !eidetic_ingest::video::has_audible_content(&pcm) {
-                        repo.store_transcript(id, &[])
+                        repo.store_transcript(id, &[], speech_model)
                             .await
                             .context("failed to record silent run")?;
                         println!(
@@ -1484,7 +1521,7 @@ async fn main() -> anyhow::Result<()> {
                                 .into_iter()
                                 .map(|s| (s.start_secs, s.end_secs, s.text))
                                 .collect();
-                            match repo.store_transcript(id, &rows).await {
+                            match repo.store_transcript(id, &rows, speech_model).await {
                                 Ok(()) => {
                                     println!(
                                         "[{}/{}] {} ({} segment(s))",
@@ -1526,7 +1563,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Dupes { threshold } => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -1577,7 +1614,7 @@ async fn main() -> anyhow::Result<()> {
             if refs.is_empty() {
                 anyhow::bail!("nothing to remove; pass asset ids, hashes or paths");
             }
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -1663,7 +1700,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Verify => {
-            let config = Config::from_env();
+            let config = Config::from_env()?;
             let pool = eidetic_db::connect(&config)
                 .await
                 .context("failed to connect to database")?;
@@ -1767,7 +1804,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let config = Config::from_env();
+            let config = Config::from_env()?;
 
             let models_dir = config.paths.models_cache.clone();
             let query_clone = query.clone();
@@ -1930,7 +1967,7 @@ async fn reel_edit(
     }
 
     let mut proj = project::ReelProject::load(project_path)?;
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     project::apply_ops(&mut proj, &ops, &config).await?;
 
     let render_output = output.unwrap_or_else(|| proj.output.clone());
@@ -2090,6 +2127,11 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
 
     let params = cluster::ClusterParams::default();
 
+    // Clustering must only ever see one recognition model's vectors: cosine
+    // distance across models is noise even when the widths agree.
+    let (_, embedder_id) =
+        eidetic_ml::face::active_models().context("failed to resolve the active face models")?;
+
     let (must_link, must_not_link) = repo.fetch_links().await.context("failed to load links")?;
     let rejections = repo
         .fetch_rejections()
@@ -2101,7 +2143,7 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
     // to them. Recomputed per run rather than cached: it is cheap at this scale
     // and a stale exemplar set silently degrades every future assignment.
     let all = repo
-        .fetch_embeddings(false)
+        .fetch_embeddings(false, embedder_id)
         .await
         .context("failed to load face embeddings")?;
 
