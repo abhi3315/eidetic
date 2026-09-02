@@ -70,6 +70,11 @@ enum Command {
         /// Override via --bind or EIDETIC_BIND env var.
         #[arg(long)]
         bind: Option<String>,
+        /// Allow binding a non-loopback address. The server has no
+        /// authentication: exposing it means anyone who can reach the port
+        /// gets the whole library — originals, faces, locations, WebDAV.
+        #[arg(long)]
+        expose: bool,
     },
     /// Run COCO 5K (Karpathy) text-to-image retrieval eval. Bypasses the
     /// library entirely; embeds images and captions in-memory.
@@ -1101,11 +1106,19 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let summary = cluster_faces(&faces_repo).await?;
-            println!(
-                "Clustering: {} face(s) joined an existing person, {} new person(s) proposed, \
-                 {} face(s) still unassigned.",
-                summary.attached, summary.new_people, summary.unassigned
-            );
+            if summary.skipped {
+                println!(
+                    "Clustering: nothing changed since the last run ({} face(s) unassigned); \
+                     skipped. New faces, names, links or a model change re-run it.",
+                    summary.unassigned
+                );
+            } else {
+                println!(
+                    "Clustering: {} face(s) joined an existing person, {} new person(s) proposed, \
+                     {} face(s) still unassigned.",
+                    summary.attached, summary.new_people, summary.unassigned
+                );
+            }
             if summary.new_people > 0 {
                 println!(
                     "Run `eidetic persons` to see them, then `eidetic name-person <id> <name>`."
@@ -1149,7 +1162,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Named {id} → {name}");
         }
 
-        Command::Serve { bind } => {
+        Command::Serve { bind, expose } => {
             use std::net::SocketAddr;
 
             let config = Config::from_env()?;
@@ -1159,6 +1172,18 @@ async fn main() -> anyhow::Result<()> {
             let addr: SocketAddr = addr_str
                 .parse()
                 .with_context(|| format!("invalid bind address: {addr_str}"))?;
+
+            // The server has no authentication, so a non-loopback bind hands
+            // the whole library — originals, faces, locations, WebDAV — to
+            // anyone who can reach the port. Make that a deliberate act, not
+            // a typo in EIDETIC_BIND.
+            if !addr.ip().is_loopback() && !expose {
+                anyhow::bail!(
+                    "{addr} is not a loopback address. This server has no \
+                     authentication; anyone on the network can browse the \
+                     whole library. Pass --expose to bind it anyway."
+                );
+            }
 
             let pool = eidetic_db::connect(&config)
                 .await
@@ -2107,6 +2132,9 @@ struct ClusterSummary {
     attached: usize,
     new_people: usize,
     unassigned: usize,
+    /// True when the run was skipped because nothing that clustering depends
+    /// on has changed since the last completed run.
+    skipped: bool,
 }
 
 /// Assign stored faces to people (ADR-0010).
@@ -2137,7 +2165,6 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
         .fetch_rejections()
         .await
         .context("failed to load rejections")?;
-    let constraints = cluster::Constraints::new(rejections, must_link, must_not_link);
 
     // Build each existing person's exemplars from the faces already attributed
     // to them. Recomputed per run rather than cached: it is cheap at this scale
@@ -2146,6 +2173,33 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
         .fetch_embeddings(false, embedder_id)
         .await
         .context("failed to load face embeddings")?;
+
+    // The periodic pass is all-pairs over the leftover pool, and leftovers
+    // only grow — so skip the whole run when its inputs match the last
+    // completed one. Clustering is deterministic: same inputs, same result.
+    let fp = cluster::fingerprint(
+        &all,
+        &rejections,
+        &must_link,
+        &must_not_link,
+        &params,
+        embedder_id,
+    );
+    if repo
+        .fetch_cluster_fingerprint()
+        .await
+        .context("failed to load cluster state")?
+        .is_some_and(|stored| stored == fp)
+    {
+        return Ok(ClusterSummary {
+            attached: 0,
+            new_people: 0,
+            unassigned: all.iter().filter(|f| f.person_id.is_none()).count(),
+            skipped: true,
+        });
+    }
+
+    let constraints = cluster::Constraints::new(rejections, must_link, must_not_link);
 
     let mut by_person: std::collections::HashMap<eidetic_core::PersonId, Vec<&_>> =
         std::collections::HashMap::new();
@@ -2213,9 +2267,35 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
         }
     }
 
+    // Store the fingerprint of the state this run left behind — phase 1/2
+    // assignments changed person_ids, so hashing the pre-run inputs would
+    // never match the next run's. Constraint lists cannot change mid-run
+    // (single writer), so only faces are re-read.
+    let after = repo
+        .fetch_embeddings(false, embedder_id)
+        .await
+        .context("failed to reload face embeddings")?;
+    let (must_link, must_not_link) = repo.fetch_links().await.context("failed to load links")?;
+    let rejections = repo
+        .fetch_rejections()
+        .await
+        .context("failed to load rejections")?;
+    let fp_after = cluster::fingerprint(
+        &after,
+        &rejections,
+        &must_link,
+        &must_not_link,
+        &params,
+        embedder_id,
+    );
+    repo.store_cluster_fingerprint(&fp_after)
+        .await
+        .context("failed to store cluster state")?;
+
     Ok(ClusterSummary {
         attached,
         new_people: proposed.len(),
         unassigned: still_unassigned.len() - grouped,
+        skipped: false,
     })
 }

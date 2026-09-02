@@ -120,7 +120,16 @@ pub async fn serve(addr: SocketAddr, deps: ServerDeps) -> anyhow::Result<()> {
         embed_tx,
     };
 
-    let app = build_router(state);
+    let mut app = build_router(state);
+    // DNS-rebinding guard for the default loopback listener: a page on
+    // attacker.example can rebind its hostname to 127.0.0.1 and read this
+    // server with the victim's own browser, and same-origin policy will not
+    // stop it — the Host header is the one thing the attacker cannot forge.
+    // Only for loopback binds: an exposed bind (--expose) is reachable
+    // directly, so a Host check there adds friction without protection.
+    if addr.ip().is_loopback() {
+        app = app.layer(axum::middleware::from_fn(require_local_host));
+    }
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -130,6 +139,38 @@ pub async fn serve(addr: SocketAddr, deps: ServerDeps) -> anyhow::Result<()> {
 
     axum::serve(listener, app).await.context("axum::serve")?;
     Ok(())
+}
+
+/// Reject requests whose Host header does not name this machine's loopback.
+///
+/// Values a legitimate local client can send: `localhost`, `127.0.0.1`, or
+/// `[::1]`, each with or without a port. Anything else — an external
+/// hostname, a LAN IP, a missing header — is a request the browser was
+/// tricked into sending here and gets a 403.
+pub(crate) async fn require_local_host(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    // Strip the port: "[::1]:8080" splits after "]", others at the last ':'.
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    if matches!(name, "localhost" | "127.0.0.1" | "::1") {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "Host header does not name localhost; refusing (DNS-rebinding guard)",
+        )
+            .into_response()
+    }
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -167,4 +208,68 @@ pub fn test_router(repo: AssetsRepo, faces: FacesRepo, library_dir: PathBuf) -> 
         embed_tx,
     };
     build_router(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn guarded_router() -> Router {
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(require_local_host))
+    }
+
+    #[tokio::test]
+    async fn local_host_names_pass_the_rebinding_guard() {
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            let res = guarded_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("Host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "Host: {host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_hosts_are_refused() {
+        // The DNS-rebinding shape: the victim's browser resolves an attacker
+        // domain to 127.0.0.1 and sends the request here — with the
+        // attacker's hostname in Host, the one part it cannot forge.
+        for host in [
+            "attacker.example",
+            "attacker.example:8080",
+            "192.168.1.5:8080",
+            "localhost.attacker.example",
+            "",
+        ] {
+            let res = guarded_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("Host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "Host: {host:?}");
+        }
+    }
 }

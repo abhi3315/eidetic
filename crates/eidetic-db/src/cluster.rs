@@ -428,9 +428,209 @@ impl Lcg {
     }
 }
 
+/// Fingerprint of everything a clustering run's outcome depends on.
+///
+/// Clustering is deterministic (fixed-seed shuffle, stable orderings), so
+/// identical inputs give identical output — and the periodic pass is the
+/// expensive all-pairs one. The caller stores this after a run and skips the
+/// next run when it matches: repeated `eidetic faces` over an unchanged
+/// library costs nothing, while any new face, assignment, pin, constraint,
+/// parameter or model change re-runs everything.
+///
+/// Embeddings are deliberately not hashed: a face row's vector is written
+/// once at detection and never mutated, so the face id (plus `model_id` for
+/// the model that produced it) already stands for it.
+pub fn fingerprint(
+    faces: &[crate::FaceEmbedding],
+    rejections: &[(FaceId, PersonId)],
+    must_link: &[(FaceId, FaceId)],
+    must_not_link: &[(FaceId, FaceId)],
+    params: &ClusterParams,
+    model_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut lines: Vec<String> = Vec::with_capacity(
+        faces.len() + rejections.len() + must_link.len() + must_not_link.len() + 1,
+    );
+    for f in faces {
+        lines.push(format!(
+            "f {} {} {} {}",
+            f.id,
+            f.person_id
+                .map_or_else(|| "-".to_string(), |p| p.to_string()),
+            f.pinned,
+            f.ts_secs.is_some(), // photo/video decides seed eligibility
+        ));
+    }
+    for (face, person) in rejections {
+        lines.push(format!("r {face} {person}"));
+    }
+    // Link pairs are unordered facts; normalize so (a,b) and (b,a) match.
+    let pair = |tag: &str, a: &FaceId, b: &FaceId| {
+        let (lo, hi) = if a.as_uuid() <= b.as_uuid() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        format!("{tag} {lo} {hi}")
+    };
+    for (a, b) in must_link {
+        lines.push(pair("l", a, b));
+    }
+    for (a, b) in must_not_link {
+        lines.push(pair("n", a, b));
+    }
+    lines.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update(model_id.as_bytes());
+    hasher.update(
+        format!(
+            "\nparams {} {} {} {} {}\n",
+            params.attach_distance,
+            params.cluster_distance,
+            params.min_faces,
+            params.min_seed_score,
+            params.max_exemplars
+        )
+        .as_bytes(),
+    );
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hasher.finalize());
+    eidetic_core::Sha256::from_bytes(bytes).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod fingerprint {
+        use super::super::*;
+        use crate::FaceEmbedding;
+        use eidetic_core::AssetId;
+
+        fn fe(person: Option<PersonId>, pinned: bool) -> FaceEmbedding {
+            FaceEmbedding {
+                id: FaceId::new(),
+                asset_id: AssetId::new(),
+                person_id: person,
+                score: 0.9,
+                embedding: vec![1.0, 0.0],
+                pinned,
+                ts_secs: None,
+            }
+        }
+
+        #[test]
+        fn is_order_independent_and_input_sensitive() {
+            let params = ClusterParams::default();
+            let a = fe(None, false);
+            let b = fe(Some(PersonId::new()), false);
+            let link = (a.id, b.id);
+
+            let fp1 = fingerprint(
+                &[a.clone(), b.clone()],
+                &[],
+                &[link],
+                &[],
+                &params,
+                "auraface-v1",
+            );
+            // Same facts, different orderings: face order and pair order.
+            let fp2 = fingerprint(
+                &[b.clone(), a.clone()],
+                &[],
+                &[(link.1, link.0)],
+                &[],
+                &params,
+                "auraface-v1",
+            );
+            assert_eq!(fp1, fp2, "ordering must not matter");
+
+            // Every kind of input change must change the fingerprint —
+            // otherwise a run that should happen gets skipped.
+            let mut assigned = a.clone();
+            assigned.person_id = Some(PersonId::new());
+            let mut pinned = a.clone();
+            pinned.pinned = true;
+            let mut other_params = ClusterParams::default();
+            other_params.min_faces += 1;
+            let changed = [
+                fingerprint(
+                    std::slice::from_ref(&a),
+                    &[],
+                    &[link],
+                    &[],
+                    &params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[assigned, b.clone()],
+                    &[],
+                    &[link],
+                    &[],
+                    &params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[pinned, b.clone()],
+                    &[],
+                    &[link],
+                    &[],
+                    &params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[a.clone(), b.clone()],
+                    &[],
+                    &[],
+                    &[],
+                    &params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[a.clone(), b.clone()],
+                    &[],
+                    &[],
+                    &[link],
+                    &params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[a.clone(), b.clone()],
+                    &[(a.id, PersonId::new())],
+                    &[link],
+                    &[],
+                    &params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[a.clone(), b.clone()],
+                    &[],
+                    &[link],
+                    &[],
+                    &other_params,
+                    "auraface-v1",
+                ),
+                fingerprint(
+                    &[a.clone(), b.clone()],
+                    &[],
+                    &[link],
+                    &[],
+                    &params,
+                    "arcface-buffalo-l",
+                ),
+            ];
+            for (i, fp) in changed.iter().enumerate() {
+                assert_ne!(*fp, fp1, "variant {i} must change the fingerprint");
+            }
+        }
+    }
 
     /// Minimal test face.
     struct TestFace {

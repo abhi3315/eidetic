@@ -538,6 +538,21 @@ impl EideticMcp {
                 chrono::Utc::now().format("%Y%m%d-%H%M%S")
             )),
         };
+        // The output name is LLM-controlled and the render pipeline passes it
+        // to ffmpeg -y, so on this boundary it must not be able to name a
+        // file the user cares about. Requiring .mp4 stops it from *creating*
+        // meaningful non-video files (~/.bashrc), and refusing existing paths
+        // stops it from *destroying* anything: after create, the only path
+        // render ever overwrites is one this project brought into existence.
+        // The CLI keeps full freedom — the operator is trusted; the agent is
+        // not.
+        anyhow::ensure!(
+            output
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mp4")),
+            "output must be an .mp4 path, got {}",
+            output.display()
+        );
         let spec = ReelSpec {
             prompt: p.prompt,
             duration: p.duration.unwrap_or(30.0).clamp(3.0, 600.0),
@@ -551,8 +566,22 @@ impl EideticMcp {
         };
         let projects = project::plan_projects(&spec, &self.config).await?;
         // Never clobber an existing project — it may hold edits. The agent
-        // should edit it, or pick another output name.
+        // should edit it, or pick another output name. The render target
+        // itself gets the same rule (see the boundary note above): a path
+        // that already exists belongs to someone, and it is not this reel.
         for proj in &projects {
+            // Everything this project will ever write: the render target and
+            // the .otio sibling export_otio derives from it. Claiming both
+            // now means every later overwrite hits a file this project
+            // created.
+            for claimed in [proj.output.clone(), proj.output.with_extension("otio")] {
+                anyhow::ensure!(
+                    !claimed.exists(),
+                    "{} already exists; pick a different output (this \
+                     pipeline only overwrites files it created)",
+                    claimed.display()
+                );
+            }
             let path = ReelProject::path_for(&proj.output);
             anyhow::ensure!(
                 !path.exists(),

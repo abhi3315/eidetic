@@ -8,6 +8,8 @@ authors.workspace = true
 description = "Database access layer for Eidetic."
 
 [dependencies]
+# Clustering-input fingerprint (cluster::fingerprint).
+sha2 = { workspace = true }
 eidetic-core = { path = "../eidetic-core" }
 sqlx = { workspace = true }
 tokio = { workspace = true }

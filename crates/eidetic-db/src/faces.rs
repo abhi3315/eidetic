@@ -344,6 +344,32 @@ impl FacesRepo {
             .collect()
     }
 
+    /// Fingerprint of the last completed clustering run, if any.
+    pub async fn fetch_cluster_fingerprint(&self) -> crate::Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT fingerprint FROM cluster_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
+        Ok(row.map(|(fp,)| fp))
+    }
+
+    /// Record the fingerprint of a completed clustering run (see
+    /// [`crate::cluster::fingerprint`]). Must describe the post-run state, so
+    /// an unchanged library matches on the next run.
+    pub async fn store_cluster_fingerprint(&self, fingerprint: &str) -> crate::Result<()> {
+        sqlx::query(
+            "INSERT INTO cluster_state (id, fingerprint) VALUES (1, ?) \
+             ON CONFLICT(id) DO UPDATE SET fingerprint = excluded.fingerprint, \
+               clustered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(fingerprint)
+        .execute(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
     /// Face boxes for one asset — (bbox x,y,w,h in original pixels, score).
     /// Feeds face-aware reel framing.
     pub async fn fetch_face_boxes_for_asset(
