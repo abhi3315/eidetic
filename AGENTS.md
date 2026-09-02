@@ -42,8 +42,8 @@ Crates under `crates/`:
 | `eidetic-db` | sqlx pool, migration runner. `AssetsRepo` owns asset CRUD + search. Defines `NewAsset` / `InsertOutcome`. | `eidetic-core` |
 | `eidetic-ingest` | File watcher, streaming hasher, content-addressable storage, thumbnail generation (JPEG/PNG/WEBP + HEIC via libheif hook + DNG via embedded preview extraction), comprehensive EXIF extraction (typed camera-settings columns + JSONB long tail). Calls `AssetsRepo` directly. Owns `ensure_heic_registered` — any new decode site in this crate must call it. | `eidetic-core`, `eidetic-db` |
 | `eidetic-ml` | `SiglipEmbedder` (concrete, no trait) loads ONNX models via `ort` and produces L2-normalised image/text embeddings as `Vec<f32>`. Decodes JPEG/PNG/WEBP/HEIC/DNG via the `image` crate (HEIC through the libheif hook; DNG via `eidetic_core::dng::extract_largest_jpeg_preview`). | `eidetic-core` |
-| `eidetic-server` | Axum HTTP server. `serve()` owns the embedder worker and the route table (`/`, `/search`, `/assets/:id`, `/assets/:id/raw`, `/thumbs/:size/:hash`). Localhost-bound, no auth. | `eidetic-core`, `eidetic-db`, `eidetic-ml` |
-| `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands. | `eidetic-core`, `eidetic-db`, `eidetic-ingest`, `eidetic-server` |
+| `eidetic-server` | Axum HTTP server (library crate). `serve()` owns the embedder worker and the route table: grid/search/detail, raw + playback streaming, thumbs, persons and face crops, and read-only WebDAV under `/dav/`. Loopback binds carry a Host-header DNS-rebinding guard; there is no auth, so a non-loopback `--bind` is refused unless `--expose` makes the exposure deliberate. | `eidetic-core`, `eidetic-db`, `eidetic-ml` |
+| `eidetic-cli` | Binary. Wires up dependencies and exposes subcommands; also hosts the reel/project/OTIO/dupes modules and the MCP server (`eidetic mcp`). | `eidetic-core`, `eidetic-db`, `eidetic-ingest`, `eidetic-ml`, `eidetic-server` |
 
 Crates added later when there's actual code that wants to live in them:
 
@@ -64,14 +64,14 @@ Crates added later when there's actual code that wants to live in them:
 
 ### Errors
 
-- Library crates (`eidetic-core`, `eidetic-db`, `eidetic-ingest`, future `eidetic-ml`): define typed errors with `thiserror`. One enum per crate, in `src/error.rs`. Callers can match.
-- Binary crates (`eidetic-cli`, future `eidetic-server`): use `anyhow::Result<()>` in `main`. Print and exit on error.
+- Library crates (`eidetic-core`, `eidetic-db`, `eidetic-ingest`, `eidetic-ml`, `eidetic-server`): define typed errors with `thiserror`. One enum per crate (in `src/error.rs`, or module-local in `eidetic-core`). Callers can match.
+- The one binary crate (`eidetic-cli`): use `anyhow::Result<()>` in `main`. Print and exit on error. (`eidetic-server` is a library crate driven by the CLI's `serve` command, not a binary.)
 - No `unwrap()` outside tests. `expect()` only with a message that documents the invariant being asserted.
 
 ### Patterns
 
 - **Newtype IDs** for every entity: `AssetId`, `PersonId`, `FaceId`. Prevents mixing IDs at the type level.
-- **Repository traits** for DB access (`AssetsRepo`, `FacesRepo`). Other crates depend on the trait, not on `sqlx::Pool` directly.
+- **Repository structs** for DB access (`AssetsRepo`, `FacesRepo`) — concrete types, not traits (the wait-for-two rule applies to abstractions too). Other crates call the repo, never `sqlx::Pool` directly; the only traits in the data layer are the algorithm seams (`VectorIndex`, `cluster::Face`).
 - **`tokio::sync::mpsc`** for async pipelines (watcher → workers). Not `Arc<Mutex<Vec<…>>>`.
 - **Sync by default**, async only at I/O boundaries.
 

@@ -19,7 +19,7 @@ Pure-Rust HEIC decoders now exist (early 2026): `imazen/heic` and `ente-io/heic-
 ## Decision
 
 - **Default HEIC path: libheif** (via `libheif-rs`), unchanged. Mature, correct, LGPL — clean to distribute.
-- **Add an opt-in `heic-pure` Cargo feature** that swaps in the pure-Rust AGPL decoder for a no-system-dependency build. That build artifact is AGPL; the default build stays MIT/Apache.
+- **Add an opt-in `heic-pure` Cargo feature** that swaps in the pure-Rust AGPL decoder for a no-system-dependency build. That build artifact is AGPL; the default build stays MIT/Apache. *(Amendment 2026-09-02: never implemented — see below.)*
 - HEVC decoding is patent-encumbered (Access Advance pool) regardless of implementation — same exposure either way; noted, not mitigated, for a personal self-hosted tool.
 
 ## Consequences
@@ -28,13 +28,23 @@ Pure-Rust HEIC decoders now exist (early 2026): `imazen/heic` and `ente-io/heic-
 
 - Best-correctness default; iPhone HEIC keeps working exactly as today.
 - Released default binaries stay permissively licensed and `cargo-deny`-clean.
-- Users who want zero system deps (and accept AGPL + occasional decode misses) build `--features heic-pure`.
+- ~~Users who want zero system deps (and accept AGPL + occasional decode misses) build `--features heic-pure`.~~ *(Not implemented — see amendment.)*
 
 **Bad / accepted:**
 
 - The default binary still needs libheif installed to decode HEIC — the exact friction we wanted gone, especially on Windows. Accepted because correctness of the primary format wins, and the pure-Rust option exists for those who prefer no-install over completeness.
 - Two decode paths behind one hook. Contained: both register through `ensure_heic_registered()`.
 - The HEIC-encoding test fixture (currently made via libheif/x265) stays libheif-side; the `heic-pure` (decode-only) build uses a static fixture file.
+
+## Amendment (2026-09-02): `heic-pure` was never implemented
+
+The libheif default shipped; the `heic-pure` feature did not. No manifest,
+source path, or CI job for it exists — `cargo build --features heic-pure`
+is an invalid command, and a portable build simply drops HEIC via
+`--no-default-features`. The option is **deferred, not accepted**: implement
+it only when someone actually wants the AGPL no-system-dep build, and add a
+CI lane for it in the same change. Until then the decision above should be
+read as "libheif, feature-gated" and nothing more.
 
 ## Alternatives considered
 
