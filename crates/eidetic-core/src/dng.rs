@@ -106,6 +106,35 @@ pub fn extract_largest_jpeg_preview(path: &Path) -> Result<Vec<u8>, Error> {
         path: path.to_path_buf(),
         source,
     })?;
+
+    // Bound the declared payload against the actual file BEFORE allocating.
+    // offset and length are attacker-controlled u32s from the TIFF header:
+    // without this check a 74-byte crafted file can declare a ~4 GiB preview
+    // and the buffer is allocated first, aborting the process on allocation
+    // failure instead of failing as one bad asset. `read_exact` would catch
+    // the lie eventually, but only after the allocation already happened.
+    let file_size = f
+        .metadata()
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    match picked.offset.checked_add(picked.length) {
+        Some(end) if end <= file_size => {}
+        _ => {
+            return Err(Error::CorruptPreview {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "preview claims bytes {}..{} but the file is {} bytes",
+                    picked.offset,
+                    picked.offset.saturating_add(picked.length),
+                    file_size
+                ),
+            });
+        }
+    }
+
     f.seek(SeekFrom::Start(picked.offset))
         .map_err(|source| Error::Io {
             path: path.to_path_buf(),
@@ -198,5 +227,77 @@ mod tests {
     fn extract_fails_on_missing_file() {
         let err = extract_largest_jpeg_preview(Path::new("/nonexistent/file.dng")).unwrap_err();
         assert!(matches!(err, Error::Io { .. }));
+    }
+
+    /// Minimal little-endian TIFF whose one IFD declares a JPEG preview
+    /// (`Compression = 7`) at the given offset/length. This is the entire
+    /// attacker-controlled surface for the allocation bound: nothing about
+    /// the declared payload has to exist.
+    fn tiff_declaring_preview(preview_offset: u32, preview_length: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        let u16le = |b: &mut Vec<u8>, v: u16| b.extend_from_slice(&v.to_le_bytes());
+        let u32le = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        // Header: "II", magic 42, first IFD at byte 8.
+        b.extend_from_slice(b"II");
+        u16le(&mut b, 42);
+        u32le(&mut b, 8);
+        // One IFD, 5 entries, tags ascending as TIFF requires.
+        u16le(&mut b, 5);
+        let entry = |b: &mut Vec<u8>, tag: u16, typ: u16, value: u32| {
+            u16le(b, tag);
+            u16le(b, typ); // 3 = SHORT, 4 = LONG
+            u32le(b, 1); // count
+            u32le(b, value); // SHORT values sit in the low bytes, LE
+        };
+        entry(&mut b, 256, 4, 100); // ImageWidth
+        entry(&mut b, 257, 4, 100); // ImageLength
+        entry(&mut b, 259, 3, 7); // Compression = JPEG
+        entry(&mut b, 513, 4, preview_offset); // JPEGInterchangeFormat
+        entry(&mut b, 514, 4, preview_length); // JPEGInterchangeFormatLength
+        u32le(&mut b, 0); // no next IFD
+        b
+    }
+
+    /// F-03 from the 2026-09 review: a 74-byte file declaring a ~4 GiB
+    /// preview must fail as one corrupt asset, not allocate the buffer (the
+    /// old code allocated before any bound check — an OOM abort on hosts
+    /// without lazy zero pages).
+    #[test]
+    fn preview_declared_past_eof_errors_without_allocating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hostile.dng");
+
+        std::fs::write(&path, tiff_declaring_preview(8, u32::MAX - 8)).expect("write");
+        let err = extract_largest_jpeg_preview(&path).unwrap_err();
+        assert!(
+            matches!(&err, Error::CorruptPreview { reason, .. } if reason.contains("but the file is")),
+            "expected the bound check, got: {err:?}"
+        );
+
+        // Offset + length overflowing u32 arithmetic must also be caught
+        // (they are widened to u64, so the sum must simply exceed the file).
+        std::fs::write(&path, tiff_declaring_preview(u32::MAX, u32::MAX)).expect("write");
+        let err = extract_largest_jpeg_preview(&path).unwrap_err();
+        assert!(matches!(err, Error::CorruptPreview { .. }));
+    }
+
+    /// The bound must not reject a legitimate payload that fits exactly.
+    #[test]
+    fn preview_inside_the_file_still_extracts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ok.dng");
+
+        let mut bytes = tiff_declaring_preview(0, 0); // placeholders
+        let offset = bytes.len() as u32;
+        let payload = [0xFFu8, 0xD8, 0xFF, 0xE0]; // JPEG SOI + marker
+        bytes.extend_from_slice(&payload);
+        // Rewrite the two placeholder values in entries 4 and 5 (bytes
+        // 10 + 3*12 + 8 and 10 + 4*12 + 8).
+        bytes[54..58].copy_from_slice(&offset.to_le_bytes());
+        bytes[66..70].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        std::fs::write(&path, &bytes).expect("write");
+        let got = extract_largest_jpeg_preview(&path).expect("extract");
+        assert_eq!(got, payload);
     }
 }
