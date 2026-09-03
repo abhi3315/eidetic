@@ -219,10 +219,37 @@ pub fn propose_people<F: Face>(
             uf.union(pair[0], pair[1]);
         }
     }
+    // A must-link union is refused when it would put any must-not-linked pair
+    // into one component — directly (the same pair carries both links) or
+    // through a chain of must-links. Must-not wins: proposing two faces the
+    // user explicitly split is worse than ignoring one merge hint, and the
+    // skipped link is reported so the conflict is visible instead of silent.
+    // Unions apply in stored link order, so the outcome is deterministic.
     for &(a, b) in &constraints.must_link {
-        if let (Some(&ia), Some(&ib)) = (index.get(&a), index.get(&b)) {
-            uf.union(ia, ib);
+        let (Some(&ia), Some(&ib)) = (index.get(&a), index.get(&b)) else {
+            continue;
+        };
+        let (ra, rb) = (uf.find(ia), uf.find(ib));
+        if ra == rb {
+            continue;
         }
+        let violates = constraints.must_not_link.iter().any(|&(x, y)| {
+            let (Some(&ix), Some(&iy)) = (index.get(&x), index.get(&y)) else {
+                return false;
+            };
+            let (rx, ry) = (uf.find(ix), uf.find(iy));
+            (rx == ra && ry == rb) || (rx == rb && ry == ra)
+        });
+        if violates {
+            tracing::warn!(
+                face_a = %a,
+                face_b = %b,
+                "must-link skipped: joining these would group a pair marked \
+                 as different people (must-not-link wins)"
+            );
+            continue;
+        }
+        uf.union(ia, ib);
     }
 
     let mut merged: HashMap<usize, Vec<FaceId>> = HashMap::new();
@@ -271,11 +298,17 @@ fn chinese_whispers<F: Face>(
     let n = faces.len();
 
     // Sparse adjacency: only pairs close enough to matter, and never a pair the
-    // user has said are different people.
+    // user has said are different people. Forbidden peers are also collected
+    // per node: dropping the edge alone is not enough, because a transitive
+    // chain (a~x~b) can still deliver one label to both ends of a forbidden
+    // pair — label adoption below has to check them.
     let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    let mut forbidden: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in (i + 1)..n {
             if constraints.forbids(faces[i].face_id(), faces[j].face_id()) {
+                forbidden[i].push(j);
+                forbidden[j].push(i);
                 continue;
             }
             let d = cosine_distance(faces[i].embedding(), faces[j].embedding());
@@ -302,8 +335,15 @@ fn chinese_whispers<F: Face>(
             if adj[i].is_empty() {
                 continue;
             }
+            // A label currently held by a must-not-linked peer is off limits:
+            // adopting it is exactly how two faces the user split end up
+            // proposed together again through a bridge face.
+            let banned: HashSet<usize> = forbidden[i].iter().map(|&f| labels[f]).collect();
             let mut weight_per_label: HashMap<usize, f32> = HashMap::new();
             for &(j, w) in &adj[i] {
+                if banned.contains(&labels[j]) {
+                    continue;
+                }
                 *weight_per_label.entry(labels[j]).or_insert(0.0) += w;
             }
             // Ties break on the smaller label so the result stays stable.
@@ -856,6 +896,78 @@ mod tests {
             apart.is_empty(),
             "with every edge forbidden no group should reach min_faces, got {apart:?}"
         );
+    }
+
+    /// Dropping the forbidden edge alone is not enough: with a bridge face
+    /// close to both, label propagation used to deliver one label to both
+    /// ends of the forbidden pair anyway — regrouping exactly the two faces
+    /// the user split.
+    #[test]
+    fn must_not_link_survives_a_transitive_bridge() {
+        let faces = cluster_around([1.0, 0.0, 0.0], 3, 0.001);
+        let params = ClusterParams {
+            min_faces: 2,
+            ..Default::default()
+        };
+
+        // Forbid only the outer pair; face 1 stays a bridge to both.
+        let (a, c) = (faces[0].face_id(), faces[2].face_id());
+        let constraints = Constraints::new(vec![], vec![], vec![(a, c)]);
+
+        let proposed = propose_people(&faces, &constraints, &params);
+        for group in &proposed {
+            assert!(
+                !(group.faces.contains(&a) && group.faces.contains(&c)),
+                "a forbidden pair reached one group through the bridge: {proposed:?}"
+            );
+        }
+    }
+
+    /// A must-link union that would join a must-not-linked pair — directly,
+    /// or through a chain of must-links — is refused. Must-not wins.
+    #[test]
+    fn must_not_link_wins_over_a_must_link_chain() {
+        // Two tight pairs, far apart: {0,1} and {2,3}.
+        let mut faces = cluster_around([1.0, 0.0, 0.0], 2, 0.001);
+        faces.extend(cluster_around([0.0, 1.0, 0.0], 2, 0.001));
+        let params = ClusterParams {
+            min_faces: 2,
+            ..Default::default()
+        };
+
+        // The user links one face across the groups but has split another
+        // pair across the same two groups. Honouring the link would union
+        // the groups and regroup the split pair.
+        let (f1, f3) = (faces[1].face_id(), faces[3].face_id());
+        let constraints = Constraints::new(
+            vec![],
+            vec![(faces[0].face_id(), faces[2].face_id())],
+            vec![(f1, f3)],
+        );
+
+        let proposed = propose_people(&faces, &constraints, &params);
+        assert_eq!(
+            proposed.len(),
+            2,
+            "the conflicting must-link must be skipped, got {proposed:?}"
+        );
+        for group in &proposed {
+            assert!(
+                !(group.faces.contains(&f1) && group.faces.contains(&f3)),
+                "split pair regrouped: {proposed:?}"
+            );
+        }
+
+        // Direct conflict: the same pair both linked and split. Must-not wins.
+        let (f0, f2) = (faces[0].face_id(), faces[2].face_id());
+        let direct = Constraints::new(vec![], vec![(f0, f2)], vec![(f0, f2)]);
+        let proposed = propose_people(&faces, &direct, &params);
+        for group in &proposed {
+            assert!(
+                !(group.faces.contains(&f0) && group.faces.contains(&f2)),
+                "directly conflicted pair regrouped: {proposed:?}"
+            );
+        }
     }
 
     #[test]
