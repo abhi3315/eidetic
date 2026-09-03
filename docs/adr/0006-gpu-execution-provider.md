@@ -36,7 +36,7 @@ Add a CUDA execution provider, but **pin the ONNX Runtime version explicitly and
 - We give up `ort`'s convenient `download-binaries` for GPU builds and own an explicit ORT version pin. The bundled binary is simply too old for Blackwell.
 - The CUDA build is **not self-contained**: it needs CUDA 13 runtime + cuDNN 9 on the machine (NVIDIA restricts redistribution). Reflected in ADR-0009 as a separate `cuda` archive.
 - The dev box is bleeding-edge (Fedora 44: gcc 16 rejects the CUDA 12.9 `nvcc`; Python 3.14 has no CUDA wheels yet). Toolchains must be pinned deliberately; expect environment friction.
-- Rust-path verification is still open — only the Python path is proven.
+- ~~Rust-path verification is still open — only the Python path is proven.~~ *(Stale: closed 2026-07-30, see the "Rust V-gate closed" paragraph above and the 2026-08-22 amendment below.)*
 
 ## Alternatives considered
 

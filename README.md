@@ -37,7 +37,7 @@ Written in Rust.
   - `EIDETIC_FACE_MODEL`: `auraface` (default), `sface` (smaller/faster, 128-dim), or `buffalo_l` (InsightFace; better accuracy but **non-commercial weights** you download yourself)
   - `--cluster-only`: re-run grouping over already-detected faces without scanning again
   - A face joins an existing person when it's close enough; leftovers are grouped into new candidates once at least 3 agree
-  - Your corrections are durable: naming, merges and splits are stored as constraints, so re-running clustering never discards them
+  - Names are durable, and clustering honours stored constraints (rejections, must/must-not links; a must-not link always wins over a conflicting merge). The constraint *storage* is fully wired, but only naming has a command today — merge/split/reject editing is future CLI surface
 - `eidetic persons`: list grouped people with face counts
 - `eidetic name-person <id> <name>`: name a person
 - `eidetic transcribe`: transcribe speech in videos with Whisper (needs a `--features speech` build), so search finds spoken words — "ask not what your country" returns the video where it's said, at the moment it's said, ranked above visual matches. Transcripts are recall fuel, never displayed as subtitles: casual home audio transcribes too roughly to show. Silent tracks are skipped by an energy gate
@@ -85,6 +85,11 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_LOG` | `info,ort=error` | Log level (trace/debug/info/warn/error). `ort=error` mutes ONNX Runtime's non-actionable noise — CoreML graph partitioning, and the per-initializer warnings some model exports emit. Real ort failures still surface. |
 | `EIDETIC_MODEL` | `base` | SigLIP 2 variant: `base` (768-dim, 1.4 GB download), `large` (1024-dim, 3.6 GB), or `so400m` (1152-dim, best retrieval quality — practical on a GPU). Unknown values are rejected rather than silently falling back. Embeddings are keyed by model, so after changing this `eidetic embed` re-embeds the whole library for the new variant (the old variant's rows are kept and ignored); until that finishes, search errors loudly instead of returning empty results. |
 | `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider: `cpu`, `cuda`, or `coreml`. `cuda` needs a build with `--features cuda` plus an ONNX Runtime ≥ 1.27 CUDA build at runtime (see [ADR-0006](docs/adr/0006-gpu-execution-provider.md)). CoreML is macOS-only and **does not currently accelerate this workload** — see "Why CoreML is opt-in" below. |
+| `EIDETIC_FACE_MODEL` | `auraface` | Face detection/recognition pair: `auraface` (YuNet + AuraFace, 512-dim), `sface` (smaller, 128-dim), or `buffalo_l` (InsightFace, **non-commercial weights**). Face rows and detection runs are keyed by model, so switching re-queues face work for the new pair. |
+| `EIDETIC_SPEECH_MODEL` | `small` | Whisper model for `eidetic transcribe` (speech builds): `base`, `small`, or `large-v3-turbo`. Transcript runs are keyed by model, so switching re-transcribes. |
+| `EIDETIC_BIND` | `127.0.0.1:8080` | `eidetic serve` bind address (same as `--bind`). Non-loopback values are refused without `--expose` — the server has no authentication. |
+| `EIDETIC_FFMPEG_PATH` / `EIDETIC_FFPROBE_PATH` | found on `PATH` | Explicit ffmpeg/ffprobe binaries when they aren't on PATH. |
+| `ORT_DYLIB_PATH` | _unset_ | CUDA builds only: path to an ONNX Runtime ≥ 1.27 CUDA `libonnxruntime.so` loaded at runtime ([ADR-0006](docs/adr/0006-gpu-execution-provider.md)). |
 
 Copy `.env.example` to `.env` and adjust as needed. There is no config file; env vars are the only configuration layer for now.
 

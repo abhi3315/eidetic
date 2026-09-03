@@ -12,7 +12,7 @@ Eidetic is moving from a Mac-only, Docker-backed setup to something a user can d
 
 ## Decision
 
-Ship **self-contained per-OS archives** built by a CI release matrix using **cargo-dist** ("dist").
+Ship **self-contained per-OS archives** built by a CI release matrix using **cargo-dist** ("dist"). *(Amendment 2026-09-02: shipped as a hand-written matrix instead — see below.)*
 
 - Targets: `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`.
 - Each archive carries the eidetic binary (ONNX Runtime already inside it), licences, and a `BUILD-INFO.txt` recording whether HEIC is compiled in and what the build needs at runtime.
@@ -28,7 +28,7 @@ Ship **self-contained per-OS archives** built by a CI release matrix using **car
 **Good:**
 
 - `curl`-and-run per OS; no Docker, no Postgres, no connection string (ADR-0005).
-- cargo-dist (actively maintained as of 2026) generates the matrix, checksums, and install scripts.
+- ~~cargo-dist (actively maintained as of 2026) generates the matrix, checksums, and install scripts.~~ *(Superseded — see amendment.)*
 - Clear split between the portable CPU download and the GPU-power-user `cuda` download.
 
 **Bad / accepted:**
@@ -38,6 +38,17 @@ Ship **self-contained per-OS archives** built by a CI release matrix using **car
 - The `cuda` archive depends on a correct host CUDA/cuDNN install; inherent to GPU ML, can't be shipped around.
 - First run needs network for the model download. One-time.
 - CI currently builds Linux/CPU only; the matrix (macOS runner, Windows MSVC, a GPU smoke test) is new work.
+
+## Amendment (2026-09-02): what actually shipped differs in three ways
+
+1. **No cargo-dist.** The release workflow is a hand-written matrix
+   (`release.yml` says why: it is small enough to read at a glance and needs
+   per-target feature differences that are awkward in dist's config).
+   Checksums are emitted directly; there are no generated install scripts.
+2. **Fewer flavours than promised.** "Two Linux/Windows flavours" shipped as
+   Linux CPU + Linux CUDA + macOS CPU + one Windows `--no-default-features`
+   artifact. A Windows CUDA archive does not exist.
+3. **The portability claim was wrong** — the rest of this amendment.
 
 ## Amendment (2026-09-02): the CPU archive is not fully portable
 

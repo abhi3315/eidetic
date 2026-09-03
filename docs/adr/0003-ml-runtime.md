@@ -49,6 +49,21 @@ Crate version: pin to a specific `ort = "2.0.0-rcN"` since ort 2.x is at release
 - **`tflite-rs`.** Rejected: limits us to TFLite models, which excludes most of the ONNX-first model zoo we want to draw from.
 - **Split runtime (Candle for CLIP, `ort` for faces).** This was the original plan. Rejected because it doubles preprocessing code, doubles model-loading code, doubles error types, and the SigLIP-2 issue means Candle is no longer earning its complexity cost.
 
+## Amendment (2026-09-02): three details drifted from this ADR
+
+1. **The pin is a compatible requirement, not exact.** The manifest says
+   `ort = "2.0.0-rc.12"`, so `cargo update` may float to a later RC; the
+   lockfile plus `--locked` release builds are what actually hold the version
+   today. An exact `=` pin remains the intent when next touched.
+2. **CPU builds statically link ONNX Runtime.** `download-binaries` embeds it
+   (measured in ADR-0009); the "dynamically links" consequence below applies
+   only to the CUDA path, which loads an external runtime via
+   `ORT_DYLIB_PATH` (ADR-0006).
+3. **The face models changed.** SCRFD/ArcFace named here shipped only as the
+   `buffalo_l` opt-in (non-commercial weights); the default pair is
+   YuNet + AuraFace per ADR-0010. The runtime choice this ADR makes is
+   unaffected — everything still runs on `ort`.
+
 ## References
 
 - STACK_AUDIT.md (2026-04-26) — "candle-transformers does not have SigLIP 2"

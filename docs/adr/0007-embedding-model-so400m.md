@@ -1,7 +1,7 @@
 # ADR-0007: Default image embedding model = SigLIP 2 so400m/384 (1152-dim)
 
 Date: 2026-07-23
-Status: accepted (supersedes ADR-0004)
+Status: accepted (supersedes ADR-0004) — **decision reversed by the 2026-08-22 amendment below: `base` stays the default**, so400m remains the opt-in
 
 ## Context
 
@@ -15,6 +15,8 @@ Two of its own preconditions for the upgrade are now met:
 External confirmation: Immich ships exactly `ViT-SO400M-16-SigLIP2-384__webli` for this same job, and `onnx-community` publishes so400m ONNX exports.
 
 ## Decision
+
+*(Reversed 2026-08-22 — the eval this section calls for ran, and `base` won. Kept for the reasoning; see the amendment at the bottom.)*
 
 Default the image embedding model to **SigLIP 2 so400m/384**, producing **1152-dim** L2-normalised embeddings.
 
