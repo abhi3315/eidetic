@@ -428,20 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn naming_is_deterministic() {
-        let input = vec![
-            asset("a.jpg", 2026, 8),
-            asset_with_id("a.jpg", 2026, 8, id12345678(1)),
-            asset("a-12345678.jpg", 2026, 8),
-            asset("a.jpg", 2026, 8),
-        ];
-        let one = build_tree(input.clone());
-        let two = build_tree(input);
-        assert_eq!(names(&one, 2026, 8), names(&two, 2026, 8));
-        assert_eq!(names(&one, 2026, 8).len(), 4);
-    }
-
-    #[test]
     fn href_encoding_round_trips() {
         let name = "IMG 0042 (chai & pakora).jpg";
         assert_eq!(percent_decode(&href_encode(name)), name);
