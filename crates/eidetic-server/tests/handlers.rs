@@ -49,11 +49,24 @@ async fn seed_asset(
     let src_path = library.join(filename);
     std::fs::write(&src_path, bytes).unwrap();
 
-    let asset = NewAsset {
+    let asset = new_asset(filename, mime, src_path, bytes.len() as u64, hash_byte);
+    match repo.insert_asset(asset).await.expect("insert") {
+        eidetic_db::InsertOutcome::Inserted(id) | eidetic_db::InsertOutcome::Existing(id) => id,
+    }
+}
+
+fn new_asset(
+    filename: &str,
+    mime: &str,
+    storage_path: std::path::PathBuf,
+    file_size: u64,
+    hash_byte: u8,
+) -> NewAsset {
+    NewAsset {
         hash: format!("{hash_byte:02x}").repeat(32),
         original_filename: filename.to_string(),
-        storage_path: src_path,
-        file_size: bytes.len() as u64,
+        storage_path,
+        file_size,
         mime_type: Some(mime.to_string()),
         date_taken: None,
         latitude: None,
@@ -81,10 +94,140 @@ async fn seed_asset(
         video_codec: None,
         pixel_width: None,
         pixel_height: None,
-    };
-    match repo.insert_asset(asset).await.expect("insert") {
-        eidetic_db::InsertOutcome::Inserted(id) | eidetic_db::InsertOutcome::Existing(id) => id,
     }
+}
+
+/// Insert one asset taken at `taken`, with bytes at a path that does not
+/// depend on the visible filename. `hash_byte` must be unique per test.
+async fn seed_dav(
+    repo: &AssetsRepo,
+    tmp: &tempfile::TempDir,
+    filename: &str,
+    bytes: &[u8],
+    hash_byte: u8,
+    taken: chrono::DateTime<chrono::Utc>,
+) -> eidetic_core::AssetId {
+    let library = tmp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let path = library.join(format!("stored-{hash_byte:02x}.bin"));
+    std::fs::write(&path, bytes).unwrap();
+    let mut asset = new_asset(
+        filename,
+        "application/octet-stream",
+        path,
+        bytes.len() as u64,
+        hash_byte,
+    );
+    asset.date_taken = Some(taken);
+    match repo.insert_asset(asset).await.expect("insert") {
+        eidetic_db::InsertOutcome::Inserted(id) => id,
+        eidetic_db::InsertOutcome::Existing(_) => panic!("duplicate hash byte {hash_byte:#x}"),
+    }
+}
+
+async fn dav_request(
+    router: &eidetic_server::TestRouter,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, Vec<u8>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Depth", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (
+        status,
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+}
+
+/// File hrefs of a month listing (the collection's own href is dropped).
+async fn month_files(router: &eidetic_server::TestRouter, month: &str) -> (Vec<String>, Vec<u8>) {
+    let (status, body) = dav_request(router, "PROPFIND", month).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    let text = String::from_utf8(body.clone()).unwrap();
+    let hrefs = text
+        .split("<D:href>")
+        .skip(1)
+        .filter_map(|s| s.split("</D:href>").next())
+        .filter(|h| *h != month)
+        .map(str::to_string)
+        .collect();
+    (hrefs, body)
+}
+
+#[tokio::test]
+async fn dav_lists_every_colliding_asset_under_a_unique_name() {
+    use chrono::TimeZone;
+    let (router, repo, _faces, tmp) = fixture().await;
+    let base = chrono::Utc.with_ymd_and_hms(2024, 3, 15, 12, 0, 0).unwrap();
+    let at = |s: i64| base + chrono::Duration::seconds(s);
+
+    // C is inserted first only to learn its id prefix; it is listed last of
+    // the "a" group and has to retry past three taken names.
+    let c = seed_dav(&repo, &tmp, "a.jpg", b"bytes-c", 1, at(3)).await;
+    let c8 = c.as_uuid().simple().to_string()[..8].to_string();
+    seed_dav(&repo, &tmp, "a.jpg", b"bytes-a", 2, at(0)).await;
+    seed_dav(&repo, &tmp, &format!("a-{c8}.jpg"), b"bytes-b", 3, at(1)).await;
+    seed_dav(&repo, &tmp, &format!("a-{c8}-2.jpg"), b"bytes-d", 4, at(2)).await;
+    // Extensionless: G's natural name equals the name F would be given, yet
+    // G is listed after F.
+    seed_dav(&repo, &tmp, "notes", b"bytes-e", 5, at(4)).await;
+    let f = seed_dav(&repo, &tmp, "notes", b"bytes-f", 6, at(5)).await;
+    let f8 = f.as_uuid().simple().to_string()[..8].to_string();
+    seed_dav(&repo, &tmp, &format!("notes-{f8}"), b"bytes-g", 7, at(6)).await;
+    // Same name, another month.
+    let april = chrono::Utc.with_ymd_and_hms(2024, 4, 15, 12, 0, 0).unwrap();
+    seed_dav(&repo, &tmp, "a.jpg", b"bytes-h", 8, april).await;
+
+    let expected: Vec<(String, &[u8])> = vec![
+        ("a.jpg".into(), b"bytes-a"),
+        (format!("a-{c8}.jpg"), b"bytes-b"),
+        (format!("a-{c8}-2.jpg"), b"bytes-d"),
+        (format!("a-{c8}-3.jpg"), b"bytes-c"),
+        ("notes".into(), b"bytes-e"),
+        (format!("notes-{f8}"), b"bytes-g"),
+        (format!("notes-{f8}-2"), b"bytes-f"),
+    ];
+
+    let (hrefs, first_body) = month_files(&router, "/dav/2024/03/").await;
+    let mut want_hrefs: Vec<String> = expected
+        .iter()
+        .map(|(n, _)| format!("/dav/2024/03/{n}"))
+        .collect();
+    want_hrefs.sort();
+    let mut got = hrefs.clone();
+    got.sort();
+    assert_eq!(got, want_hrefs);
+
+    let (_, second_body) = month_files(&router, "/dav/2024/03/").await;
+    assert_eq!(first_body, second_body, "listing is stable");
+
+    for (name, bytes) in &expected {
+        let (status, body) = dav_request(&router, "GET", &format!("/dav/2024/03/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(body, *bytes, "{name}");
+    }
+
+    let (hrefs, _) = month_files(&router, "/dav/2024/04/").await;
+    assert_eq!(hrefs, vec!["/dav/2024/04/a.jpg".to_string()]);
+    let (status, body) = dav_request(&router, "GET", "/dav/2024/04/a.jpg").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"bytes-h");
 }
 
 #[tokio::test]

@@ -7,7 +7,8 @@
 //! The tree is virtual: `/dav/YYYY/MM/filename`, from `date_taken` falling
 //! back to import time — a phone file manager gets a date-organised library
 //! instead of the hash-sharded CAS layout on disk. Name collisions within a
-//! month get a short id suffix, so every asset is always reachable.
+//! month get a short id suffix (`-<id8>`, then `-<id8>-<n>`), so every asset
+//! is always reachable under a unique name.
 
 use crate::{AppState, ServerError};
 use axum::extract::State;
@@ -22,26 +23,51 @@ type MonthFiles = BTreeMap<String, DavAsset>;
 /// year -> month -> files.
 type DavTree = BTreeMap<i32, BTreeMap<u32, MonthFiles>>;
 
+/// A free name for `original` within a month: `<stem>-<id8>.<ext>` first,
+/// then `<stem>-<id8>-<n>.<ext>` for n = 2, 3, ... until one is unused.
+fn collision_name(original: &str, id: eidetic_core::AssetId, month: &MonthFiles) -> String {
+    let id8 = &id.as_uuid().simple().to_string()[..8];
+    let (stem, ext) = match original.rsplit_once('.') {
+        Some((stem, ext)) => (stem, format!(".{ext}")),
+        None => (original, String::new()),
+    };
+    let mut candidate = format!("{stem}-{id8}{ext}");
+    let mut n = 2u32;
+    while month.contains_key(&candidate) {
+        candidate = format!("{stem}-{id8}-{n}{ext}");
+        n += 1;
+    }
+    candidate
+}
+
 fn build_tree(assets: Vec<DavAsset>) -> DavTree {
     let mut tree: DavTree = BTreeMap::new();
+    let mut colliders = Vec::new();
+    // First pass: an asset whose own filename is free keeps it, so a
+    // generated suffix can never take a name another file really has.
     for asset in assets {
         let month = tree
             .entry(asset.taken.year())
             .or_default()
             .entry(asset.taken.month())
             .or_default();
-        let mut name = asset.original_filename.clone();
-        if month.contains_key(&name) {
-            // Deterministic collision suffix: first 8 chars of the asset id,
-            // inserted before the extension. Listing order is stable (query
-            // orders by taken, id), so names never flip between requests.
-            let id8 = &asset.id.as_uuid().simple().to_string()[..8];
-            name = match name.rsplit_once('.') {
-                Some((stem, ext)) => format!("{stem}-{id8}.{ext}"),
-                None => format!("{name}-{id8}"),
-            };
+        if month.contains_key(&asset.original_filename) {
+            colliders.push(asset);
+        } else {
+            month.insert(asset.original_filename.clone(), asset);
         }
-        month.insert(name, asset);
+    }
+    // Second pass, in listing order (the query orders by taken, id), so names
+    // never flip between requests.
+    for asset in colliders {
+        let month = tree
+            .entry(asset.taken.year())
+            .or_default()
+            .entry(asset.taken.month())
+            .or_default();
+        let name = collision_name(&asset.original_filename, asset.id, month);
+        let previous = month.insert(name, asset);
+        debug_assert!(previous.is_none(), "collision_name returned a used name");
     }
     tree
 }
@@ -267,34 +293,152 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn asset(name: &str, y: i32, m: u32) -> DavAsset {
+    fn asset_with_id(name: &str, y: i32, m: u32, id: eidetic_core::AssetId) -> DavAsset {
         DavAsset {
-            id: eidetic_core::AssetId::new(),
+            id,
             original_filename: name.to_string(),
-            storage_path: std::path::PathBuf::from(format!("/lib/{name}")),
+            storage_path: std::path::PathBuf::from(format!("/lib/{}", id.as_uuid())),
             file_size: 42,
             mime_type: Some("image/jpeg".into()),
             taken: chrono::Utc.with_ymd_and_hms(y, m, 15, 12, 0, 0).unwrap(),
         }
     }
 
+    fn asset(name: &str, y: i32, m: u32) -> DavAsset {
+        asset_with_id(name, y, m, eidetic_core::AssetId::new())
+    }
+
+    /// An id whose first 8 hex chars are `12345678`.
+    fn id12345678(n: u8) -> eidetic_core::AssetId {
+        eidetic_core::AssetId::from(
+            uuid::Uuid::parse_str(&format!("12345678-0000-4000-8000-0000000000{n:02}")).unwrap(),
+        )
+    }
+
+    fn names(tree: &DavTree, y: i32, m: u32) -> BTreeMap<String, eidetic_core::AssetId> {
+        tree[&y][&m]
+            .iter()
+            .map(|(k, v)| (k.clone(), v.id))
+            .collect()
+    }
+
+    fn expect(
+        got: &BTreeMap<String, eidetic_core::AssetId>,
+        want: &[(&str, eidetic_core::AssetId)],
+    ) {
+        let want: BTreeMap<String, _> = want.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        assert_eq!(*got, want);
+    }
+
     #[test]
     fn tree_groups_by_year_month_and_dedups_names() {
+        let (first, second) = (asset("a.jpg", 2026, 8), asset("a.jpg", 2026, 8));
+        let (fid, sid) = (first.id, second.id);
+        let tree = build_tree(vec![first, second, asset("b.jpg", 2025, 1)]);
+        assert_eq!(tree.len(), 2);
+        let id8 = sid.as_uuid().simple().to_string()[..8].to_string();
+        expect(
+            &names(&tree, 2026, 8),
+            &[("a.jpg", fid), (&format!("a-{id8}.jpg"), sid)],
+        );
+        assert!(tree[&2025][&1].contains_key("b.jpg"));
+    }
+
+    #[test]
+    fn natural_name_equal_to_generated_suffix_keeps_its_name() {
+        let a = asset("a.jpg", 2026, 8);
+        let b = asset("a-12345678.jpg", 2026, 8);
+        let c = asset_with_id("a.jpg", 2026, 8, id12345678(1));
+        let want = [
+            ("a.jpg", a.id),
+            ("a-12345678.jpg", b.id),
+            ("a-12345678-2.jpg", c.id),
+        ];
+        let tree = build_tree(vec![a.clone(), b.clone(), c.clone()]);
+        expect(&names(&tree, 2026, 8), &want);
+        let tree = build_tree(vec![a, c, b]);
+        expect(&names(&tree, 2026, 8), &want);
+    }
+
+    #[test]
+    fn several_fallback_retries() {
+        let dup = asset_with_id("a.jpg", 2026, 8, id12345678(1));
+        let dup_id = dup.id;
+        let tree = build_tree(vec![
+            asset("a-12345678.jpg", 2026, 8),
+            asset("a-12345678-2.jpg", 2026, 8),
+            asset("a-12345678-3.jpg", 2026, 8),
+            asset("a.jpg", 2026, 8),
+            dup,
+        ]);
+        let got = names(&tree, 2026, 8);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got["a-12345678-4.jpg"], dup_id);
+    }
+
+    #[test]
+    fn repeated_id_prefixes() {
+        let input = vec![
+            asset("a.jpg", 2026, 8),
+            asset_with_id("a.jpg", 2026, 8, id12345678(1)),
+            asset_with_id("a.jpg", 2026, 8, id12345678(2)),
+        ];
+        let ids: Vec<_> = input.iter().map(|a| a.id).collect();
+        let tree = build_tree(input);
+        expect(
+            &names(&tree, 2026, 8),
+            &[
+                ("a.jpg", ids[0]),
+                ("a-12345678.jpg", ids[1]),
+                ("a-12345678-2.jpg", ids[2]),
+            ],
+        );
+    }
+
+    #[test]
+    fn extensionless_names() {
+        let input = vec![
+            asset("README", 2026, 8),
+            asset_with_id("README", 2026, 8, id12345678(1)),
+            asset("README-12345678", 2026, 8),
+        ];
+        let ids: Vec<_> = input.iter().map(|a| a.id).collect();
+        let tree = build_tree(input);
+        expect(
+            &names(&tree, 2026, 8),
+            &[
+                ("README", ids[0]),
+                ("README-12345678-2", ids[1]),
+                ("README-12345678", ids[2]),
+            ],
+        );
+    }
+
+    #[test]
+    fn months_are_independent() {
+        let sep = asset_with_id("a.jpg", 2026, 9, id12345678(1));
+        let sid = sep.id;
         let tree = build_tree(vec![
             asset("a.jpg", 2026, 8),
-            asset("a.jpg", 2026, 8),
-            asset("b.jpg", 2025, 1),
+            asset("a-12345678.jpg", 2026, 8),
+            sep,
         ]);
-        assert_eq!(tree.len(), 2);
-        let aug = &tree[&2026][&8];
-        assert_eq!(aug.len(), 2, "collision kept both files");
-        assert!(aug.contains_key("a.jpg"));
-        assert!(
-            aug.keys()
-                .any(|k| k.starts_with("a-") && k.ends_with(".jpg")),
-            "suffixed duplicate name: {:?}",
-            aug.keys().collect::<Vec<_>>()
-        );
+        assert_eq!(tree[&2026][&8].len(), 2);
+        expect(&names(&tree, 2026, 9), &[("a.jpg", sid)]);
+    }
+
+    #[test]
+    fn naming_is_deterministic() {
+        let input = vec![
+            asset("a.jpg", 2026, 8),
+            asset_with_id("a.jpg", 2026, 8, id12345678(1)),
+            asset("a-12345678.jpg", 2026, 8),
+            asset("a.jpg", 2026, 8),
+        ];
+        let one = build_tree(input.clone());
+        let two = build_tree(input);
+        assert_eq!(names(&one, 2026, 8), names(&two, 2026, 8));
+        assert_eq!(names(&one, 2026, 8).len(), 4);
     }
 
     #[test]
