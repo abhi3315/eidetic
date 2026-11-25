@@ -47,7 +47,8 @@ pub struct EideticMcp {
     /// only reads metadata (`scenes`, `transcript`, `faces_in`) should never
     /// pay for it at all. Same resident-worker shape as `eidetic-server`,
     /// with the eager load traded for a `OnceCell`.
-    embedder: OnceCell<mpsc::Sender<EmbedJob>>,
+    /// Paired with the loaded model's `model_id`.
+    embedder: OnceCell<(&'static str, mpsc::Sender<EmbedJob>)>,
     /// `eidetic mcp --allow-previews`: may a tool return pixels?
     allow_previews: bool,
 }
@@ -208,14 +209,16 @@ impl EideticMcp {
             .with_context(|| format!("no asset matches {needle:?}"))
     }
 
-    async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
+    /// Embed `text`, returning the embedder's `model_id` with the vector so
+    /// search ranks only rows from that same model.
+    async fn embed(&self, text: String) -> anyhow::Result<(&'static str, Vec<f32>)> {
         use anyhow::Context;
 
         // First semantic query in the session pays the model load; every
         // later one is a channel round trip to the worker that already owns
         // the session. Reloading per call made an agent's second search cost
         // as much as its first.
-        let tx = self
+        let &(model_id, ref tx) = self
             .embedder
             .get_or_try_init(|| async {
                 let models_dir = self.config.paths.models_cache.clone();
@@ -225,6 +228,7 @@ impl EideticMcp {
                 .await
                 .context("embedder thread panicked")?
                 .context("failed to load SigLIP 2 model")?;
+                let model_id = embedder.model_id();
 
                 let (tx, mut rx) = mpsc::channel::<EmbedJob>(8);
                 tokio::task::spawn_blocking(move || {
@@ -233,7 +237,7 @@ impl EideticMcp {
                         let _ = reply.send(embedder.embed_text(&text));
                     }
                 });
-                Ok::<_, anyhow::Error>(tx)
+                Ok::<_, anyhow::Error>((model_id, tx))
             })
             .await?;
 
@@ -241,10 +245,11 @@ impl EideticMcp {
         tx.send((text, reply_tx))
             .await
             .context("embed worker is gone")?;
-        reply_rx
+        let emb = reply_rx
             .await
             .context("embed worker panicked or died mid-job")?
-            .context("text embedding failed")
+            .context("text embedding failed")?;
+        Ok((model_id, emb))
     }
 
     #[tool(
@@ -544,11 +549,11 @@ impl EideticMcp {
             place: p.place,
             kind: p.kind,
         };
-        let emb = self.embed(p.query.clone()).await?;
+        let (model_id, emb) = self.embed(p.query.clone()).await?;
         let limit = p.limit.unwrap_or(10).min(50);
         let results = self
             .repo
-            .search(&p.query, &emb, limit, &filters)
+            .search(&p.query, &emb, model_id, limit, &filters)
             .await
             .context("search failed")?;
         Ok(json!({

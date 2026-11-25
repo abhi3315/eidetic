@@ -787,11 +787,13 @@ impl AssetsRepo {
     /// Transcript hits carry a fixed score of 0.35 — deliberately above the
     /// SigLIP range (~0.1–0.2): someone literally saying the words is
     /// stronger evidence than visual similarity. An asset found both ways
-    /// keeps the transcript's timestamp and snippet.
+    /// keeps the transcript's timestamp and snippet. `model_id` is the
+    /// embedder that produced `query_vec` (see [`Self::search_similar`]).
     pub async fn search(
         &self,
         query_text: &str,
         query_vec: &[f32],
+        model_id: &str,
         limit: u32,
         filters: &SearchFilters,
     ) -> crate::Result<Vec<SearchResult>> {
@@ -799,7 +801,7 @@ impl AssetsRepo {
 
         let allowed = self.fetch_filtered_ids(filters).await?;
         let semantic = self
-            .search_similar(query_vec, limit, allowed.as_ref())
+            .search_similar(query_vec, model_id, limit, allowed.as_ref())
             .await?;
         let spoken = self
             .search_transcripts(query_text, limit, allowed.as_ref())
@@ -852,15 +854,19 @@ impl AssetsRepo {
         }))
     }
 
-    /// Every image embedding with its path — input to near-duplicate
-    /// detection (`eidetic dupes`).
+    /// Every image embedding `model_id` produced, with its path — input to
+    /// near-duplicate detection (`eidetic dupes`). Cosine across two models
+    /// is meaningless, so rows from any other model are left out.
     pub async fn fetch_all_image_embeddings(
         &self,
+        model_id: &str,
     ) -> crate::Result<Vec<(AssetId, PathBuf, Vec<f32>)>> {
         let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
             "SELECT e.asset_id, a.storage_path, e.vector \
-             FROM embeddings e JOIN assets a ON a.id = e.asset_id",
+             FROM embeddings e JOIN assets a ON a.id = e.asset_id \
+             WHERE e.model_id = ?",
         )
+        .bind(model_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -876,16 +882,19 @@ impl AssetsRepo {
             .collect()
     }
 
-    /// Every video's frame embeddings, grouped per asset — input to
-    /// near-duplicate detection.
+    /// Every video's frame embeddings from `model_id`, grouped per asset —
+    /// input to near-duplicate detection.
     pub async fn fetch_all_frame_embedding_sets(
         &self,
+        model_id: &str,
     ) -> crate::Result<Vec<(AssetId, PathBuf, Vec<Vec<f32>>)>> {
         let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
             "SELECT f.asset_id, a.storage_path, f.vector \
              FROM frame_embeddings f JOIN assets a ON a.id = f.asset_id \
+             WHERE f.model_id = ? \
              ORDER BY f.asset_id, f.ts_secs",
         )
+        .bind(model_id)
         .fetch_all(&self.pool)
         .await
         .map_err(crate::Error::Query)?;
@@ -1081,24 +1090,59 @@ impl AssetsRepo {
     ///
     /// Two round trips: load the vectors, then fetch metadata for the winners.
     /// Ranking itself is exact and happens in-process (ADR-0005).
+    ///
+    /// Only rows produced by `model_id`, the model that embedded
+    /// `query_vec`, take part. Width alone cannot say that: two exports of
+    /// the same variant share a width, and so do rows written before model
+    /// ids named a pinned revision.
     pub async fn search_similar(
         &self,
         query_vec: &[f32],
+        model_id: &str,
         limit: u32,
         allowed: Option<&std::collections::HashSet<AssetId>>,
     ) -> crate::Result<Vec<SearchResult>> {
         // Image embeddings and video frame embeddings rank in one pool; a
         // frame row carries its timestamp so the winning moment survives.
         let rows: Vec<(String, Vec<u8>)> =
-            sqlx::query_as("SELECT asset_id, vector FROM embeddings")
+            sqlx::query_as("SELECT asset_id, vector FROM embeddings WHERE model_id = ?")
+                .bind(model_id)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(crate::Error::Query)?;
-        let frame_rows: Vec<(String, f64, Vec<u8>)> =
-            sqlx::query_as("SELECT asset_id, ts_secs, vector FROM frame_embeddings")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(crate::Error::Query)?;
+        let frame_rows: Vec<(String, f64, Vec<u8>)> = sqlx::query_as(
+            "SELECT asset_id, ts_secs, vector FROM frame_embeddings WHERE model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+
+        // Nothing from the active model, but something from another one, is
+        // the state an `EIDETIC_MODEL` change or a revision bump leaves
+        // behind. It needs re-embedding, not a different search term, so say
+        // so instead of returning a page that looks like an empty library.
+        if rows.is_empty() && frame_rows.is_empty() {
+            let stored: Vec<(String,)> = sqlx::query_as(
+                "SELECT COALESCE(model_id, 'unknown') FROM embeddings \
+                 UNION SELECT COALESCE(model_id, 'unknown') FROM frame_embeddings \
+                 ORDER BY 1",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
+            if !stored.is_empty() {
+                return Err(crate::Error::ModelMismatch {
+                    active: model_id.to_string(),
+                    stored: stored
+                        .into_iter()
+                        .map(|(id,)| id)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+            return Ok(Vec::new());
+        }
 
         let mut keys: Vec<(AssetId, Option<f64>)> =
             Vec::with_capacity(rows.len() + frame_rows.len());
@@ -1118,25 +1162,6 @@ impl AssetsRepo {
                 vector::decode(&blob).ok_or_else(|| corrupt("frame_embeddings", &id, &blob))?;
             keys.push((parse_id(&id), Some(ts)));
             vectors.push(decoded);
-        }
-
-        // Ranking drops rows whose width doesn't match the query, which is
-        // right mid-migration but indistinguishable from an empty library if
-        // *nothing* matches. Say so instead: this is the state an
-        // `EIDETIC_MODEL` change leaves behind, and it needs re-embedding,
-        // not a different search term.
-        if !vectors.is_empty() && !vectors.iter().any(|v| v.len() == query_vec.len()) {
-            let mut dims: Vec<usize> = vectors.iter().map(Vec::len).collect();
-            dims.sort_unstable();
-            dims.dedup();
-            return Err(crate::Error::ModelMismatch {
-                query_dim: query_vec.len(),
-                stored_dims: dims
-                    .iter()
-                    .map(|d| format!("{d}-dim"))
-                    .collect::<Vec<_>>()
-                    .join(" + "),
-            });
         }
 
         // A video contributes several frame rows, so over-fetch and collapse

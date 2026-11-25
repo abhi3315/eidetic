@@ -219,13 +219,14 @@ pub struct ReelSpec {
 pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelProject>> {
     let models_dir = config.paths.models_cache.clone();
     let prompt = spec.prompt.clone();
-    let query_emb = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
-        let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-        embedder.embed_text(&prompt)
-    })
-    .await
-    .context("embedder thread panicked")?
-    .context("text embedding failed")?;
+    let (model_id, query_emb) =
+        tokio::task::spawn_blocking(move || -> eidetic_ml::Result<(&'static str, Vec<f32>)> {
+            let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+            Ok((embedder.model_id(), embedder.embed_text(&prompt)?))
+        })
+        .await
+        .context("embedder thread panicked")?
+        .context("text embedding failed")?;
 
     let pool = eidetic_db::connect(config)
         .await
@@ -239,6 +240,7 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         .search(
             &spec.prompt,
             query_emb.as_slice(),
+            model_id,
             candidates,
             &eidetic_db::SearchFilters::default(),
         )
@@ -357,10 +359,16 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         let spans = reel::speech_spans(segments, 2.5, 8.0, total);
         let texts: Vec<String> = spans.iter().map(|s| s.2.clone()).collect();
         let models_dir = config.paths.models_cache.clone();
-        let embs = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<Vec<f32>>> {
-            let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-            texts.iter().map(|t| e.embed_text(t)).collect()
-        })
+        let (model_id, embs) = tokio::task::spawn_blocking(
+            move || -> eidetic_ml::Result<(&'static str, Vec<Vec<f32>>)> {
+                let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                let embs = texts
+                    .iter()
+                    .map(|t| e.embed_text(t))
+                    .collect::<eidetic_ml::Result<_>>()?;
+                Ok((e.model_id(), embs))
+            },
+        )
         .await
         .context("embedder thread panicked")?
         .context("failed to embed narration")?;
@@ -369,7 +377,13 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         let mut prev: Option<eidetic_core::AssetId> = None;
         for ((start, end, text), emb) in spans.iter().zip(&embs) {
             let hits = repo
-                .search(text, emb, 5, &eidetic_db::SearchFilters::default())
+                .search(
+                    text,
+                    emb,
+                    model_id,
+                    5,
+                    &eidetic_db::SearchFilters::default(),
+                )
                 .await
                 .context("voiceover search failed")?;
             let chosen = hits
@@ -746,10 +760,16 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         }
         let queries: Vec<String> = swaps.iter().map(|(_, q)| q.clone()).collect();
         let models_dir = config.paths.models_cache.clone();
-        let embs = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<Vec<f32>>> {
-            let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-            queries.iter().map(|q| e.embed_text(q)).collect()
-        })
+        let (model_id, embs) = tokio::task::spawn_blocking(
+            move || -> eidetic_ml::Result<(&'static str, Vec<Vec<f32>>)> {
+                let mut e = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                let embs = queries
+                    .iter()
+                    .map(|q| e.embed_text(q))
+                    .collect::<eidetic_ml::Result<_>>()?;
+                Ok((e.model_id(), embs))
+            },
+        )
         .await
         .context("embedder thread panicked")?
         .context("failed to embed swap queries")?;
@@ -763,7 +783,13 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
 
         for ((i, query), emb) in swaps.iter().zip(&embs) {
             let hits = repo
-                .search(query, emb, 10, &eidetic_db::SearchFilters::default())
+                .search(
+                    query,
+                    emb,
+                    model_id,
+                    10,
+                    &eidetic_db::SearchFilters::default(),
+                )
                 .await
                 .context("swap search failed")?;
             // Prefer something not already in the reel and sharp enough; a

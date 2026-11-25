@@ -26,18 +26,16 @@ pub enum Error {
     },
 
     /// Every stored embedding was produced by a different model than the one
-    /// answering the query. Ranking across widths is meaningless, so this
+    /// answering the query. Ranking across models is meaningless, so this
     /// fails loudly instead of returning an empty page that looks like "your
     /// library has nothing matching".
     #[error(
-        "no embedding matches the active model: {stored_dims} stored, query is {query_dim}-dim. \
-         Run `eidetic embed` to re-embed the library, or set EIDETIC_MODEL back to the variant \
-         that produced it."
+        "no embedding matches the active model {active}; stored: {stored}. Run `eidetic embed` \
+         to re-embed the library (existing rows are kept until replaced), or set EIDETIC_MODEL \
+         back to the variant that produced them. Ids without an @revision predate pinned \
+         model revisions and always need re-embedding."
     )]
-    ModelMismatch {
-        query_dim: usize,
-        stored_dims: String,
-    },
+    ModelMismatch { active: String, stored: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1610,12 +1610,16 @@ async fn main() -> anyhow::Result<()> {
                 .context("failed to connect to database")?;
             let repo = eidetic_db::AssetsRepo::new(pool);
 
+            // Only vectors from the active model are comparable; resolving
+            // the id does not load the model.
+            let (model_id, _dim) = eidetic_ml::active_model()
+                .context("failed to resolve the active embedding model")?;
             let photos = repo
-                .fetch_all_image_embeddings()
+                .fetch_all_image_embeddings(model_id)
                 .await
                 .context("failed to load image embeddings")?;
             let videos = repo
-                .fetch_all_frame_embedding_sets()
+                .fetch_all_frame_embedding_sets(model_id)
                 .await
                 .context("failed to load frame embeddings")?;
 
@@ -1849,10 +1853,12 @@ async fn main() -> anyhow::Result<()> {
 
             let models_dir = config.paths.models_cache.clone();
             let query_clone = query.clone();
-            let query_emb = tokio::task::spawn_blocking(move || -> eidetic_ml::Result<Vec<f32>> {
-                let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
-                embedder.embed_text(&query_clone)
-            })
+            let (model_id, query_emb) = tokio::task::spawn_blocking(
+                move || -> eidetic_ml::Result<(&'static str, Vec<f32>)> {
+                    let mut embedder = eidetic_ml::SiglipEmbedder::load(&models_dir)?;
+                    Ok((embedder.model_id(), embedder.embed_text(&query_clone)?))
+                },
+            )
             .await
             .context("embedder thread panicked")?
             .context("text embedding failed; check your internet connection and that the SigLIP 2 model is downloaded")?;
@@ -1892,7 +1898,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let results = repo
-                .search(&query, query_emb.as_slice(), limit, &filters)
+                .search(&query, query_emb.as_slice(), model_id, limit, &filters)
                 .await
                 .context("search failed")?;
 

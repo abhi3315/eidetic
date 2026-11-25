@@ -102,6 +102,7 @@ pub(crate) async fn search(
         .search(
             &query_text,
             &query_vec,
+            state.model_id,
             limit,
             &eidetic_db::SearchFilters::default(),
         )

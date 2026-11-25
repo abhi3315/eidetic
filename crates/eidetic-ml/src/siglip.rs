@@ -50,14 +50,23 @@ const PAD_TOKEN_ID: i64 = 1;
 
 #[derive(Debug)]
 struct ModelVariant {
-    /// Stable identity written into every row this variant produces.
+    /// Stable identity written into every row this variant produces:
+    /// `<variant>@<revision>`.
     ///
     /// Deliberately not the HuggingFace repo path: a repo can be renamed or
     /// re-exported, and rows already on disk have to keep meaning what they
-    /// meant. Changing one of these strings orphans existing rows, which is
-    /// correct only when the weights genuinely changed.
+    /// meant. The revision suffix is what makes the id name one exact
+    /// artifact set. Bump `revision` and the id changes with it, which
+    /// requeues every row for `eidetic embed` instead of letting vectors
+    /// from two exports rank against each other.
     id: &'static str,
     repo: &'static str,
+    /// Immutable HuggingFace commit that every file below is fetched from.
+    ///
+    /// Never `main`: a branch moves, so the same id could silently name a
+    /// different export on the next fresh download. Verified against
+    /// `https://huggingface.co/api/models/<repo>/revision/main` (ADR-0013).
+    revision: &'static str,
     vision_model: &'static str,
     text_model: &'static str,
     /// Optional companion file holding the text model's external weights.
@@ -70,8 +79,9 @@ struct ModelVariant {
 }
 
 const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
-    id: "siglip2-base-patch16-256",
+    id: "siglip2-base-patch16-256@d1114256522a37ffa257a0a58017348ab0058db2",
     repo: "onnx-community/siglip2-base-patch16-256-ONNX",
+    revision: "d1114256522a37ffa257a0a58017348ab0058db2",
     vision_model: "onnx/vision_model.onnx",
     text_model: "onnx/text_model.onnx",
     text_model_data: None,
@@ -80,8 +90,9 @@ const SIGLIP2_BASE_256: ModelVariant = ModelVariant {
 };
 
 const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
-    id: "siglip2-large-patch16-384",
+    id: "siglip2-large-patch16-384@257daa8df5100fdd0add12f4c2187aebf0beb409",
     repo: "onnx-community/siglip2-large-patch16-384-ONNX",
+    revision: "257daa8df5100fdd0add12f4c2187aebf0beb409",
     vision_model: "onnx/vision_model.onnx",
     text_model: "onnx/text_model.onnx",
     text_model_data: Some("onnx/text_model.onnx_data"),
@@ -95,8 +106,9 @@ const SIGLIP2_LARGE_384: ModelVariant = ModelVariant {
 /// text-to-image job. Not yet the default: ADR-0007 requires the switch be
 /// justified by measured recall from `eidetic eval`, not assumed.
 const SIGLIP2_SO400M_384: ModelVariant = ModelVariant {
-    id: "siglip2-so400m-patch14-384",
+    id: "siglip2-so400m-patch14-384@8ecf3f2bbb135bec33f4bb721c11479bf6a8a254",
     repo: "onnx-community/siglip2-so400m-patch14-384-ONNX",
+    revision: "8ecf3f2bbb135bec33f4bb721c11479bf6a8a254",
     vision_model: "onnx/vision_model.onnx",
     text_model: "onnx/text_model.onnx",
     text_model_data: Some("onnx/text_model.onnx_data"),
@@ -153,21 +165,23 @@ impl SiglipEmbedder {
     /// Load the active SigLIP 2 variant from `models_dir`.
     ///
     /// Downloads vision/text ONNX files and the tokenizer from HuggingFace
-    /// on first call. The large variant additionally pulls a `.onnx_data`
-    /// companion holding external weights.
+    /// on first call, all from the variant's pinned revision. The large and
+    /// so400m variants additionally pull a `.onnx_data` companion holding
+    /// external weights.
     pub fn load(models_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(models_dir)
             .map_err(|e| Error::ModelLoad(format!("cannot create models dir: {e}")))?;
 
         let variant = current_variant()?;
-        let vision_path = download(models_dir, variant.repo, variant.vision_model)?;
+        let fetch = |file| download_pinned(models_dir, variant.repo, variant.revision, file);
+        let vision_path = fetch(variant.vision_model)?;
         // Pre-download the external-data companion (if any) so it sits
         // beside text_model.onnx in the snapshot dir before ort opens it.
         if let Some(data_file) = variant.text_model_data {
-            download(models_dir, variant.repo, data_file)?;
+            fetch(data_file)?;
         }
-        let text_path = download(models_dir, variant.repo, variant.text_model)?;
-        let tokenizer_path = download(models_dir, variant.repo, TOKENIZER_FILE)?;
+        let text_path = fetch(variant.text_model)?;
+        let tokenizer_path = fetch(TOKENIZER_FILE)?;
 
         let mode = parse_accelerator(std::env::var("EIDETIC_ACCELERATOR").ok().as_deref())?;
         if matches!(mode, Mode::CoreML) {
@@ -195,6 +209,12 @@ impl SiglipEmbedder {
 
     pub fn dim(&self) -> usize {
         self.variant.embed_dim
+    }
+
+    /// Identity of the artifact set this embedder loaded: the `model_id`
+    /// its vectors are stored and searched under.
+    pub fn model_id(&self) -> &'static str {
+        self.variant.id
     }
 
     /// Compute an L2-normalised embedding for the image at `path`.
@@ -252,18 +272,65 @@ impl SiglipEmbedder {
     }
 }
 
-/// Fetch one file from a HuggingFace repo into the local model cache.
+/// Fetch one file from a HuggingFace repo's `main` branch into the local
+/// model cache.
 ///
-/// Shared with the face stack (ADR-0010) so both pipelines use one download
-/// and caching path.
+/// Shared with the face stack (ADR-0010) and whisper so every pipeline uses
+/// one download and caching path. SigLIP does not come through here: its
+/// files must come from a pinned commit (see [`download_pinned`]).
 pub(crate) fn download(
     models_dir: &Path,
     repo: &str,
     filename: &str,
 ) -> Result<std::path::PathBuf> {
-    use hf_hub::api::sync::ApiBuilder;
+    fetch_revision(models_dir, repo, "main", filename)
+}
 
-    tracing::info!("Loading {filename} from {repo}…");
+/// Fetch one file from an immutable `revision` (a full commit hash).
+///
+/// hf-hub files a download under `snapshots/<commit>/` but only finds it
+/// again through a `refs/<revision>` pointer, so a file an older build pulled
+/// from `main` would be downloaded again even when `main` was this exact
+/// commit. The snapshot directory *is* the commit, so a file already there is
+/// the pinned artifact and is used as-is. Anything else, including whatever
+/// `main` points at today, is fetched by commit.
+fn download_pinned(
+    models_dir: &Path,
+    repo: &str,
+    revision: &str,
+    filename: &str,
+) -> Result<std::path::PathBuf> {
+    let cached = pinned_snapshot_path(models_dir, repo, revision, filename);
+    if cached.is_file() {
+        return Ok(cached);
+    }
+    fetch_revision(models_dir, repo, revision, filename)
+}
+
+/// Where hf-hub keeps `filename` from commit `revision` of model `repo`.
+fn pinned_snapshot_path(
+    models_dir: &Path,
+    repo: &str,
+    revision: &str,
+    filename: &str,
+) -> std::path::PathBuf {
+    models_dir
+        .join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots")
+        .join(revision)
+        .join(filename)
+}
+
+fn fetch_revision(
+    models_dir: &Path,
+    repo: &str,
+    revision: &str,
+    filename: &str,
+) -> Result<std::path::PathBuf> {
+    use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::{Repo, RepoType};
+
+    tracing::info!("Loading {filename} from {repo}@{revision}…");
 
     let api = ApiBuilder::new()
         .with_cache_dir(models_dir.to_path_buf())
@@ -271,7 +338,11 @@ pub(crate) fn download(
         .map_err(|e| Error::ModelDownload(e.to_string()))?;
 
     let path = api
-        .model(repo.to_string())
+        .repo(Repo::with_revision(
+            repo.to_string(),
+            RepoType::Model,
+            revision.to_string(),
+        ))
         .get(filename)
         .map_err(|e| Error::ModelDownload(format!("{filename}: {e}")))?;
 
@@ -611,6 +682,90 @@ mod tests {
         let v = variant_for(Some("so400m")).unwrap();
         assert_eq!(v.text_model_data, Some("onnx/text_model.onnx_data"));
         assert_eq!(v.image_size, 384);
+    }
+
+    const VARIANTS: [&ModelVariant; 3] =
+        [&SIGLIP2_BASE_256, &SIGLIP2_LARGE_384, &SIGLIP2_SO400M_384];
+
+    #[test]
+    fn every_variant_pins_the_verified_upstream_commit() {
+        // Commits read from huggingface.co/api/models/<repo>/revision/main
+        // (ADR-0013). Changing one is a deliberate model change that must go
+        // through this test and the ADR, never a quiet edit.
+        let expected = [
+            (
+                "onnx-community/siglip2-base-patch16-256-ONNX",
+                "d1114256522a37ffa257a0a58017348ab0058db2",
+            ),
+            (
+                "onnx-community/siglip2-large-patch16-384-ONNX",
+                "257daa8df5100fdd0add12f4c2187aebf0beb409",
+            ),
+            (
+                "onnx-community/siglip2-so400m-patch14-384-ONNX",
+                "8ecf3f2bbb135bec33f4bb721c11479bf6a8a254",
+            ),
+        ];
+        for (v, (repo, rev)) in VARIANTS.iter().zip(expected) {
+            assert_eq!(v.repo, repo);
+            assert_eq!(v.revision, rev);
+            // A full commit hash, not a branch or tag that can move.
+            assert_eq!(v.revision.len(), 40, "{}: not a full commit", v.repo);
+            assert!(v.revision.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn model_id_names_the_pinned_artifact_set() {
+        for v in VARIANTS {
+            let (name, rev) = v.id.split_once('@').expect("id is <variant>@<revision>");
+            assert_eq!(rev, v.revision, "{}: id must move with the revision", v.id);
+            // Rows from before pinning carry the bare name (migration 009);
+            // they must not count as produced by the pinned set.
+            assert_ne!(v.id, name);
+        }
+        let ids: std::collections::HashSet<_> = VARIANTS.iter().map(|v| v.id).collect();
+        assert_eq!(ids.len(), VARIANTS.len(), "ids must be distinct");
+        assert_eq!(
+            variant_for(None).unwrap().id,
+            "siglip2-base-patch16-256@d1114256522a37ffa257a0a58017348ab0058db2"
+        );
+    }
+
+    #[test]
+    fn pinned_download_uses_the_commit_snapshot_and_ignores_others() {
+        // Offline: seed an hf-hub-shaped cache and check routing without
+        // touching the network. Every required file under the pinned commit
+        // is served as-is; a file under any other snapshot (what `main`
+        // resolved to for an older build) is not the pinned path.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let v = &SIGLIP2_SO400M_384;
+        let root = tmp
+            .path()
+            .join("models--onnx-community--siglip2-so400m-patch14-384-ONNX");
+        let files = [
+            v.vision_model,
+            v.text_model,
+            v.text_model_data.expect("so400m has external text weights"),
+            TOKENIZER_FILE,
+        ];
+        for f in files {
+            let pinned = root.join("snapshots").join(v.revision).join(f);
+            std::fs::create_dir_all(pinned.parent().expect("has parent")).expect("mkdir");
+            std::fs::write(&pinned, b"pinned").expect("write");
+            let got = download_pinned(tmp.path(), v.repo, v.revision, f).expect("cached");
+            assert_eq!(got, pinned);
+        }
+
+        let other = root
+            .join("snapshots")
+            .join("0".repeat(40))
+            .join(TOKENIZER_FILE);
+        std::fs::create_dir_all(other.parent().expect("has parent")).expect("mkdir");
+        std::fs::write(&other, b"main").expect("write");
+        let resolved = pinned_snapshot_path(tmp.path(), v.repo, v.revision, TOKENIZER_FILE);
+        assert_ne!(resolved, other);
+        assert_eq!(std::fs::read(resolved).expect("read"), b"pinned");
     }
 
     #[test]

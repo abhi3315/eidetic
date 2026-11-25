@@ -34,6 +34,8 @@ pub(crate) struct AppState {
     pub(crate) library_dir: Arc<PathBuf>,
     #[allow(dead_code)]
     pub(crate) embed_tx: mpsc::Sender<EmbedJob>,
+    /// Identity of the model behind `embed_tx`; search ranks only its rows.
+    pub(crate) model_id: &'static str,
 }
 
 #[derive(Debug, Error)]
@@ -118,6 +120,7 @@ pub async fn serve(addr: SocketAddr, deps: ServerDeps) -> anyhow::Result<()> {
         .await
         .context("embedder thread panicked")?
         .context("failed to load SigLIP 2 model")?;
+    let model_id = embedder.model_id();
 
     let (embed_tx, mut embed_rx) = mpsc::channel::<EmbedJob>(8);
     tokio::task::spawn_blocking(move || {
@@ -132,6 +135,7 @@ pub async fn serve(addr: SocketAddr, deps: ServerDeps) -> anyhow::Result<()> {
         faces: Arc::new(deps.faces),
         library_dir: Arc::new(deps.library_dir),
         embed_tx,
+        model_id,
     };
 
     let mut app = build_router(state);
@@ -220,6 +224,8 @@ pub fn test_router(repo: AssetsRepo, faces: FacesRepo, library_dir: PathBuf) -> 
         faces: Arc::new(faces),
         library_dir: Arc::new(library_dir),
         embed_tx,
+        // No embedder is loaded, so no row can belong to it.
+        model_id: "",
     };
     build_router(state)
 }

@@ -350,7 +350,10 @@ async fn search_similar_orders_by_cosine_similarity() {
 
     // Query with e1: asset A should come first (score ~1.0), B second (score ~0.0).
     let query = emb_a.clone();
-    let results = repo.search_similar(&query, 10, None).await.expect("search");
+    let results = repo
+        .search_similar(&query, "siglip2-base-patch16-256", 10, None)
+        .await
+        .expect("search");
 
     assert_eq!(results.len(), 2);
     assert!(
@@ -364,6 +367,137 @@ async fn search_similar_orders_by_cosine_similarity() {
         results[1].score
     );
     assert!(results[0].storage_path.to_str().unwrap().contains("d.jpg"));
+}
+
+fn media(hash_byte: char, name: &str, mime: &str) -> NewAsset {
+    NewAsset {
+        hash: hash_byte.to_string().repeat(64),
+        original_filename: name.to_string(),
+        storage_path: PathBuf::from(format!("/lib/{name}")),
+        file_size: 1,
+        mime_type: Some(mime.to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        lens_make: None,
+        lens_model: None,
+        focal_length: None,
+        focal_length_35mm: None,
+        aperture: None,
+        shutter: None,
+        iso: None,
+        orientation: None,
+        altitude: None,
+        gps_direction: None,
+        exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
+        thumbnails_generated: false,
+        duration_secs: Some(4.0),
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
+    }
+}
+
+#[tokio::test]
+async fn legacy_rows_never_rank_under_a_pinned_model_id() {
+    // Rows written before model ids carried a revision (migration 009's bare
+    // names) have the same width as the pinned export's rows, so a width
+    // check cannot tell them apart. Search, dupes input and the re-embed
+    // queue must all go by exact id — and nothing is deleted to get there.
+    const LEGACY: &str = "siglip2-base-patch16-256";
+    const PINNED: &str = "siglip2-base-patch16-256@d1114256522a37ffa257a0a58017348ab0058db2";
+
+    let (_tmp, config) = temp_db();
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = AssetsRepo::new(pool);
+    let insert = |a| async {
+        match repo.insert_asset(a).await.expect("insert") {
+            InsertOutcome::Inserted(id) => id,
+            _ => panic!("expected Inserted"),
+        }
+    };
+    let photo = insert(media('a', "a.jpg", "image/jpeg")).await;
+    let video = insert(media('b', "b.mp4", "video/mp4")).await;
+
+    let mut v = vec![0.0f32; 768];
+    v[0] = 1.0;
+    repo.store_embedding(photo, &v, LEGACY)
+        .await
+        .expect("legacy photo");
+    repo.store_frame_embeddings(video, &[(1.0, v.clone())], LEGACY)
+        .await
+        .expect("legacy frames");
+
+    // Only legacy rows: a loud mismatch naming both ids, not an empty page
+    // and not legacy hits.
+    let Err(err) = repo.search_similar(&v, PINNED, 10, None).await else {
+        panic!("legacy rows must not answer a pinned query");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains(PINNED) && msg.contains(LEGACY), "{msg}");
+    assert!(msg.contains("eidetic embed"), "{msg}");
+
+    // Both assets are queued for explicit re-embedding under the pinned id,
+    // and dupes sees nothing comparable yet.
+    assert_eq!(repo.fetch_unembedded(PINNED).await.expect("queue").len(), 1);
+    assert_eq!(
+        repo.fetch_videos_unembedded(PINNED)
+            .await
+            .expect("queue")
+            .len(),
+        1
+    );
+    assert!(
+        repo.fetch_all_image_embeddings(PINNED)
+            .await
+            .expect("dupes")
+            .is_empty()
+    );
+    assert!(
+        repo.fetch_all_frame_embedding_sets(PINNED)
+            .await
+            .expect("dupes")
+            .is_empty()
+    );
+    // The legacy rows are still there for the legacy id.
+    assert_eq!(
+        repo.fetch_all_image_embeddings(LEGACY)
+            .await
+            .expect("legacy")
+            .len(),
+        1
+    );
+
+    // Mid re-embed: the photo moves to the pinned id, the video has not.
+    // Search ranks only the pinned row; the legacy frame stays out.
+    repo.store_embedding(photo, &v, PINNED)
+        .await
+        .expect("re-embed photo");
+    let hits = repo
+        .search_similar(&v, PINNED, 10, None)
+        .await
+        .expect("search");
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![photo]);
+    assert!(
+        repo.fetch_unembedded(PINNED)
+            .await
+            .expect("queue")
+            .is_empty()
+    );
+    assert_eq!(
+        repo.fetch_all_frame_embedding_sets(LEGACY)
+            .await
+            .expect("legacy frames kept")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
