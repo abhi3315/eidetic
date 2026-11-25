@@ -14,8 +14,8 @@ use tracing::info;
 
 pub mod assets;
 pub use assets::{
-    AssetDetail, AssetsRepo, DavAsset, InsertOutcome, LibraryStats, NewAsset, RecentAsset,
-    RemovalManifest, SearchFilters, SearchResult,
+    AssetDetail, AssetsRepo, DavAsset, InsertOutcome, LibraryStats, MomentKey, MomentSignals,
+    MotionBacklog, NewAsset, NewFrame, RecentAsset, RemovalManifest, SearchFilters, SearchResult,
 };
 
 pub mod cluster;

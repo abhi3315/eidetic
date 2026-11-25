@@ -91,6 +91,251 @@ pub struct Slot {
     /// ignored.
     #[serde(default)]
     pub transition_in: Transition,
+    /// Measured pixel motion (0..1) at the moment this video slot was cut
+    /// around. Always None for photos; None for a video means "not
+    /// measured" (embedded before motion scoring, or a project file from
+    /// before it), never "still".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<f32>,
+    /// Dimensions and metadata rotation of what the render reads. None =
+    /// not probed (older project file, or unreadable source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<Geometry>,
+    /// Other slots of the cut list that repeat this shot: the same footage
+    /// (same photo, or the same sampled moment of the same video), or a
+    /// stored embedding within [`NEAR_DUPLICATE`]. `Some(vec![])` =
+    /// checked, nothing repeats; None = never checked (older project file,
+    /// or no embedding from the active model and no identical footage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_duplicates: Option<Vec<SlotRef>>,
+}
+
+/// Names a slot independently of its position, so annotations survive
+/// reorders and drops: the asset plus the in-point it is cut from.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SlotRef {
+    pub asset: AssetId,
+    pub start: f64,
+}
+
+impl SlotRef {
+    fn of(slot: &Slot) -> SlotRef {
+        SlotRef {
+            asset: slot.asset,
+            start: slot.start,
+        }
+    }
+
+    fn names(&self, slot: &Slot) -> bool {
+        self.asset == slot.asset && (self.start - slot.start).abs() < 1e-6
+    }
+}
+
+/// What container metadata says about a slot's picture. Metadata only: it
+/// can warn that a rotation will NOT be applied, but a zero rotation is no
+/// proof the pixels are upright (a phone with orientation lock records
+/// sideways content at rotation 0). Only looking at a frame settles that.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Geometry {
+    /// Pixel size of the file the render reads (display size for videos,
+    /// i.e. after rotation; the upright thumbnail for thumbnailed photos).
+    pub width: u32,
+    pub height: u32,
+    /// Clockwise rotation the source's metadata asks for (EXIF Orientation
+    /// or the video displaymatrix): 0, 90, 180 or 270. None = none found.
+    pub rotation_cw: Option<u16>,
+    /// Whether the render applies that rotation: thumbnails are
+    /// pre-rotated and ffmpeg autorotates video. False (a photo rendered
+    /// from its original) means the shot may come out sideways.
+    pub rotation_applied: bool,
+}
+
+impl Geometry {
+    /// Metadata asks for a rotation the render will not perform.
+    pub fn may_render_sideways(&self) -> bool {
+        !self.rotation_applied && self.rotation_cw.is_some_and(|r| r % 180 != 0)
+    }
+}
+
+/// Cosine at or above which two stored embeddings count as the same scene
+/// for planning. Far looser than `eidetic dupes` (0.985, "same pixels"):
+/// the target here is three files of one posing session, not re-exports.
+/// SigLIP is not calibrated for this, so it is a heuristic threshold.
+pub const NEAR_DUPLICATE: f32 = 0.92;
+
+/// How much a hot-section span values motion relative to semantic score.
+/// Scores are normalised to the pool's best hit (1.0) and motion to the
+/// pool's measured range, so the most-moving measured clip gains up to
+/// this much over a still of equal score.
+pub const MOTION_WEIGHT: f64 = 0.3;
+
+/// Which moment of the library a candidate or slot shows: the asset plus,
+/// for videos, the time asked about (a hit's matched frame, a slot's
+/// midpoint). Signals are keyed by this, never by asset alone — two slots
+/// of one video can show different scenes with different motion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MomentRef {
+    pub asset: AssetId,
+    pub at: Option<f64>,
+}
+
+impl MomentRef {
+    pub fn of_hit(r: &SearchResult) -> MomentRef {
+        MomentRef {
+            asset: r.id,
+            at: r.frame_ts,
+        }
+    }
+
+    pub fn of_slot(s: &Slot) -> MomentRef {
+        MomentRef {
+            asset: s.asset,
+            at: (s.kind == SlotKind::Video).then_some(s.start + s.duration / 2.0),
+        }
+    }
+
+    fn key(self) -> (AssetId, Option<u64>) {
+        (self.asset, self.at.map(f64::to_bits))
+    }
+}
+
+/// One moment's stored signals, as the planner sees it.
+#[derive(Debug, Clone, Default)]
+pub struct Moment {
+    /// The sampled frame the signals were read from (videos); None for
+    /// photos, or a video with no stored frames.
+    pub frame: Option<f64>,
+    /// Embedding from the active model; None = nothing comparable.
+    pub embedding: Option<Vec<f32>>,
+    /// Measured motion; None for photos and unmeasured moments.
+    pub motion: Option<f32>,
+}
+
+/// Plan-time quality signals per [`MomentRef`]. Empty = no signals, and
+/// every planner then behaves exactly as it did before signals existed.
+#[derive(Debug, Default)]
+pub struct Signals {
+    moments: HashMap<(AssetId, Option<u64>), Moment>,
+}
+
+impl Signals {
+    pub fn insert(&mut self, at: MomentRef, moment: Moment) {
+        self.moments.insert(at.key(), moment);
+    }
+
+    pub fn get(&self, at: MomentRef) -> Option<&Moment> {
+        self.moments.get(&at.key())
+    }
+
+    /// Cosine of two moments' stored embeddings, when both are known,
+    /// same-width and finite (the loader already dropped other models).
+    pub fn similarity(&self, a: MomentRef, b: MomentRef) -> Option<f32> {
+        let va = self.get(a)?.embedding.as_ref()?;
+        let vb = self.get(b)?.embedding.as_ref()?;
+        if va.len() != vb.len() || va.is_empty() {
+            return None;
+        }
+        let dot: f32 = va.iter().zip(vb).map(|(x, y)| x * y).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos = dot / (norm(va) * norm(vb));
+        cos.is_finite().then_some(cos)
+    }
+
+    /// The same footage: one photo twice, or one video at the same sampled
+    /// frame (the query time when no frames are stored). Needs no
+    /// embedding, so it holds even for unembedded or other-model assets.
+    pub fn same_footage(&self, a: MomentRef, b: MomentRef) -> bool {
+        if a.asset != b.asset {
+            return false;
+        }
+        match (a.at, b.at) {
+            (Some(x), Some(y)) => {
+                let frame = |r: MomentRef, t: f64| self.get(r).and_then(|m| m.frame).unwrap_or(t);
+                (frame(a, x) - frame(b, y)).abs() < 1e-6
+            }
+            _ => true,
+        }
+    }
+
+    /// Would `b` read as a repeat of `a` on screen?
+    pub fn repeats(&self, a: MomentRef, b: MomentRef) -> bool {
+        self.same_footage(a, b) || self.similarity(a, b).is_some_and(|s| s >= NEAR_DUPLICATE)
+    }
+
+    pub fn repeats_any(&self, a: MomentRef, others: &[MomentRef]) -> bool {
+        others.iter().any(|&b| self.repeats(a, b))
+    }
+
+    fn motion(&self, at: MomentRef) -> Option<f32> {
+        self.get(at).and_then(|m| m.motion)
+    }
+}
+
+/// Stamp stored signals onto a cut list: motion on video slots (from each
+/// slot's own moment), and every slot's repeats among the others. A slot
+/// with no comparable embedding and no identical footage elsewhere is
+/// marked unchecked (None) rather than "no repeats".
+pub fn annotate(slots: &mut [Slot], signals: &Signals) {
+    let refs: Vec<MomentRef> = slots.iter().map(MomentRef::of_slot).collect();
+    let names: Vec<SlotRef> = slots.iter().map(SlotRef::of).collect();
+    for (i, slot) in slots.iter_mut().enumerate() {
+        if slot.kind == SlotKind::Video {
+            slot.motion = signals.motion(refs[i]);
+        }
+        let repeats: Vec<SlotRef> = (0..refs.len())
+            .filter(|&j| j != i && signals.repeats(refs[i], refs[j]))
+            .map(|j| names[j])
+            .collect();
+        let comparable = signals.get(refs[i]).is_some_and(|m| m.embedding.is_some());
+        slot.near_duplicates = (comparable || !repeats.is_empty()).then_some(repeats);
+    }
+}
+
+/// 1-based positions of `slots[i]`'s repeats in the current order; None
+/// when the slot was never checked.
+pub fn similar_to(slots: &[Slot], i: usize) -> Option<Vec<usize>> {
+    let dups = slots[i].near_duplicates.as_ref()?;
+    Some(
+        slots
+            .iter()
+            .enumerate()
+            .filter(|(j, s)| *j != i && dups.iter().any(|d| d.names(s)))
+            .map(|(j, _)| j + 1)
+            .collect(),
+    )
+}
+
+/// Probe what the render will read for `slot`: video display size and
+/// displaymatrix rotation via ffprobe; photo size from the source header and
+/// rotation from the original's EXIF. Metadata only — see [`Geometry`].
+pub fn probe_geometry(slot: &Slot, original: &Path) -> Option<Geometry> {
+    match slot.kind {
+        SlotKind::Video => {
+            let p = eidetic_ingest::video::probe(&slot.source).ok().flatten()?;
+            Some(Geometry {
+                width: u32::try_from(p.width?).ok()?,
+                height: u32::try_from(p.height?).ok()?,
+                rotation_cw: p.rotation_cw,
+                rotation_applied: true,
+            })
+        }
+        SlotKind::Photo | SlotKind::PhotoScenic => {
+            let (width, height) = image::image_dimensions(&slot.source).ok()?;
+            let rotation_cw = eidetic_core::exif::read_orientation(original).map(|o| match o {
+                3 | 4 => 180,
+                5 | 6 => 90,
+                7 | 8 => 270,
+                _ => 0,
+            });
+            Some(Geometry {
+                width,
+                height,
+                rotation_cw,
+                // The medium thumbnail was rotated upright when generated.
+                rotation_applied: slot.source != original,
+            })
+        }
+    }
 }
 
 /// The ffmpeg treatment for a slot.
@@ -233,6 +478,26 @@ impl Slot {
         if self.pinned {
             s.push_str(" [pinned]");
         }
+        if self.kind == SlotKind::Video {
+            match self.motion {
+                Some(m) => s.push_str(&format!(" [motion {m:.3}]")),
+                None => s.push_str(" [motion unmeasured]"),
+            }
+        }
+        // Geometry is metadata: it can warn, never certify upright pixels.
+        match self.geometry {
+            None => s.push_str(" [size unknown]"),
+            Some(g) => {
+                let rotation = match g.rotation_cw {
+                    Some(r) => format!("metadata rotation {r}°"),
+                    None => "no rotation metadata".to_string(),
+                };
+                s.push_str(&format!(" [{}x{}, {rotation}]", g.width, g.height));
+                if g.may_render_sideways() {
+                    s.push_str(" [rotation not applied by the render: may come out sideways]");
+                }
+            }
+        }
         s
     }
 }
@@ -253,6 +518,9 @@ fn video_slot(r: &SearchResult, start: f64, duration: f64, focus_x: Option<f64>)
         score: r.score,
         pinned: false,
         transition_in: Transition::Cut,
+        motion: None,
+        geometry: None,
+        near_duplicates: None,
     }
 }
 
@@ -271,6 +539,9 @@ fn photo_slot(r: &SearchResult, library_dir: &Path, duration: f64, scenic: bool)
         score: r.score,
         pinned: false,
         transition_in: Transition::Cut,
+        motion: None,
+        geometry: None,
+        near_duplicates: None,
     }
 }
 
@@ -283,15 +554,23 @@ fn photo_slot(r: &SearchResult, library_dir: &Path, duration: f64, scenic: bool)
 /// `library_dir` locates photo thumbnails — see [`photo_source`]. `scenes`
 /// holds per-video scene boundaries (empty entry or missing key = single
 /// shot / undetected) so cuts snap to shots — see [`clip_bounds`].
+///
+/// With `signals`, near-duplicates of shots already taken are deferred to
+/// the back of the queue (see [`diverse_order`]).
 pub fn plan(
     results: &[SearchResult],
     target_secs: f64,
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
+    signals: &Signals,
 ) -> Vec<Slot> {
+    let strong = strong_prefix(results);
     let mut slots: Vec<Slot> = Vec::new();
     let mut total = 0.0f64;
-    for r in strong_prefix(results) {
+    for r in diverse_order(strong, signals)
+        .into_iter()
+        .map(|i| &strong[i])
+    {
         let slot = match r.frame_ts {
             Some(ts) => {
                 let empty = Vec::new();
@@ -308,6 +587,83 @@ pub fn plan(
         slots.push(slot);
     }
     slots
+}
+
+/// The next shot from the unused part of `pool`. The diversity penalty is
+/// lexicographic: a near-duplicate of an already-chosen shot is taken only
+/// when nothing else is left (scarcity), so no score can buy a repeat —
+/// and when scarcity forces one, [`annotate`] surfaces it as `similar_to`.
+/// Within a tier the highest `value` wins; ties go to the earlier hit in
+/// `pool` order, so the choice is deterministic.
+fn pick(
+    pool: &[SearchResult],
+    used: &[bool],
+    chosen: &[MomentRef],
+    signals: &Signals,
+    value: impl Fn(usize) -> f64,
+) -> Option<usize> {
+    (0..pool.len()).filter(|&j| !used[j]).min_by(|&a, &b| {
+        let dup = |j: usize| signals.repeats_any(MomentRef::of_hit(&pool[j]), chosen);
+        dup(a)
+            .cmp(&dup(b))
+            .then(value(b).total_cmp(&value(a)))
+            .then(a.cmp(&b))
+    })
+}
+
+/// Indices of `pool` in the order [`plan`] consumes them: `pool` order
+/// (score order from search, or a `--variations` rotation of it), with
+/// repeats of earlier picks deferred.
+pub fn diverse_order(pool: &[SearchResult], signals: &Signals) -> Vec<usize> {
+    let mut used = vec![false; pool.len()];
+    let mut chosen = Vec::with_capacity(pool.len());
+    let mut order = Vec::with_capacity(pool.len());
+    while let Some(j) = pick(pool, &used, &chosen, signals, |j| -(j as f64)) {
+        used[j] = true;
+        chosen.push(MomentRef::of_hit(&pool[j]));
+        order.push(j);
+    }
+    order
+}
+
+/// A semantic value per position that respects `pool` order: position j
+/// is worth the j-th best score in the pool, over the best. For a
+/// score-sorted pool that is each hit's own score; for a rotated
+/// `--variations` pool it keeps the rotation's order while staying on the
+/// score scale the motion bonus is weighed against.
+fn rank_values(pool: &[SearchResult]) -> Vec<f64> {
+    let mut scores: Vec<f64> = pool.iter().map(|r| r.score as f64).collect();
+    scores.sort_by(|a, b| b.total_cmp(a));
+    let top = scores.first().copied().unwrap_or(1.0).max(f64::EPSILON);
+    scores.into_iter().map(|s| s / top).collect()
+}
+
+/// Each hit's measured motion scaled to the pool's measured range (0..1).
+/// Photos and unmeasured videos get 0 — no bonus, and no penalty against
+/// each other. With fewer than two distinct measurements there is nothing
+/// to prefer, so everything is 0 and planning falls back to score order.
+fn motion_norm(pool: &[SearchResult], signals: &Signals) -> Vec<f64> {
+    let m: Vec<Option<f64>> = pool
+        .iter()
+        .map(|r| {
+            r.frame_ts
+                .and(signals.motion(MomentRef::of_hit(r)))
+                .map(f64::from)
+                .filter(|m| m.is_finite())
+        })
+        .collect();
+    let lo = m.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+    let hi = m
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    m.into_iter()
+        .map(|v| match v {
+            Some(v) if hi > lo => (v - lo) / (hi - lo),
+            _ => 0.0,
+        })
+        .collect()
 }
 
 /// The prefix of (score-sorted) `results` that clears the weak-tail rules:
@@ -793,6 +1149,14 @@ const SECTION_FADE_SECS: f64 = 0.5;
 /// first span that starts on a bar line inside the section (a pickup,
 /// half-bar, or a bar that begins before the drop is passed over); with
 /// Ellis grids it is simply the section's first span.
+///
+/// Quality signals (goals-v0.9.md phase 2) refine the choice without
+/// widening the pool: every pick comes from the same strong prefix, so the
+/// semantic floor (and whatever filters produced `results`) still binds.
+/// High-energy spans value measured motion ([`MOTION_WEIGHT`]) alongside
+/// score, and near-duplicates of shots already placed are deferred until
+/// nothing else is left ([`pick`]). With empty `signals` the plan is
+/// exactly the score-order plan.
 pub fn plan_synced(
     results: &[SearchResult],
     grid: &BeatGrid,
@@ -800,6 +1164,7 @@ pub fn plan_synced(
     library_dir: &Path,
     scenes: &HashMap<AssetId, Vec<f64>>,
     focus: &HashMap<AssetId, f64>,
+    signals: &Signals,
 ) -> Vec<Slot> {
     let spans = beat_spans(grid, total_secs);
     let strong = strong_prefix(results);
@@ -809,9 +1174,9 @@ pub fn plan_synced(
         .iter()
         .map(|s| grid.is_high_energy((s.start + s.end) / 2.0))
         .collect();
-    // Which hit fills which span: drops first (best hits), rest in order.
-    let mut hit_for_span = vec![usize::MAX; n];
-    let mut next = 0usize;
+    // Which span is filled when: each section's hero span first (so the
+    // drops get the best hits), then the rest in timeline order.
+    let mut heroes = Vec::new();
     let mut i = 0;
     while i < n {
         if !hot[i] {
@@ -834,15 +1199,33 @@ pub fn plan_synced(
         } else {
             i
         };
-        hit_for_span[hero] = next;
-        next += 1;
+        heroes.push(hero);
         i = run_end;
     }
-    for h in &mut hit_for_span {
-        if *h == usize::MAX {
-            *h = next;
-            next += 1;
-        }
+    let fill_order: Vec<usize> = heroes
+        .iter()
+        .copied()
+        .chain((0..n).filter(|i| !heroes.contains(i)))
+        .collect();
+    let base = rank_values(strong);
+    let motion = motion_norm(strong, signals);
+    let mut used = vec![false; strong.len()];
+    let mut chosen = Vec::with_capacity(n);
+    let mut hit_for_span = vec![0usize; n];
+    for i in fill_order {
+        let value = |j: usize| {
+            let bonus = if hot[i] {
+                MOTION_WEIGHT * motion[j]
+            } else {
+                0.0
+            };
+            base[j] + bonus
+        };
+        let j = pick(strong, &used, &chosen, signals, value)
+            .expect("n <= strong.len(), so a hit is left for every span");
+        used[j] = true;
+        chosen.push(MomentRef::of_hit(&strong[j]));
+        hit_for_span[i] = j;
     }
 
     let mut slots = Vec::new();
@@ -1127,7 +1510,7 @@ mod tests {
     fn plan_respects_target_duration() {
         // Ten strong photo hits at 3s each against a 10s target: 3 fit.
         let results: Vec<_> = (0..10).map(|_| hit(0.5, None, None)).collect();
-        let slots = plan(&results, 10.0, &lib(), &HashMap::new());
+        let slots = plan(&results, 10.0, &lib(), &HashMap::new(), &Signals::default());
         assert_eq!(slots.len(), 3);
         assert!((total_secs(&slots) - 9.0).abs() < 1e-9);
     }
@@ -1135,28 +1518,28 @@ mod tests {
     #[test]
     fn plan_drops_weak_tail_even_with_room() {
         let results = vec![hit(0.5, None, None), hit(0.1, None, None)];
-        let slots = plan(&results, 60.0, &lib(), &HashMap::new());
+        let slots = plan(&results, 60.0, &lib(), &HashMap::new(), &Signals::default());
         assert_eq!(slots.len(), 1, "0.1 < 35% of 0.5 is padding");
     }
 
     #[test]
     fn plan_drops_non_positive_scores() {
         let results = vec![hit(0.0, None, None), hit(-0.2, None, None)];
-        assert!(plan(&results, 30.0, &lib(), &HashMap::new()).is_empty());
+        assert!(plan(&results, 30.0, &lib(), &HashMap::new(), &Signals::default()).is_empty());
     }
 
     #[test]
     fn video_clip_leads_into_the_moment_and_respects_bounds() {
         // Moment at 9s of a 10s video: start = 7.5, len clamped to 2.5.
         let results = vec![hit(0.5, Some(9.0), Some(10.0))];
-        let slots = plan(&results, 30.0, &lib(), &HashMap::new());
+        let slots = plan(&results, 30.0, &lib(), &HashMap::new(), &Signals::default());
         assert_eq!(slots[0].kind, SlotKind::Video);
         assert!((slots[0].start - 7.5).abs() < 1e-9);
         assert!((slots[0].duration - 2.5).abs() < 1e-9);
 
         // Moment at 0.5s: lead-in clamps to the file start.
         let results = vec![hit(0.5, Some(0.5), Some(10.0))];
-        let slots = plan(&results, 30.0, &lib(), &HashMap::new());
+        let slots = plan(&results, 30.0, &lib(), &HashMap::new(), &Signals::default());
         assert_eq!(slots[0].start, 0.0);
         assert!((slots[0].duration - 4.0).abs() < 1e-9);
     }
@@ -1164,7 +1547,13 @@ mod tests {
     #[test]
     fn slots_carry_identity_and_score() {
         let r = hit(0.7, Some(2.0), Some(30.0));
-        let slots = plan(std::slice::from_ref(&r), 30.0, &lib(), &HashMap::new());
+        let slots = plan(
+            std::slice::from_ref(&r),
+            30.0,
+            &lib(),
+            &HashMap::new(),
+            &Signals::default(),
+        );
         assert_eq!(slots[0].asset, r.id);
         assert!((slots[0].score - 0.7).abs() < 1e-6);
         assert!(!slots[0].pinned);
@@ -1177,7 +1566,13 @@ mod tests {
         let mut thumbed = hit(0.5, None, None);
         thumbed.storage_path = PathBuf::from(format!("/lib/ab/ab/{hash}.heic"));
         thumbed.thumbnails_generated = true;
-        let slots = plan(&[thumbed], 30.0, &lib(), &HashMap::new());
+        let slots = plan(
+            &[thumbed],
+            30.0,
+            &lib(),
+            &HashMap::new(),
+            &Signals::default(),
+        );
         assert_eq!(slots[0].kind, SlotKind::Photo);
         let s = slots[0].source.to_str().unwrap();
         assert!(s.contains(".thumbs/m/"), "expected thumb path, got {s}");
@@ -1185,7 +1580,7 @@ mod tests {
 
         // No thumbnail -> the original is used as-is.
         let raw = hit(0.5, None, None);
-        let slots = plan(&[raw], 30.0, &lib(), &HashMap::new());
+        let slots = plan(&[raw], 30.0, &lib(), &HashMap::new(), &Signals::default());
         assert_eq!(slots[0].source, PathBuf::from("/x"));
     }
 
@@ -1344,6 +1739,7 @@ mod tests {
             &lib(),
             &HashMap::new(),
             &HashMap::new(),
+            &Signals::default(),
         );
         assert_eq!(slots.len(), 2);
         assert!((slots[0].duration - 2.0).abs() < 1e-9, "span-sized clip");
@@ -1368,6 +1764,7 @@ mod tests {
             &lib(),
             &HashMap::new(),
             &HashMap::new(),
+            &Signals::default(),
         );
         let spans = beat_spans(&grid, 12.0);
         let fades: Vec<usize> = slots
@@ -1402,6 +1799,7 @@ mod tests {
             &lib(),
             &HashMap::new(),
             &HashMap::new(),
+            &Signals::default(),
         );
         // Spans: [0,2) [2,4) | hot [4,5) [5,6) [6,7) [7,8) | [8,10) [10,12).
         // The first hot span (index 2) is the drop: it gets the best hit.
@@ -1424,8 +1822,17 @@ mod tests {
         let results: Vec<_> = (0..16)
             .map(|i| hit(0.5 - i as f32 * 0.01, None, None))
             .collect();
-        let plan =
-            |g: &BeatGrid| plan_synced(&results, g, 10.0, &lib(), &HashMap::new(), &HashMap::new());
+        let plan = |g: &BeatGrid| {
+            plan_synced(
+                &results,
+                g,
+                10.0,
+                &lib(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Signals::default(),
+            )
+        };
 
         let spans = beat_spans(&grid, 10.0);
         assert_eq!(spans[0].start, 0.0);
@@ -1457,8 +1864,17 @@ mod tests {
         let results: Vec<_> = (0..16)
             .map(|i| hit(0.5 - i as f32 * 0.01, None, None))
             .collect();
-        let plan =
-            |g: &BeatGrid| plan_synced(&results, g, 10.0, &lib(), &HashMap::new(), &HashMap::new());
+        let plan = |g: &BeatGrid| {
+            plan_synced(
+                &results,
+                g,
+                10.0,
+                &lib(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Signals::default(),
+            )
+        };
 
         let spans = beat_spans(&grid, 10.0);
         assert_eq!(starts(&spans)[..2], [0.0, 2.0]);
@@ -1487,6 +1903,7 @@ mod tests {
             &lib(),
             &HashMap::new(),
             &HashMap::new(),
+            &Signals::default(),
         );
         let lens: Vec<f64> = slots.iter().map(|s| s.duration).collect();
         assert_eq!(lens, vec![1.5, 1.5, 1.5, 1.5]);
@@ -1496,7 +1913,10 @@ mod tests {
     fn plan_always_takes_at_least_one_strong_hit() {
         // Target shorter than the first segment still yields that segment.
         let results = vec![hit(0.5, Some(5.0), Some(60.0))];
-        assert_eq!(plan(&results, 1.0, &lib(), &HashMap::new()).len(), 1);
+        assert_eq!(
+            plan(&results, 1.0, &lib(), &HashMap::new(), &Signals::default()).len(),
+            1
+        );
     }
 
     #[test]
@@ -1526,7 +1946,13 @@ mod tests {
     #[test]
     fn slot_serde_round_trips() {
         let r = hit(0.42, Some(3.0), Some(20.0));
-        let mut slots = plan(std::slice::from_ref(&r), 30.0, &lib(), &HashMap::new());
+        let mut slots = plan(
+            std::slice::from_ref(&r),
+            30.0,
+            &lib(),
+            &HashMap::new(),
+            &Signals::default(),
+        );
         slots[0].pinned = true;
         slots[0].transition_in = Transition::Crossfade { secs: 0.5 };
         let json = serde_json::to_string(&slots).unwrap();
@@ -1535,6 +1961,406 @@ mod tests {
         assert_eq!(back[0].kind, SlotKind::Video);
         assert!(back[0].pinned);
         assert_eq!(back[0].transition_in, Transition::Crossfade { secs: 0.5 });
+    }
+
+    // -- quality signals (deterministic vectors, no database) ---------------
+
+    /// Signals for `hits`: (embedding, motion) per hit, same order, keyed
+    /// by each hit's matched moment.
+    fn signals(hits: &[SearchResult], per: &[(Option<[f32; 3]>, Option<f32>)]) -> Signals {
+        let mut s = Signals::default();
+        for (h, (e, m)) in hits.iter().zip(per) {
+            s.insert(
+                MomentRef::of_hit(h),
+                Moment {
+                    frame: h.frame_ts,
+                    embedding: e.map(|v| v.to_vec()),
+                    motion: *m,
+                },
+            );
+        }
+        s
+    }
+
+    /// Signals keyed by each slot's own moment (what [`annotate`] reads):
+    /// (resolved frame, embedding, motion) per slot.
+    type SlotMoment = (Option<f64>, Option<[f32; 3]>, Option<f32>);
+
+    fn slot_signals(slots: &[Slot], per: &[SlotMoment]) -> Signals {
+        let mut s = Signals::default();
+        for (slot, (frame, e, m)) in slots.iter().zip(per) {
+            s.insert(
+                MomentRef::of_slot(slot),
+                Moment {
+                    frame: *frame,
+                    embedding: e.map(|v| v.to_vec()),
+                    motion: *m,
+                },
+            );
+        }
+        s
+    }
+
+    fn video_at(asset: AssetId, start: f64) -> Slot {
+        Slot {
+            asset,
+            source: PathBuf::from("/v.mp4"),
+            kind: SlotKind::Video,
+            start,
+            duration: 2.0,
+            focus_x: None,
+            score: 0.3,
+            pinned: false,
+            transition_in: Transition::Cut,
+            motion: None,
+            geometry: None,
+            near_duplicates: None,
+        }
+    }
+
+    #[test]
+    fn two_moments_of_one_video_keep_their_own_signals() {
+        // Video A at 2s is a beach, at 20s a forest; photo-like slot B is
+        // the beach again. Orthogonal embeddings, different motion.
+        let a = AssetId::new();
+        let mut slots = vec![
+            video_at(a, 1.0),
+            video_at(a, 19.0),
+            video_at(AssetId::new(), 4.0),
+        ];
+        let sig = slot_signals(
+            &slots,
+            &[
+                (Some(2.0), Some(BEACH), Some(0.1)),
+                (Some(20.0), Some(FOREST), Some(0.7)),
+                (Some(5.0), Some(BEACH_AGAIN), None),
+            ],
+        );
+        annotate(&mut slots, &sig);
+        assert_eq!(slots[0].motion, Some(0.1));
+        assert_eq!(slots[1].motion, Some(0.7), "not the first moment's motion");
+        assert_eq!(
+            similar_to(&slots, 0),
+            Some(vec![3]),
+            "beach repeats beach only"
+        );
+        assert_eq!(
+            similar_to(&slots, 1),
+            Some(vec![]),
+            "the forest moment is distinct"
+        );
+        assert_eq!(similar_to(&slots, 2), Some(vec![1]));
+    }
+
+    #[test]
+    fn the_same_footage_twice_is_a_repeat_even_without_embeddings() {
+        let a = AssetId::new();
+        // Same video, same in-point: identical footage.
+        let mut slots = vec![video_at(a, 1.0), video_at(a, 1.0), video_at(a, 30.0)];
+        annotate(&mut slots, &Signals::default());
+        assert_eq!(similar_to(&slots, 0), Some(vec![2]));
+        assert_eq!(similar_to(&slots, 1), Some(vec![1]));
+        assert_eq!(
+            similar_to(&slots, 2),
+            None,
+            "another moment, nothing to compare"
+        );
+    }
+
+    #[test]
+    fn variation_rotations_still_change_the_plan() {
+        let hits = vec![
+            hit(0.50, None, None),
+            hit(0.49, None, None),
+            hit(0.40, None, None),
+        ];
+        let ids = |s: &[Slot]| s.iter().map(|s| s.asset).collect::<Vec<_>>();
+        let mut seen = Vec::new();
+        for k in 0..3 {
+            let mut pool = hits.clone();
+            pool.rotate_left(k);
+            let want: Vec<_> = pool.iter().map(|h| h.id).collect();
+            let unsynced = plan(&pool, 30.0, &lib(), &HashMap::new(), &Signals::default());
+            assert_eq!(ids(&unsynced), want, "rotation {k} keeps its order");
+            let synced = plan_synced(
+                &pool,
+                &grid_120bpm(30.0),
+                6.0,
+                &lib(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Signals::default(),
+            );
+            assert_eq!(ids(&synced), want, "rotation {k} opens differently");
+            seen.push(ids(&synced)[0]);
+        }
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "every variation opens on a different shot");
+
+        // Diversity still applies inside a rotated pool: the repeat of the
+        // opener is deferred.
+        let mut pool = hits.clone();
+        pool.rotate_left(1); // 0.49, 0.40, 0.50
+        let sig = signals(
+            &pool,
+            &[
+                (Some(BEACH), None),
+                (Some(FOREST), None),
+                (Some(BEACH_AGAIN), None),
+            ],
+        );
+        let slots = plan(&pool, 6.0, &lib(), &HashMap::new(), &sig);
+        assert_eq!(ids(&slots), vec![pool[0].id, pool[1].id]);
+    }
+
+    #[test]
+    fn describe_shows_geometry_or_says_it_is_unknown() {
+        let mut s = video_at(AssetId::new(), 0.0);
+        assert!(s.describe().contains("[size unknown]"), "{}", s.describe());
+        s.geometry = Some(Geometry {
+            width: 1080,
+            height: 1920,
+            rotation_cw: Some(90),
+            rotation_applied: true,
+        });
+        let d = s.describe();
+        assert!(d.contains("[1080x1920, metadata rotation 90°]"), "{d}");
+        assert!(!d.contains("sideways"), "{d}");
+        s.geometry = Some(Geometry {
+            width: 4000,
+            height: 3000,
+            rotation_cw: None,
+            rotation_applied: false,
+        });
+        assert!(s.describe().contains("[4000x3000, no rotation metadata]"));
+        s.geometry = Some(Geometry {
+            width: 4000,
+            height: 3000,
+            rotation_cw: Some(270),
+            rotation_applied: false,
+        });
+        assert!(s.describe().contains("may come out sideways"));
+    }
+
+    const BEACH: [f32; 3] = [1.0, 0.0, 0.0];
+    const BEACH_AGAIN: [f32; 3] = [0.99, 0.1, 0.0]; // cos ≈ 0.995
+    const FOREST: [f32; 3] = [0.0, 1.0, 0.0];
+    const CITY: [f32; 3] = [0.0, 0.0, 1.0];
+
+    #[test]
+    fn near_identical_shots_are_deferred_behind_different_ones() {
+        // Two files of one scene rank 1 and 2; a different scene ranks 3.
+        let hits = vec![
+            hit(0.50, None, None),
+            hit(0.49, None, None),
+            hit(0.40, None, None),
+        ];
+        let sig = signals(
+            &hits,
+            &[
+                (Some(BEACH), None),
+                (Some(BEACH_AGAIN), None),
+                (Some(FOREST), None),
+            ],
+        );
+        let slots = plan(&hits, 6.0, &lib(), &HashMap::new(), &sig);
+        let ids: Vec<_> = slots.iter().map(|s| s.asset).collect();
+        assert_eq!(
+            ids,
+            vec![hits[0].id, hits[2].id],
+            "the repeat lost its slot"
+        );
+
+        // Semantically different candidates are left in score order.
+        let sig = signals(
+            &hits,
+            &[
+                (Some(BEACH), None),
+                (Some(CITY), None),
+                (Some(FOREST), None),
+            ],
+        );
+        let slots = plan(&hits, 6.0, &lib(), &HashMap::new(), &sig);
+        assert_eq!(slots[1].asset, hits[1].id);
+    }
+
+    #[test]
+    fn scarcity_uses_the_repeat_and_says_so() {
+        let hits = vec![hit(0.50, None, None), hit(0.49, None, None)];
+        let sig = signals(&hits, &[(Some(BEACH), None), (Some(BEACH_AGAIN), None)]);
+        let mut slots = plan(&hits, 6.0, &lib(), &HashMap::new(), &sig);
+        assert_eq!(slots.len(), 2, "a repeat beats a shorter reel");
+        annotate(&mut slots, &sig);
+        assert_eq!(similar_to(&slots, 1), Some(vec![1]));
+        assert_eq!(similar_to(&slots, 0), Some(vec![2]));
+
+        // Without comparable embeddings the check is reported as not run.
+        let sig = signals(&hits, &[(None, None), (Some(BEACH), None)]);
+        annotate(&mut slots, &sig);
+        assert_eq!(similar_to(&slots, 0), None, "unchecked, not 'no repeats'");
+        assert_eq!(similar_to(&slots, 1), Some(vec![]));
+    }
+
+    fn hot_grid() -> BeatGrid {
+        let mut grid = grid_120bpm(30.0);
+        // Spans: [0,2) [2,4) | hot [4,5) [5,6) [6,7) [7,8) | [8,10) [10,12).
+        grid.high_energy = vec![(4.0, 8.0)];
+        grid
+    }
+
+    #[test]
+    fn hot_spans_prefer_measured_motion_within_the_strong_pool() {
+        // A still photo scores best; a moving clip scores a little lower;
+        // a very-high-motion clip is below the weak-tail floor.
+        let mut hits = vec![
+            hit(0.50, None, None),
+            hit(0.45, Some(5.0), Some(60.0)),
+            hit(0.44, None, None),
+            hit(0.43, None, None),
+            hit(0.42, None, None),
+            hit(0.41, None, None),
+            hit(0.40, None, None),
+            hit(0.39, Some(5.0), Some(60.0)),
+            hit(0.10, Some(5.0), Some(60.0)),
+        ];
+        let motion = [
+            None,
+            Some(0.08),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0.01),
+            Some(0.5),
+        ];
+        let per: Vec<_> = motion.iter().map(|m| (None, *m)).collect();
+        let sig = signals(&hits, &per);
+        let slots = plan_synced(
+            &hits,
+            &hot_grid(),
+            12.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &sig,
+        );
+        // The drop (span 2) takes the moving clip over the better-scoring
+        // still; the calm opener still gets the best remaining hit.
+        assert_eq!(slots[2].asset, hits[1].id, "motion on the drop");
+        assert_eq!(slots[0].asset, hits[0].id);
+        assert!(
+            slots.iter().all(|s| s.asset != hits[8].id),
+            "high motion never buys a way past the semantic floor"
+        );
+
+        // No measured motion anywhere: exactly the score-order plan.
+        hits.truncate(8);
+        let sig = signals(&hits, &[(None, None); 8]);
+        let with = plan_synced(
+            &hits,
+            &hot_grid(),
+            12.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &sig,
+        );
+        let without = plan_synced(
+            &hits,
+            &hot_grid(),
+            12.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Signals::default(),
+        );
+        let ids = |s: &[Slot]| s.iter().map(|s| s.asset).collect::<Vec<_>>();
+        assert_eq!(ids(&with), ids(&without));
+        assert_eq!(with[2].asset, hits[0].id, "hero on the drop, as before");
+    }
+
+    #[test]
+    fn calm_spans_ignore_motion() {
+        let hits = vec![hit(0.50, None, None), hit(0.45, Some(5.0), Some(60.0))];
+        let sig = signals(&hits, &[(None, None), (None, Some(0.9))]);
+        let slots = plan_synced(
+            &hits,
+            &grid_120bpm(30.0),
+            12.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &sig,
+        );
+        assert_eq!(slots[0].asset, hits[0].id);
+    }
+
+    #[test]
+    fn annotations_mark_video_motion_and_leave_photos_without_one() {
+        let hits = vec![
+            hit(0.5, None, None),
+            hit(0.5, Some(5.0), Some(60.0)),
+            hit(0.5, Some(9.0), Some(60.0)),
+        ];
+        let mut slots = plan(&hits, 30.0, &lib(), &HashMap::new(), &Signals::default());
+        let motion = |id| {
+            if id == hits[1].id { Some(0.0) } else { None }
+        };
+        let per: Vec<_> = slots
+            .iter()
+            .map(|s| (None, None, motion(s.asset)))
+            .collect();
+        let sig = slot_signals(&slots, &per);
+        annotate(&mut slots, &sig);
+        let by = |id| slots.iter().find(|s| s.asset == id).unwrap();
+        assert_eq!(by(hits[0].id).motion, None);
+        assert_eq!(
+            by(hits[1].id).motion,
+            Some(0.0),
+            "measured still, not unknown"
+        );
+        assert_eq!(by(hits[2].id).motion, None);
+        assert!(by(hits[2].id).describe().contains("motion unmeasured"));
+        assert!(!by(hits[0].id).describe().contains("motion"));
+    }
+
+    #[test]
+    fn geometry_flags_only_a_rotation_the_render_skips() {
+        let g = |rotation_cw, rotation_applied| Geometry {
+            width: 4000,
+            height: 3000,
+            rotation_cw,
+            rotation_applied,
+        };
+        assert!(g(Some(90), false).may_render_sideways());
+        assert!(
+            !g(Some(90), true).may_render_sideways(),
+            "thumbnail is upright"
+        );
+        assert!(!g(Some(180), false).may_render_sideways());
+        assert!(
+            !g(Some(0), false).may_render_sideways(),
+            "metadata cannot prove sideways"
+        );
+        assert!(!g(None, false).may_render_sideways());
+    }
+
+    #[test]
+    fn projects_from_before_signals_still_load() {
+        let old = serde_json::json!({
+            "asset": AssetId::new(), "source": "/x.mp4", "kind": "video",
+            "start": 1.0, "duration": 2.0, "score": 0.3,
+        });
+        let slot: Slot = serde_json::from_value(old).unwrap();
+        assert_eq!(slot.motion, None);
+        assert_eq!(slot.geometry, None);
+        assert_eq!(slot.near_duplicates, None);
+        let back = serde_json::to_value(&slot).unwrap();
+        assert!(
+            back.get("motion").is_none(),
+            "unknown fields are not invented"
+        );
     }
 
     // -- render publication (synthetic media; skipped without ffmpeg) -------
@@ -1573,6 +2399,9 @@ mod tests {
             score: 0.0,
             pinned: false,
             transition_in: Transition::Cut,
+            motion: None,
+            geometry: None,
+            near_duplicates: None,
         }
     }
 

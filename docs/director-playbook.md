@@ -88,9 +88,15 @@ not invented.
   deliberate energy, at most once or twice per reel. Dip-to-black
   mid-reel reads as "the end"; don't — the render already fades the tail.
 - **Shot diversity beats score order.** Ten best-scoring hits of the same
-  sunset make a worse reel than six sunsets, two faces and two wides. When
-  the cut list is monotonous, swap with more specific queries ("kids
-  running on the beach", not "beach" again).
+  sunset make a worse reel than six sunsets, two faces and two wides. The
+  planner already holds back near-duplicates (other files of a scene it
+  has placed) until nothing else is left, and swaps skip them the same
+  way. A non-empty `similar_to` means the library ran out of distinct
+  shots for that prompt: swap with a more specific query ("kids running on
+  the beach", not "beach" again) or drop the repeat.
+- **Motion belongs in the loud parts.** High-energy spans prefer videos
+  with measured motion over equally relevant stills. `motion` is
+  relative: compare slots within one cut list, don't read 0.05 as "slow".
 - **Respect the frame.** Portrait reels crop hard; scenic panoramas belong
   in landscape output or as `photo_scenic` slots (blur-fill). If a swap
   puts a wide landscape into a portrait reel, expect it to render as the
@@ -105,6 +111,24 @@ not invented.
 - The sharpness gate already dropped clearly-blurry candidates; a slot
   that made it in is at worst soft. Without `preview_sheet` you cannot see
   pixels — only the human can. Preview early.
+- Cut lists carry quality signals per slot, explained in their `signals`
+  field. `motion` (videos only) is frame-differencing between the matched
+  frame and one 0.2 s later: it sees camera pans as well as subject action,
+  and `null` means never measured, not still. `similar_to` flags the same
+  footage twice (one photo, or one video moment) and near-duplicate stored
+  SigLIP embeddings of the same model, per moment — two different scenes
+  of one long video are not repeats. `null` means it could not check.
+  Voiceover shots get the same treatment per narration span, but only
+  among that span's relevant hits (the usual weak-tail floor): a repeat
+  of the right scene beats a fresh but unrelated shot. `--variations`
+  keep their rotated shot order. Swaps try, in order: a new asset that
+  repeats nothing, another scene of a video already in the reel, then a
+  new file of a scene already placed. A retime moves a video slot's
+  midpoint, so `motion` and `similar_to` are re-read for the new moment.
+  `width`/`height`/`rotation_cw` are file metadata: `may_render_sideways`
+  warns about a rotation the render will skip, but rotation 0 proves
+  nothing about the pixels — a phone with orientation lock records
+  sideways footage at 0. Only `preview_sheet` (or the human) can see that.
 - `transcript` is recall fuel (what was said, when) — quote it when
   choosing voiceover shots, never burn it in as subtitles.
 - Renders are deterministic from the project file: same file, same reel.

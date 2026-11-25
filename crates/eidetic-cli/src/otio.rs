@@ -180,6 +180,9 @@ mod tests {
                     score: 0.4,
                     pinned: false,
                     transition_in: Transition::Cut,
+                    motion: None,
+                    geometry: None,
+                    near_duplicates: None,
                 },
                 Slot {
                     asset: AssetId::new(),
@@ -191,6 +194,9 @@ mod tests {
                     score: 0.3,
                     pinned: false,
                     transition_in: Transition::Cut,
+                    motion: None,
+                    geometry: None,
+                    near_duplicates: None,
                 },
             ],
         )

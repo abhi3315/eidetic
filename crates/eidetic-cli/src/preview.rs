@@ -404,6 +404,9 @@ mod tests {
             score: 0.0,
             pinned: false,
             transition_in: Transition::Cut,
+            motion: None,
+            geometry: None,
+            near_duplicates: None,
         }
     }
 

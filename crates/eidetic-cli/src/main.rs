@@ -43,7 +43,15 @@ enum Command {
     /// Show library statistics.
     Stats,
     /// Generate embeddings for all imported images that don't have one yet.
-    Embed,
+    /// Video moments also get a motion score measured from decoded frames.
+    Embed {
+        /// Only measure motion for already-embedded video moments that
+        /// have none (embedded before motion scoring existed, or whose
+        /// companion frame failed to decode). Needs ffmpeg; loads no model
+        /// and changes no embedding.
+        #[arg(long)]
+        backfill_motion: bool,
+    },
     /// Generate missing thumbnails for previously-imported images.
     Thumbnail,
     /// Detect and group faces in imported images.
@@ -493,7 +501,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("eval thread panicked")??;
         }
 
-        Command::Embed => {
+        Command::Embed { backfill_motion } => {
             let config = Config::from_env()?;
 
             let models_dir = config.paths.models_cache.clone();
@@ -502,6 +510,22 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to connect to database")?;
             let repo = eidetic_db::AssetsRepo::new(pool);
+
+            if backfill_motion {
+                return backfill_motion_scores(&repo).await;
+            }
+            let motion_backlog = repo
+                .fetch_motion_backlog()
+                .await
+                .context("failed to count unmeasured video moments")?
+                .len();
+            if motion_backlog > 0 {
+                eprintln!(
+                    "{motion_backlog} embedded video(s) have moments without a motion score; \
+                     `eidetic embed --backfill-motion` measures them (reels treat them as \
+                     unknown until then)."
+                );
+            }
 
             // Resolved from EIDETIC_MODEL without loading the model: a row
             // produced by another model is pending work, not a finished
@@ -550,15 +574,16 @@ async fn main() -> anyhow::Result<()> {
             // results via per-job oneshot replies. Channel capacity 1 keeps
             // the worker tightly coupled to the async loop, so no large queue
             // of pending embeds builds up if the DB write side stalls.
-            /// (ts, embedding) pairs for a video's sampled frames, or a
+            /// A video's sampled frames (embedding + measured motion), or a
             /// display-ready reason the whole video was skipped.
-            type FrameReply = oneshot::Sender<Result<Vec<(f64, Vec<f32>)>, String>>;
+            type FrameReply = oneshot::Sender<Result<Vec<eidetic_db::NewFrame>, String>>;
             enum EmbedJob {
                 Image(PathBuf, oneshot::Sender<eidetic_ml::Result<Vec<f32>>>),
-                // Sampled timestamps in, (ts, embedding) pairs out. Frame
-                // extraction runs on the worker too — it is subprocess-bound,
-                // and interleaving it with inference keeps one job in flight.
-                Video(PathBuf, Vec<f64>, FrameReply),
+                // Sampled timestamps (and the duration, for motion's
+                // companion frame) in, frames out. Frame extraction runs on
+                // the worker too — it is subprocess-bound, and interleaving
+                // it with inference keeps one job in flight.
+                Video(PathBuf, Vec<f64>, Option<f64>, FrameReply),
             }
             let (job_tx, mut job_rx) = mpsc::channel::<EmbedJob>(1);
 
@@ -571,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
                         EmbedJob::Image(path, reply) => {
                             let _ = reply.send(embedder.embed(&path));
                         }
-                        EmbedJob::Video(path, timestamps, reply) => {
+                        EmbedJob::Video(path, timestamps, duration, reply) => {
                             // Frames that embedded stay embedded: a container
                             // whose tail is unreadable (truncated file, audio
                             // outlasting video) still contributes its good
@@ -586,10 +611,25 @@ async fn main() -> anyhow::Result<()> {
                                         f.ok_or_else(|| "ffmpeg disappeared mid-run".to_string())
                                     })
                                     .and_then(|frame| {
-                                        embedder.embed_image(&frame).map_err(|e| e.to_string())
+                                        let v = embedder
+                                            .embed_image(&frame)
+                                            .map_err(|e| e.to_string())?;
+                                        // An unmeasurable companion leaves
+                                        // motion NULL; it never fails the
+                                        // frame or reads as a still shot.
+                                        let motion = eidetic_ingest::motion::motion_at(
+                                            &path, &frame, ts, duration,
+                                        )
+                                        .ok()
+                                        .flatten();
+                                        Ok((v, motion))
                                     });
                                 match result {
-                                    Ok(v) => frames.push((ts, v)),
+                                    Ok((vector, motion)) => frames.push(eidetic_db::NewFrame {
+                                        ts_secs: ts,
+                                        vector,
+                                        motion,
+                                    }),
                                     Err(e) => first_err = first_err.or(Some(e)),
                                 }
                             }
@@ -686,7 +726,12 @@ async fn main() -> anyhow::Result<()> {
                 let timestamps = scene_timestamps(&repo, id, &path, duration).await?;
                 let (reply_tx, reply_rx) = oneshot::channel();
                 if job_tx
-                    .send(EmbedJob::Video(path.clone(), timestamps, reply_tx))
+                    .send(EmbedJob::Video(
+                        path.clone(),
+                        timestamps,
+                        duration,
+                        reply_tx,
+                    ))
                     .await
                     .is_err()
                 {
@@ -2042,6 +2087,68 @@ async fn reel_edit(
     println!("Rendering {}x{} @ 30fps…", proj.width, proj.height);
     project::render_project(&proj, &proj.render_target(false)).await?;
     println!("Wrote {}", proj.output.display());
+    Ok(())
+}
+
+/// `eidetic embed --backfill-motion`: measure motion for embedded video
+/// moments that have none, decoding each moment's frame and its companion.
+/// Embeddings are untouched and no model loads. A moment that still cannot
+/// be measured stays NULL (unknown) and is listed again next run.
+async fn backfill_motion_scores(repo: &eidetic_db::AssetsRepo) -> anyhow::Result<()> {
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        anyhow::bail!(
+            "motion backfill needs ffmpeg; install it (or set EIDETIC_FFMPEG_PATH) and re-run"
+        );
+    }
+    let backlog = repo
+        .fetch_motion_backlog()
+        .await
+        .context("failed to list unmeasured video moments")?;
+    if backlog.is_empty() {
+        println!("Every embedded video moment already has a motion score.");
+        return Ok(());
+    }
+    let total = backlog.len();
+    let (mut measured, mut unmeasurable) = (0usize, 0usize);
+    for (i, video) in backlog.into_iter().enumerate() {
+        let path = video.storage_path.clone();
+        let (duration, timestamps) = (video.duration_secs, video.timestamps.clone());
+        let results = tokio::task::spawn_blocking(move || {
+            timestamps
+                .into_iter()
+                .map(|ts| {
+                    let motion = eidetic_ingest::video::extract_frame(&path, ts)
+                        .ok()
+                        .flatten()
+                        .and_then(|frame| {
+                            eidetic_ingest::motion::motion_at(&path, &frame, ts, duration)
+                                .ok()
+                                .flatten()
+                        });
+                    (ts, motion)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .context("motion thread panicked")?;
+        let ok: Vec<(f64, f32)> = results
+            .iter()
+            .filter_map(|(ts, m)| m.map(|m| (*ts, m)))
+            .collect();
+        unmeasurable += results.len() - ok.len();
+        measured += ok.len();
+        repo.store_frame_motion(video.id, &ok)
+            .await
+            .context("failed to store motion scores")?;
+        println!(
+            "[{}/{total}] {} ({}/{} moment(s) measured)",
+            i + 1,
+            video.storage_path.display(),
+            ok.len(),
+            results.len()
+        );
+    }
+    println!("Done. Measured {measured} moment(s); {unmeasurable} left unknown.");
     Ok(())
 }
 

@@ -34,6 +34,11 @@ pub struct VideoProbe {
     /// Average frame rate of the video stream, e.g. 29.97. The OTIO export
     /// expresses clip ranges at each source's real rate.
     pub frame_rate: Option<f64>,
+    /// Clockwise display rotation from the stream's displaymatrix (0, 90,
+    /// 180 or 270); None without a video stream. ffmpeg applies it on
+    /// decode, so it describes the container, not the pixels: a phone
+    /// recording with orientation lock can still hold sideways content at 0.
+    pub rotation_cw: Option<u16>,
 }
 
 /// Locate a binary: `$env_var` override first, then trust `PATH`.
@@ -122,9 +127,10 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
         .flatten()
         .find(|s| s["codec_type"].as_str() == Some("video"));
 
-    let (video_codec, width, height, frame_rate) = match video_stream {
+    let (video_codec, width, height, frame_rate, rotation_cw) = match video_stream {
         Some(s) => {
-            let rotated = stream_rotation(s) % 180 != 0;
+            let rotation = stream_rotation(s);
+            let rotated = rotation % 180 != 0;
             let (w, h) = (s["width"].as_i64(), s["height"].as_i64());
             (
                 s["codec_name"].as_str().map(str::to_string),
@@ -135,9 +141,11 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
                     .or_else(|| s["r_frame_rate"].as_str())
                     .and_then(parse_rational)
                     .filter(|r| *r > 0.0),
+                // displaymatrix angles are counter-clockwise.
+                Some(((360 - rotation) % 360) as u16),
             )
         }
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
 
     let date_taken = tags["creation_time"]
@@ -160,6 +168,7 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
         latitude,
         longitude,
         frame_rate,
+        rotation_cw,
     }
 }
 
@@ -605,6 +614,11 @@ mod tests {
             (p.width, p.height),
             (Some(1080), Some(1920)),
             "portrait after rotation"
+        );
+        assert_eq!(
+            p.rotation_cw,
+            Some(90),
+            "-90 counter-clockwise = 90 clockwise"
         );
     }
 

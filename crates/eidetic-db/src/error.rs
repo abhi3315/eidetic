@@ -25,6 +25,16 @@ pub enum Error {
         detail: String,
     },
 
+    /// A caller tried to persist a quality signal outside its contract
+    /// (non-finite, or outside 0..1). Refused rather than clamped: a NaN
+    /// that became 0.0 would read as "measured still shot".
+    #[error("refusing to store {signal} = {value} for asset {asset}: expected a finite 0..1")]
+    InvalidSignal {
+        signal: &'static str,
+        value: f32,
+        asset: String,
+    },
+
     /// Every stored embedding was produced by a different model than the one
     /// answering the query. Ranking across models is meaningless, so this
     /// fails loudly instead of returning an empty page that looks like "your

@@ -170,7 +170,14 @@ impl ReelProject {
             self.slots.len()
         );
         for (i, slot) in self.slots.iter().enumerate() {
-            println!("  {:>2}. {}", i + 1, slot.describe());
+            let similar = match reel::similar_to(&self.slots, i) {
+                Some(v) if !v.is_empty() => {
+                    let v: Vec<String> = v.iter().map(usize::to_string).collect();
+                    format!(" [similar to {}]", v.join(", "))
+                }
+                _ => String::new(),
+            };
+            println!("  {:>2}. {}{similar}", i + 1, slot.describe());
         }
     }
 }
@@ -377,6 +384,7 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
     };
 
     let mut scenes = fetch_scenes(&repo, &results).await?;
+    let signals = load_signals(&repo, model_id, &result_keys(&results)).await?;
 
     // With audio: detect beats and sync cuts to them; the reel runs at most
     // as long as the track. A track with no stable tempo falls back to
@@ -492,6 +500,8 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
 
         let mut pairs = Vec::with_capacity(spans.len());
         let mut prev: Option<eidetic_core::AssetId> = None;
+        let mut span_signals = reel::Signals::default();
+        let mut placed: Vec<reel::MomentRef> = Vec::new();
         for ((start, end, text), emb) in spans.iter().zip(&embs) {
             let hits = repo
                 .search(
@@ -503,12 +513,11 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
                 )
                 .await
                 .context("voiceover search failed")?;
-            let chosen = hits
-                .iter()
-                .find(|h| Some(h.id) != prev)
-                .or_else(|| hits.first());
-            if let Some(hit) = chosen {
+            // Only this span's hits are new; placed moments are loaded.
+            extend_signals(&repo, model_id, &mut span_signals, &result_keys(&hits)).await?;
+            if let Some(hit) = choose_voiceover(&hits, prev, &placed, &span_signals) {
                 prev = Some(hit.id);
+                placed.push(reel::MomentRef::of_hit(hit));
                 pairs.push((end - start, hit.clone()));
             }
         }
@@ -533,12 +542,19 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
                 pool.rotate_left(k);
             }
             let mut slots = match &grid {
-                Some(g) => {
-                    reel::plan_synced(&pool, g, total, &config.paths.library_dir, &scenes, &focus)
-                }
-                None => reel::plan(&pool, total, &config.paths.library_dir, &scenes),
+                Some(g) => reel::plan_synced(
+                    &pool,
+                    g,
+                    total,
+                    &config.paths.library_dir,
+                    &scenes,
+                    &focus,
+                    &signals,
+                ),
+                None => reel::plan(&pool, total, &config.paths.library_dir, &scenes, &signals),
             };
             reel::restyle(&mut slots, v - 1);
+            finish_slots(&repo, model_id, &mut slots, &results).await?;
             anyhow::ensure!(
                 !slots.is_empty(),
                 "nothing in the library matches {:?} confidently enough for a reel",
@@ -557,14 +573,16 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         return Ok(projects);
     }
 
-    let slots = match (&voiceover_pairs, &grid) {
+    let mut slots = match (&voiceover_pairs, &grid) {
         (Some(pairs), _) => {
             // Framing and scene data for the chosen shots (they may not
             // overlap the prompt's search results).
             let chosen: Vec<SearchResult> = pairs.iter().map(|(_, r)| r.clone()).collect();
             focus.extend(framing_focus(config, &repo, &chosen).await?);
             scenes.extend(fetch_scenes(&repo, &chosen).await?);
-            reel::plan_assigned(pairs, &config.paths.library_dir, &scenes, &focus)
+            let mut slots = reel::plan_assigned(pairs, &config.paths.library_dir, &scenes, &focus);
+            finish_slots(&repo, model_id, &mut slots, &chosen).await?;
+            slots
         }
         (None, Some(g)) => reel::plan_synced(
             &results,
@@ -573,9 +591,19 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
             &config.paths.library_dir,
             &scenes,
             &focus,
+            &signals,
         ),
-        (None, None) => reel::plan(&results, total, &config.paths.library_dir, &scenes),
+        (None, None) => reel::plan(
+            &results,
+            total,
+            &config.paths.library_dir,
+            &scenes,
+            &signals,
+        ),
     };
+    if voiceover_pairs.is_none() {
+        finish_slots(&repo, model_id, &mut slots, &results).await?;
+    }
     anyhow::ensure!(
         !slots.is_empty(),
         "nothing in the library matches {:?} confidently enough for a reel",
@@ -664,6 +692,135 @@ async fn fetch_scenes(
         }
     }
     Ok(scenes)
+}
+
+/// Signal lookups for search hits: the matched frame of a video hit, the
+/// photo itself otherwise.
+fn result_keys(results: &[SearchResult]) -> Vec<reel::MomentRef> {
+    results.iter().map(reel::MomentRef::of_hit).collect()
+}
+
+/// Signal lookups for slots already on the timeline: a video slot's moment
+/// is the sampled frame nearest the middle of its span — which works for
+/// project files that never recorded the matched timestamp.
+fn slot_keys(slots: &[Slot]) -> Vec<reel::MomentRef> {
+    slots.iter().map(reel::MomentRef::of_slot).collect()
+}
+
+/// Stored quality signals for `refs` in one batched lookup, each kept under
+/// its own asset + moment (two moments of one video never share signals).
+/// Only embeddings whose stored identity is exactly `model_id` (the pinned
+/// id the query was embedded with) are compared; any other — another
+/// variant, or a legacy unpinned row — is a different similarity space, so
+/// it is dropped and counted on stderr, and a half-migrated library
+/// explains why near-duplicate checks went quiet.
+async fn load_signals(
+    repo: &AssetsRepo,
+    model_id: &str,
+    refs: &[reel::MomentRef],
+) -> Result<reel::Signals> {
+    let mut signals = reel::Signals::default();
+    extend_signals(repo, model_id, &mut signals, refs).await?;
+    Ok(signals)
+}
+
+/// [`load_signals`] into an existing set (voiceover grows one per span).
+async fn extend_signals(
+    repo: &AssetsRepo,
+    model_id: &str,
+    signals: &mut reel::Signals,
+    refs: &[reel::MomentRef],
+) -> Result<()> {
+    let keys: Vec<eidetic_db::MomentKey> = refs
+        .iter()
+        .map(|r| eidetic_db::MomentKey {
+            asset: r.asset,
+            at: r.at,
+        })
+        .collect();
+    let fetched = repo
+        .fetch_moment_signals(model_id, &keys)
+        .await
+        .context("failed to load quality signals")?;
+    let mut other_model = 0usize;
+    for (r, s) in refs.iter().zip(fetched) {
+        other_model += usize::from(s.other_model.is_some());
+        signals.insert(
+            *r,
+            reel::Moment {
+                frame: s.ts_secs,
+                embedding: s.embedding,
+                motion: s.motion,
+            },
+        );
+    }
+    if other_model > 0 {
+        eprintln!(
+            "{other_model} candidate(s) were embedded by a different model than {model_id}; \
+             near-duplicate checks skip them until `eidetic embed` re-embeds them."
+        );
+    }
+    Ok(())
+}
+
+/// Everything a planned cut list carries besides its shots: motion and
+/// repeat annotations read at each slot's own moment (one batched lookup),
+/// and probed geometry (the photo's original comes from `results`, for its
+/// EXIF rotation). Scarcity that forced a repeat in is reported, not hidden.
+async fn finish_slots(
+    repo: &AssetsRepo,
+    model_id: &str,
+    slots: &mut [Slot],
+    results: &[SearchResult],
+) -> Result<()> {
+    let signals = load_signals(repo, model_id, &slot_keys(slots)).await?;
+    reel::annotate(slots, &signals);
+    let originals: std::collections::HashMap<_, _> = results
+        .iter()
+        .map(|r| (r.id, r.storage_path.clone()))
+        .collect();
+    probe_geometry(slots, &originals).await?;
+    let repeats = slots
+        .iter()
+        .filter(|s| s.near_duplicates.as_ref().is_some_and(|d| !d.is_empty()))
+        .count();
+    if repeats > 0 {
+        eprintln!(
+            "{repeats} slot(s) are near-duplicates of another shot (not enough distinct \
+             candidates); see similar_to in the cut list."
+        );
+    }
+    Ok(())
+}
+
+/// Fill each slot's [`reel::Geometry`] from its files (ffprobe for videos,
+/// the image header + original's EXIF for photos). Per slot, never per
+/// library; runs off the async runtime.
+async fn probe_geometry(
+    slots: &mut [Slot],
+    originals: &std::collections::HashMap<eidetic_core::AssetId, PathBuf>,
+) -> Result<()> {
+    let work: Vec<(Slot, PathBuf)> = slots
+        .iter()
+        .map(|s| {
+            let original = originals
+                .get(&s.asset)
+                .cloned()
+                .unwrap_or_else(|| s.source.clone());
+            (s.clone(), original)
+        })
+        .collect();
+    let geometry = tokio::task::spawn_blocking(move || {
+        work.iter()
+            .map(|(s, o)| reel::probe_geometry(s, o))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("geometry probe thread panicked")?;
+    for (slot, g) in slots.iter_mut().zip(geometry) {
+        slot.geometry = g;
+    }
+    Ok(())
 }
 
 /// Face-aware framing data (goals-v0.7.md phase 1b): which assets have
@@ -767,6 +924,73 @@ pub enum EditOp {
     },
 }
 
+/// The swap winner among `hits` (search order), taken from the first
+/// non-empty tier, sharp before soft within each:
+///
+/// 1. an unused asset, distinct from every other slot;
+/// 2. a distinct moment of an asset already in the reel (another scene of
+///    a used video) — still no repeat on screen, and never the footage
+///    `replaced` is showing now;
+/// 3. an unused asset that repeats a scene already placed;
+/// 4. any positive hit.
+///
+/// "Distinct" = not the same footage and not a near-duplicate by stored
+/// embedding; a hit with no comparable embedding counts as distinct
+/// (unknown is not a repeat). A swap that hands back a shot already on
+/// screen — or a new file of the same scene — helps nobody, but a repeat
+/// beats giving up, and the refreshed similar_to annotation shows it.
+/// `sharp` is called lazily: it decodes pixels.
+pub(crate) fn choose_swap<'a>(
+    hits: &'a [SearchResult],
+    used: &std::collections::HashSet<eidetic_core::AssetId>,
+    others: &[reel::MomentRef],
+    replaced: reel::MomentRef,
+    signals: &reel::Signals,
+    sharp: impl Fn(&SearchResult) -> bool,
+) -> Option<&'a SearchResult> {
+    let positive = |h: &SearchResult| h.score > 0.0;
+    let fresh = |h: &SearchResult| positive(h) && !used.contains(&h.id);
+    // Moment-aware: the same footage as another slot is a repeat even when
+    // nothing about it is embedded.
+    let distinct = |h: &SearchResult| !signals.repeats_any(reel::MomentRef::of_hit(h), others);
+    let new_moment = |h: &SearchResult| {
+        positive(h) && distinct(h) && !signals.same_footage(reel::MomentRef::of_hit(h), replaced)
+    };
+    let tier = |ok: &dyn Fn(&SearchResult) -> bool| {
+        hits.iter()
+            .find(|h| ok(h) && sharp(h))
+            .or_else(|| hits.iter().find(|h| ok(h)))
+    };
+    tier(&|h| fresh(h) && distinct(h))
+        .or_else(|| tier(&new_moment))
+        .or_else(|| tier(&fresh))
+        .or_else(|| tier(&positive))
+}
+
+/// The shot for one narration span, from that span's hits (search order).
+/// Diversity only ever chooses among the semantically eligible hits — the
+/// same weak-tail rules as every planner ([`reel::strong_prefix`]) — so a
+/// relevant repeat always beats an unrelated alternative: eligible,
+/// distinct from every shot already placed and not the previous asset →
+/// eligible and not the previous asset → the best hit. Distinct = not the
+/// same footage and not within [`reel::NEAR_DUPLICATE`] by stored
+/// embedding; unknown embeddings count as distinct. Scarcity falls through
+/// to a repeat, which the finished cut list's similar_to then shows.
+pub(crate) fn choose_voiceover<'a>(
+    hits: &'a [SearchResult],
+    prev: Option<eidetic_core::AssetId>,
+    placed: &[reel::MomentRef],
+    signals: &reel::Signals,
+) -> Option<&'a SearchResult> {
+    let eligible = reel::strong_prefix(hits);
+    let not_prev = |h: &SearchResult| Some(h.id) != prev;
+    eligible
+        .iter()
+        .find(|h| not_prev(h) && !signals.repeats_any(reel::MomentRef::of_hit(h), placed))
+        .or_else(|| eligible.iter().find(|h| not_prev(h)))
+        .or_else(|| hits.first())
+}
+
 /// Apply a batch of ops to a project, in the documented fixed order:
 /// pin/unpin → retime → transition → swap → drop → reorder, every slot
 /// number meaning the ORIGINAL position. Pins apply first, so a batch that
@@ -839,8 +1063,10 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         );
     }
 
+    let mut retimed_video = false;
     for (i, secs) in retimes {
         let slot = &mut proj.slots[i];
+        retimed_video |= slot.kind == reel::SlotKind::Video;
         let mut secs = secs;
         // Clamp a video to the media past its in-point; a shortened file
         // would silently desync everything after it.
@@ -867,7 +1093,20 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         proj.slots[i].transition_in = t;
     }
 
-    if !swaps.is_empty() {
+    // A retime moves a video slot's midpoint — the moment its motion and
+    // similar_to are read at — and a swap changes which shots repeat, so
+    // either one re-annotates the whole list once, after the swaps.
+    let repo = if retimed_video || !swaps.is_empty() {
+        Some(AssetsRepo::new(
+            eidetic_db::connect(config)
+                .await
+                .context("failed to connect to database")?,
+        ))
+    } else {
+        None
+    };
+
+    if let Some(repo) = repo.as_ref().filter(|_| !swaps.is_empty()) {
         for (i, _) in &swaps {
             anyhow::ensure!(
                 !proj.slots[*i].pinned,
@@ -891,10 +1130,6 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         .context("embedder thread panicked")?
         .context("failed to embed swap queries")?;
 
-        let pool = eidetic_db::connect(config)
-            .await
-            .context("failed to connect to database")?;
-        let repo = AssetsRepo::new(pool);
         let mut used: std::collections::HashSet<eidetic_core::AssetId> =
             proj.slots.iter().map(|s| s.asset).collect();
 
@@ -904,28 +1139,36 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
                     query,
                     emb,
                     model_id,
-                    10,
+                    20,
                     &eidetic_db::SearchFilters::default(),
                 )
                 .await
                 .context("swap search failed")?;
-            // Prefer something not already in the reel and sharp enough; a
-            // swap that hands back a shot the user is looking at (or a
-            // blurry one) helps nobody. Degrade gracefully: unused beats
-            // sharp beats give-up.
-            let lib = config.paths.library_dir.clone();
-            let hit = hits
+            // Near-duplicate screening compares each hit's matched moment
+            // with every OTHER slot as it stands now (earlier swaps in this
+            // batch included; the slot being replaced excluded).
+            let others: Vec<Slot> = proj
+                .slots
                 .iter()
-                .find(|h| {
-                    h.score > 0.0
-                        && !used.contains(&h.id)
-                        && reel::sharp_enough(h, &lib, reel::MIN_SHARPNESS)
-                })
-                .or_else(|| hits.iter().find(|h| h.score > 0.0 && !used.contains(&h.id)))
-                .or_else(|| hits.iter().find(|h| h.score > 0.0))
-                .with_context(|| format!("nothing in the library matches {query:?}"))?;
-            let scenes = fetch_scenes(&repo, std::slice::from_ref(hit)).await?;
-            let focus = framing_focus(config, &repo, std::slice::from_ref(hit)).await?;
+                .enumerate()
+                .filter(|(j, _)| j != i)
+                .map(|(_, s)| s.clone())
+                .collect();
+            // Keys carry asset + moment, so a hit from video A at 20s and a
+            // slot of A at 2s keep their own signals.
+            let other_moments = slot_keys(&others);
+            let replaced = reel::MomentRef::of_slot(&proj.slots[*i]);
+            let mut keys = result_keys(&hits);
+            keys.extend(other_moments.iter().copied());
+            keys.push(replaced);
+            let signals = load_signals(repo, model_id, &keys).await?;
+            let lib = config.paths.library_dir.clone();
+            let hit = choose_swap(&hits, &used, &other_moments, replaced, &signals, |h| {
+                reel::sharp_enough(h, &lib, reel::MIN_SHARPNESS)
+            })
+            .with_context(|| format!("nothing in the library matches {query:?}"))?;
+            let scenes = fetch_scenes(repo, std::slice::from_ref(hit)).await?;
+            let focus = framing_focus(config, repo, std::slice::from_ref(hit)).await?;
             let old = &proj.slots[*i];
             let mut slot = reel::fill_span(
                 hit,
@@ -937,10 +1180,23 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
             // A swap replaces the footage, not the edit decision: the
             // slot keeps its joint (and its length, above).
             slot.transition_in = old.transition_in;
+            let mut geometry_for = std::collections::HashMap::new();
+            geometry_for.insert(hit.id, hit.storage_path.clone());
+            probe_geometry(std::slice::from_mut(&mut slot), &geometry_for).await?;
             used.insert(slot.asset);
             eprintln!("slot {}: {} -> {}", i + 1, old.describe(), slot.describe());
             proj.slots[*i] = slot;
         }
+    }
+
+    // Every slot is re-annotated, pinned ones included: their footage is
+    // untouched, but what repeats them (and, after a retime, the moment
+    // their motion describes) may have changed.
+    if let Some(repo) = &repo {
+        let (model_id, _dim) =
+            eidetic_ml::active_model().context("failed to resolve the active embedding model")?;
+        let signals = load_signals(repo, model_id, &slot_keys(&proj.slots)).await?;
+        reel::annotate(&mut proj.slots, &signals);
     }
 
     // Drops and the reorder both work over ORIGINAL indices: the reorder
@@ -1004,6 +1260,9 @@ mod tests {
             score: 0.31,
             pinned: true,
             transition_in: Transition::Crossfade { secs: 0.5 },
+            motion: None,
+            geometry: None,
+            near_duplicates: None,
         }
     }
 
@@ -1659,6 +1918,386 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(assets(&p), vec![a[3], a[0], a[2]]);
+    }
+
+    /// Retiming a video slot moves its midpoint — the moment its motion
+    /// and similar_to are read at. Against a real temporary SQLite library
+    /// (video V: beach at 2s, forest at 20s; photo P: the beach again), a
+    /// retime alone, with no swap in the batch, must re-read both.
+    #[tokio::test]
+    async fn retime_refreshes_moment_annotations_without_a_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let repo = AssetsRepo::new(eidetic_db::connect(&config).await.unwrap());
+        let (model_id, _) = eidetic_ml::active_model().unwrap();
+        let insert = |n: u8, mime: &str| {
+            let asset = eidetic_db::NewAsset {
+                hash: format!("{n:02x}").repeat(32),
+                original_filename: format!("f{n}"),
+                storage_path: dir.path().join(format!("f{n}")),
+                file_size: 1,
+                mime_type: Some(mime.to_string()),
+                date_taken: None,
+                latitude: None,
+                longitude: None,
+                camera_make: None,
+                camera_model: None,
+                lens_make: None,
+                lens_model: None,
+                focal_length: None,
+                focal_length_35mm: None,
+                aperture: None,
+                shutter: None,
+                iso: None,
+                orientation: None,
+                altitude: None,
+                gps_direction: None,
+                exif_raw: None,
+                country_code: None,
+                country_name: None,
+                admin1: None,
+                place: None,
+                place_distance_m: None,
+                thumbnails_generated: false,
+                duration_secs: mime.starts_with("video/").then_some(60.0),
+                video_codec: None,
+                pixel_width: None,
+                pixel_height: None,
+            };
+            let repo = &repo;
+            async move {
+                match repo.insert_asset(asset).await.unwrap() {
+                    eidetic_db::InsertOutcome::Inserted(id) => id,
+                    eidetic_db::InsertOutcome::Existing(_) => panic!("fresh database"),
+                }
+            }
+        };
+        let video = insert(1, "video/mp4").await;
+        let photo = insert(2, "image/jpeg").await;
+        let frame = |ts: f64, vector: Vec<f32>, motion: f32| eidetic_db::NewFrame {
+            ts_secs: ts,
+            vector,
+            motion: Some(motion),
+        };
+        repo.store_frame_embeddings(
+            video,
+            &[
+                frame(2.0, vec![1.0, 0.0], 0.1),
+                frame(20.0, vec![0.0, 1.0], 0.7),
+            ],
+            model_id,
+        )
+        .await
+        .unwrap();
+        repo.store_embedding(photo, &[0.99, 0.05], model_id)
+            .await
+            .unwrap();
+
+        let mut p = four();
+        p.slots.truncate(2);
+        // Slot 1: V from 1s for 2s (midpoint 2s, the beach). The source
+        // does not exist, so the retime clamp cannot probe it.
+        p.slots[0] = Slot {
+            asset: video,
+            source: dir.path().join("missing.mp4"),
+            kind: SlotKind::Video,
+            start: 1.0,
+            duration: 2.0,
+            ..p.slots[0].clone()
+        };
+        p.slots[1].asset = photo;
+        let ops = |v| serde_json::from_value::<Vec<EditOp>>(v).unwrap();
+
+        // Retime to 38s: midpoint 1 + 19 = 20s, the forest.
+        apply_ops(
+            &mut p,
+            &ops(serde_json::json!([{"op": "retime", "slot": 1, "secs": 38.0}])),
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(p.slots[0].motion, Some(0.7), "motion of the new midpoint");
+        assert_eq!(reel::similar_to(&p.slots, 0), Some(vec![]));
+        assert_eq!(
+            reel::similar_to(&p.slots, 1),
+            Some(vec![]),
+            "the photo no longer repeats the video"
+        );
+
+        // And back to 2s: the beach again, which the photo repeats.
+        apply_ops(
+            &mut p,
+            &ops(serde_json::json!([{"op": "retime", "slot": 1, "secs": 2.0}])),
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(p.slots[0].motion, Some(0.1));
+        assert_eq!(reel::similar_to(&p.slots, 0), Some(vec![2]));
+        assert_eq!(reel::similar_to(&p.slots, 1), Some(vec![1]));
+    }
+
+    // -- swap candidate selection (deterministic vectors) --------------------
+
+    fn result(score: f32) -> SearchResult {
+        SearchResult {
+            id: AssetId::new(),
+            storage_path: PathBuf::from("/x"),
+            score,
+            frame_ts: None,
+            duration_secs: None,
+            speech: None,
+            mime_type: None,
+            file_size: 0,
+            thumbnails_generated: false,
+            date_taken: None,
+            camera_make: None,
+            camera_model: None,
+            latitude: None,
+            longitude: None,
+        }
+    }
+
+    fn photo_ref(id: AssetId) -> reel::MomentRef {
+        reel::MomentRef {
+            asset: id,
+            at: None,
+        }
+    }
+
+    /// (moment, resolved frame, embedding) for one stored moment.
+    type StoredMoment = (reel::MomentRef, Option<f64>, Option<[f32; 2]>);
+
+    fn with_embeddings(pairs: &[StoredMoment]) -> reel::Signals {
+        let mut s = reel::Signals::default();
+        for (at, frame, e) in pairs {
+            s.insert(
+                *at,
+                reel::Moment {
+                    frame: *frame,
+                    embedding: e.map(|v| v.to_vec()),
+                    motion: None,
+                },
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn swap_skips_new_files_of_a_scene_already_in_the_reel() {
+        let on_screen = photo_ref(AssetId::new());
+        let hits = vec![result(0.5), result(0.4), result(0.3)];
+        let sig = with_embeddings(&[
+            (on_screen, None, Some([1.0, 0.0])),
+            (photo_ref(hits[0].id), None, Some([0.99, 0.05])), // same scene
+            (photo_ref(hits[1].id), None, Some([0.0, 1.0])),
+            (photo_ref(hits[2].id), None, None), // unknown: not a repeat
+        ]);
+        // The slot being swapped out is some other photo.
+        let replaced = photo_ref(AssetId::new());
+        let used = std::collections::HashSet::from([on_screen.asset, replaced.asset]);
+        let others = [on_screen];
+        let pick = choose_swap(&hits, &used, &others, replaced, &sig, |_| true).unwrap();
+        assert_eq!(pick.id, hits[1].id);
+
+        // Sharpness still ranks within the distinct tier.
+        let pick = choose_swap(&hits, &used, &others, replaced, &sig, |h| {
+            h.id != hits[1].id
+        })
+        .unwrap();
+        assert_eq!(pick.id, hits[2].id);
+
+        // Scarcity: only the repeat is left, so it is used rather than
+        // failing the swap.
+        let pick = choose_swap(&hits[..1], &used, &others, replaced, &sig, |_| true).unwrap();
+        assert_eq!(pick.id, hits[0].id);
+        assert!(choose_swap(&[result(0.0)], &used, &[], replaced, &sig, |_| true).is_none());
+    }
+
+    /// A hit from video A at 20s must not overwrite the signals of the
+    /// slot showing A at 2s: the beach-again candidate is compared with the
+    /// beach slot, not with A's forest moment.
+    #[test]
+    fn swap_compares_candidates_with_each_slots_own_moment() {
+        let a = AssetId::new();
+        let mut a_hit = result(0.6);
+        a_hit.id = a;
+        a_hit.frame_ts = Some(20.0);
+        let beach_again = result(0.5);
+        let city = result(0.4);
+        let hits = vec![a_hit.clone(), beach_again.clone(), city.clone()];
+        let a_slot = reel::MomentRef {
+            asset: a,
+            at: Some(2.0),
+        };
+        // Hits first, then the slot — the load order swaps use.
+        let sig = with_embeddings(&[
+            (
+                reel::MomentRef::of_hit(&a_hit),
+                Some(20.0),
+                Some([0.0, 1.0]),
+            ),
+            (photo_ref(beach_again.id), None, Some([0.99, 0.05])),
+            (photo_ref(city.id), None, Some([0.6, -0.8])),
+            (a_slot, Some(2.0), Some([1.0, 0.0])),
+        ]);
+        assert!(sig.repeats(photo_ref(beach_again.id), a_slot));
+        let replaced = photo_ref(AssetId::new());
+        let used = std::collections::HashSet::from([a, replaced.asset]);
+        let pick = choose_swap(&hits, &used, &[a_slot], replaced, &sig, |_| true).unwrap();
+        assert_eq!(pick.id, city.id);
+    }
+
+    /// With no fresh distinct candidate, another scene of a video already in
+    /// the reel (A at 20s, a forest) beats a fresh file repeating the beach
+    /// A shows at 2s; sharpness still orders that tier; the footage being
+    /// swapped out is never handed back as "distinct".
+    #[test]
+    fn swap_prefers_a_distinct_moment_of_a_used_video_over_a_repeat() {
+        let a = AssetId::new();
+        let moment = |ts: f64, score: f32| {
+            let mut h = result(score);
+            h.id = a;
+            h.frame_ts = Some(ts);
+            h
+        };
+        let (a20, a30) = (moment(20.0, 0.6), moment(30.0, 0.55));
+        let beach_again = result(0.5);
+        let a_slot = reel::MomentRef {
+            asset: a,
+            at: Some(2.0),
+        };
+        let sig = with_embeddings(&[
+            (reel::MomentRef::of_hit(&a20), Some(20.0), Some([0.0, 1.0])),
+            (reel::MomentRef::of_hit(&a30), Some(30.0), Some([0.6, -0.8])),
+            (photo_ref(beach_again.id), None, Some([0.99, 0.05])),
+            (a_slot, Some(2.0), Some([1.0, 0.0])),
+        ]);
+        let replaced = photo_ref(AssetId::new());
+        let used = std::collections::HashSet::from([a, replaced.asset]);
+        let hits = vec![beach_again.clone(), a20.clone(), a30.clone()];
+        let pick = choose_swap(&hits, &used, &[a_slot], replaced, &sig, |_| true).unwrap();
+        assert_eq!(
+            (pick.id, pick.frame_ts),
+            (a, Some(20.0)),
+            "the forest, not beach again"
+        );
+
+        // Sharp before soft inside the distinct-moment tier, and still
+        // ahead of the sharp fresh repeat.
+        let pick = choose_swap(&hits, &used, &[a_slot], replaced, &sig, |h| {
+            h.frame_ts != Some(20.0)
+        })
+        .unwrap();
+        assert_eq!(pick.frame_ts, Some(30.0));
+
+        // Swapping out A@20s itself: that footage is not a new moment, so
+        // the fresh repeat wins over handing the same shot back.
+        let replaced = reel::MomentRef {
+            asset: a,
+            at: Some(20.0),
+        };
+        let pick = choose_swap(&hits[..2], &used, &[a_slot], replaced, &sig, |_| true).unwrap();
+        assert_eq!(pick.id, beach_again.id);
+    }
+
+    /// Swapping B in [A, B] when A is the only positive hit yields A twice,
+    /// and the refreshed annotation says so instead of reporting nothing.
+    #[test]
+    fn same_asset_scarcity_is_annotated_not_silent() {
+        let mut p = four();
+        p.slots.truncate(2);
+        let a = p.slots[0].clone();
+        let mut hit_a = result(0.5);
+        hit_a.id = a.asset;
+        let used: std::collections::HashSet<_> = p.slots.iter().map(|s| s.asset).collect();
+        let others = [reel::MomentRef::of_slot(&a)];
+        let replaced = reel::MomentRef::of_slot(&p.slots[1]);
+        let sig = reel::Signals::default();
+        let pick = choose_swap(
+            std::slice::from_ref(&hit_a),
+            &used,
+            &others,
+            replaced,
+            &sig,
+            |_| true,
+        )
+        .expect("a repeat beats giving up");
+        assert_eq!(pick.id, a.asset);
+
+        p.slots[1] = Slot {
+            transition_in: p.slots[1].transition_in,
+            ..a.clone()
+        };
+        reel::annotate(&mut p.slots, &sig);
+        assert_eq!(reel::similar_to(&p.slots, 0), Some(vec![2]));
+        assert_eq!(reel::similar_to(&p.slots, 1), Some(vec![1]));
+    }
+
+    #[test]
+    fn voiceover_prefers_a_distinct_scene_and_repeats_only_when_it_must() {
+        let placed_beach = result(0.5);
+        let beach_again = result(0.45);
+        let forest = result(0.3);
+        let sig = with_embeddings(&[
+            (photo_ref(placed_beach.id), None, Some([1.0, 0.0])),
+            (photo_ref(beach_again.id), None, Some([0.99, 0.05])),
+            (photo_ref(forest.id), None, Some([0.0, 1.0])),
+        ]);
+        let placed = [photo_ref(placed_beach.id)];
+        let hits = vec![beach_again.clone(), forest.clone()];
+        let pick = choose_voiceover(&hits, Some(placed_beach.id), &placed, &sig).unwrap();
+        assert_eq!(pick.id, forest.id, "another file of the beach loses");
+
+        // Scarcity: only the repeat matches this span, so it is used.
+        let hits = vec![beach_again.clone()];
+        let pick = choose_voiceover(&hits, Some(placed_beach.id), &placed, &sig).unwrap();
+        assert_eq!(pick.id, beach_again.id);
+        // Never the previous shot while anything else exists.
+        let hits = vec![placed_beach.clone(), beach_again.clone()];
+        let pick = choose_voiceover(&hits, Some(placed_beach.id), &placed, &sig).unwrap();
+        assert_eq!(pick.id, beach_again.id);
+    }
+
+    /// Diversity never abandons the narration query: a relevant repeat of
+    /// the beach beats a distinct but unrelated shot that scores zero,
+    /// negative, or below the weak-tail floor (35% of the span's best).
+    #[test]
+    fn voiceover_keeps_a_relevant_repeat_over_unrelated_alternatives() {
+        let placed_beach = result(0.5);
+        let placed = [photo_ref(placed_beach.id)];
+        for unrelated_score in [0.0, -0.1, 0.1] {
+            let beach_again = result(0.45);
+            let unrelated = result(unrelated_score);
+            let sig = with_embeddings(&[
+                (photo_ref(placed_beach.id), None, Some([1.0, 0.0])),
+                (photo_ref(beach_again.id), None, Some([0.99, 0.05])),
+                (photo_ref(unrelated.id), None, Some([0.0, 1.0])),
+            ]);
+            let hits = vec![beach_again.clone(), unrelated.clone()];
+            let pick = choose_voiceover(&hits, Some(placed_beach.id), &placed, &sig).unwrap();
+            assert_eq!(
+                pick.id, beach_again.id,
+                "a {unrelated_score} alternative must not beat the relevant repeat"
+            );
+
+            // Even the previous shot itself beats an ineligible alternative.
+            let hits = vec![placed_beach.clone(), unrelated.clone()];
+            let pick = choose_voiceover(&hits, Some(placed_beach.id), &placed, &sig).unwrap();
+            assert_eq!(pick.id, placed_beach.id, "{unrelated_score}");
+        }
+
+        // A distinct shot inside the floor still wins over the repeat.
+        let beach_again = result(0.45);
+        let forest = result(0.2);
+        let sig = with_embeddings(&[
+            (photo_ref(placed_beach.id), None, Some([1.0, 0.0])),
+            (photo_ref(beach_again.id), None, Some([0.99, 0.05])),
+            (photo_ref(forest.id), None, Some([0.0, 1.0])),
+        ]);
+        let hits = vec![beach_again, forest.clone()];
+        let pick = choose_voiceover(&hits, Some(placed_beach.id), &placed, &sig).unwrap();
+        assert_eq!(pick.id, forest.id);
     }
 
     #[test]

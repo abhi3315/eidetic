@@ -431,7 +431,12 @@ async fn legacy_rows_never_rank_under_a_pinned_model_id() {
     repo.store_embedding(photo, &v, LEGACY)
         .await
         .expect("legacy photo");
-    repo.store_frame_embeddings(video, &[(1.0, v.clone())], LEGACY)
+    let frame = eidetic_db::NewFrame {
+        ts_secs: 1.0,
+        vector: v.clone(),
+        motion: None,
+    };
+    repo.store_frame_embeddings(video, &[frame], LEGACY)
         .await
         .expect("legacy frames");
 

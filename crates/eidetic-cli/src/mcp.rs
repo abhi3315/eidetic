@@ -382,7 +382,7 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Plan a reel from a prompt: search, quality-gate, beat-sync (with audio), assign shots. Writes a project file per plan and returns the cut list(s) — nothing is rendered yet. Iterate with edit_reel, then call render."
+        description = "Plan a reel from a prompt: search, quality-gate, beat-sync (with audio), assign shots (high-energy spans prefer measured motion; near-duplicate scenes are held back). Writes a project file per plan and returns the cut list(s) — nothing is rendered yet; each slot carries motion, similar_to and geometry fields explained in the cut list's signals note. Iterate with edit_reel, then call render."
     )]
     async fn create_reel(
         &self,
@@ -710,8 +710,9 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
         "audio": proj.audio,
         "bpm": proj.grid.as_ref().map(|g| round2(g.bpm)),
         "beat_grid": proj.grid.as_ref().map(grid_provenance),
+        "signals": SIGNALS_NOTE,
         "slots": proj.slots.iter().enumerate().map(|(i, s)| {
-            json!({
+            let mut slot = json!({
                 "n": i + 1,
                 "asset": s.asset.to_string(),
                 "source": s.source,
@@ -721,7 +722,27 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
                 "score": round2(s.score as f64),
                 "pinned": s.pinned,
                 "transition_in": transition_spec(s.transition_in),
-            })
+                "similar_to": reel::similar_to(&proj.slots, i),
+            });
+            let o = slot.as_object_mut().expect("slot is an object literal");
+            // Photos carry no motion key at all: a still is not a
+            // zero-motion video. null = a video nobody measured.
+            if s.kind == reel::SlotKind::Video {
+                o.insert(
+                    "motion".into(),
+                    json!(s.motion.map(|m| (m as f64 * 1000.0).round() / 1000.0)),
+                );
+            }
+            if let Some(g) = s.geometry {
+                o.insert("width".into(), json!(g.width));
+                o.insert("height".into(), json!(g.height));
+                o.insert("rotation_cw".into(), json!(g.rotation_cw));
+                o.insert("rotation_applied".into(), json!(g.rotation_applied));
+                if g.may_render_sideways() {
+                    o.insert("may_render_sideways".into(), json!(true));
+                }
+            }
+            slot
         }).collect::<Vec<_>>(),
     })
 }
@@ -736,6 +757,12 @@ fn grid_provenance(g: &eidetic_ingest::beats::BeatGrid) -> Value {
         "fallback": g.fallback,
     })
 }
+
+/// How to read the per-slot quality fields; sent with every cut list so an
+/// agent never mistakes a heuristic for a measurement it is not.
+const SIGNALS_NOTE: &str = "motion (videos only): mean pixel change between the matched frame and one 0.2s later, 0..1, uncalibrated — compare slots, don't threshold; null = not measured. \
+     similar_to: other slots that repeat this one — the same footage (same photo, or the same moment of the same video) or a near-duplicate stored embedding (same scene, maybe a different file); null = could not be checked. \
+     width/height/rotation_cw come from file metadata: they can flag a rotation the render will not apply (may_render_sideways), but rotation 0 does not prove the picture is upright.";
 
 fn slot_kind(k: reel::SlotKind) -> &'static str {
     match k {

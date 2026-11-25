@@ -208,6 +208,61 @@ pub struct AssetDetail {
     pub playback_path: Option<PathBuf>,
 }
 
+/// One sampled video frame to persist: where it was sampled, its embedding,
+/// and the motion measured there (`None` = not measured, stored as NULL).
+#[derive(Debug, Clone)]
+pub struct NewFrame {
+    pub ts_secs: f64,
+    pub vector: Vec<f32>,
+    pub motion: Option<f32>,
+}
+
+/// A video whose embedded moments lack motion (see
+/// [`AssetsRepo::fetch_motion_backlog`]).
+#[derive(Debug)]
+pub struct MotionBacklog {
+    pub id: AssetId,
+    pub storage_path: PathBuf,
+    pub duration_secs: Option<f64>,
+    pub timestamps: Vec<f64>,
+}
+
+/// Which stored moment to read signals for: a photo (`at: None`) or the
+/// video frame nearest `at` seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct MomentKey {
+    pub asset: AssetId,
+    pub at: Option<f64>,
+}
+
+/// What the library knows about one moment (see
+/// [`AssetsRepo::fetch_moment_signals`]). The default — everything `None` —
+/// is "no stored row at all".
+#[derive(Debug, Clone, Default)]
+pub struct MomentSignals {
+    /// The sampled frame the signals came from; None for photos.
+    pub ts_secs: Option<f64>,
+    /// The embedding, only when the active model produced it.
+    pub embedding: Option<Vec<f32>>,
+    /// Set when a row exists but another model produced it.
+    pub other_model: Option<String>,
+    /// Measured motion in 0..1; None for photos and unmeasured moments.
+    pub motion: Option<f32>,
+}
+
+fn check_motion(id: AssetId, motion: Option<f32>) -> crate::Result<()> {
+    match motion {
+        Some(m) if !(m.is_finite() && (0.0..=1.0).contains(&m)) => {
+            Err(crate::Error::InvalidSignal {
+                signal: "motion",
+                value: m,
+                asset: id_text(id),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// UUIDs are stored as lowercase hyphenated TEXT so the database stays
 /// readable from the `sqlite3` CLI.
 fn id_text(id: AssetId) -> String {
@@ -492,35 +547,212 @@ impl AssetsRepo {
 
     /// Replace a video's sampled-frame embeddings in one transaction
     /// (delete + insert), so re-embedding is idempotent like
-    /// [`Self::store_embedding`].
+    /// [`Self::store_embedding`]. Each frame's motion is stored as given:
+    /// `None` stays NULL ("not measured"), and a non-finite or out-of-range
+    /// value is refused before anything is written.
     pub async fn store_frame_embeddings(
         &self,
         id: AssetId,
-        frames: &[(f64, Vec<f32>)],
+        frames: &[NewFrame],
         model_id: &str,
     ) -> crate::Result<()> {
+        for f in frames {
+            check_motion(id, f.motion)?;
+        }
         let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
         sqlx::query("DELETE FROM frame_embeddings WHERE asset_id = ?")
             .bind(id_text(id))
             .execute(&mut *tx)
             .await
             .map_err(crate::Error::Query)?;
-        for (ts, vector) in frames {
+        for f in frames {
             sqlx::query(
-                "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector, model_id) \
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector, model_id, motion) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(id_text(id))
-            .bind(ts)
-            .bind(vector.len() as i64)
-            .bind(vector::encode(vector))
+            .bind(f.ts_secs)
+            .bind(f.vector.len() as i64)
+            .bind(vector::encode(&f.vector))
             .bind(model_id)
+            .bind(f.motion)
             .execute(&mut *tx)
             .await
             .map_err(crate::Error::Query)?;
         }
         tx.commit().await.map_err(crate::Error::Query)?;
         Ok(())
+    }
+
+    /// Every video with at least one embedded moment whose motion was never
+    /// measured (rows from before migration 011, or a companion frame that
+    /// failed to decode): the input to `eidetic embed --backfill-motion`.
+    /// Only the unmeasured timestamps are listed, ascending.
+    pub async fn fetch_motion_backlog(&self) -> crate::Result<Vec<MotionBacklog>> {
+        let rows: Vec<(String, String, Option<f64>, f64)> = sqlx::query_as(
+            "SELECT f.asset_id, a.storage_path, a.duration_secs, f.ts_secs \
+             FROM frame_embeddings f JOIN assets a ON a.id = f.asset_id \
+             WHERE f.motion IS NULL \
+             ORDER BY f.asset_id, f.ts_secs",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::Error::Query)?;
+        let mut out: Vec<MotionBacklog> = Vec::new();
+        for (id, path, duration_secs, ts) in rows {
+            let id = parse_id(&id);
+            match out.last_mut() {
+                Some(last) if last.id == id => last.timestamps.push(ts),
+                _ => out.push(MotionBacklog {
+                    id,
+                    storage_path: PathBuf::from(path),
+                    duration_secs,
+                    timestamps: vec![ts],
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set measured motion on existing moments without touching their
+    /// embeddings. Moments not listed keep what they had.
+    pub async fn store_frame_motion(
+        &self,
+        id: AssetId,
+        measured: &[(f64, f32)],
+    ) -> crate::Result<()> {
+        for (_, m) in measured {
+            check_motion(id, Some(*m))?;
+        }
+        let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
+        for (ts, m) in measured {
+            sqlx::query(
+                "UPDATE frame_embeddings SET motion = ? WHERE asset_id = ? AND ts_secs = ?",
+            )
+            .bind(m)
+            .bind(id_text(id))
+            .bind(ts)
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::Error::Query)?;
+        }
+        tx.commit().await.map_err(crate::Error::Query)?;
+        Ok(())
+    }
+
+    /// Stored signals for a batch of moments — one query per table for the
+    /// whole batch, however many moments are asked about.
+    ///
+    /// A key with `at: None` is a photo (its row in `embeddings`); with
+    /// `at: Some(t)` it is the video moment nearest `t` among the asset's
+    /// sampled frames. Results are aligned with `keys`.
+    ///
+    /// Embeddings are returned only when produced by `model_id`: a vector
+    /// from another model lives in a different similarity space, so it comes
+    /// back as `embedding: None` with its model named in `other_model`,
+    /// never silently compared. Vectors holding non-finite values are
+    /// treated the same as absent.
+    pub async fn fetch_moment_signals(
+        &self,
+        model_id: &str,
+        keys: &[MomentKey],
+    ) -> crate::Result<Vec<MomentSignals>> {
+        let mut ids: Vec<AssetId> = keys.iter().map(|k| k.asset).collect();
+        ids.sort_unstable_by_key(|id| id.as_uuid());
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "SELECT asset_id, vector, model_id FROM embeddings WHERE asset_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, Vec<u8>, Option<String>)>(&sql);
+        for id in &ids {
+            q = q.bind(id_text(*id));
+        }
+        let images: std::collections::HashMap<AssetId, (Vec<u8>, Option<String>)> = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?
+            .into_iter()
+            .map(|(id, blob, model)| (parse_id(&id), (blob, model)))
+            .collect();
+
+        let sql = format!(
+            "SELECT asset_id, ts_secs, vector, model_id, motion FROM frame_embeddings \
+             WHERE asset_id IN ({placeholders}) ORDER BY asset_id, ts_secs"
+        );
+        type FrameRow = (String, f64, Vec<u8>, Option<String>, Option<f64>);
+        let mut q = sqlx::query_as::<_, FrameRow>(&sql);
+        for id in &ids {
+            q = q.bind(id_text(*id));
+        }
+        let mut frames: std::collections::HashMap<AssetId, Vec<FrameRow>> =
+            std::collections::HashMap::new();
+        for row in q.fetch_all(&self.pool).await.map_err(crate::Error::Query)? {
+            frames.entry(parse_id(&row.0)).or_default().push(row);
+        }
+
+        let embedding = |table: &'static str,
+                         id: AssetId,
+                         blob: &[u8],
+                         model: Option<&str>|
+         -> crate::Result<(Option<Vec<f32>>, Option<String>)> {
+            if model != Some(model_id) {
+                return Ok((None, Some(model.unwrap_or("unknown").to_string())));
+            }
+            let v = vector::decode(blob).ok_or_else(|| crate::Error::CorruptRow {
+                table,
+                column: "vector",
+                detail: format!("asset {}: ragged blob", id_text(id)),
+            })?;
+            Ok((v.iter().all(|x| x.is_finite()).then_some(v), None))
+        };
+
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let signals = match key.at {
+                None => match images.get(&key.asset) {
+                    Some((blob, model)) => {
+                        let (embedding, other_model) =
+                            embedding("embeddings", key.asset, blob, model.as_deref())?;
+                        MomentSignals {
+                            ts_secs: None,
+                            embedding,
+                            other_model,
+                            motion: None,
+                        }
+                    }
+                    None => MomentSignals::default(),
+                },
+                Some(at) => match frames.get(&key.asset).and_then(|rows| {
+                    rows.iter()
+                        .min_by(|a, b| (a.1 - at).abs().total_cmp(&(b.1 - at).abs()))
+                }) {
+                    Some((_, ts, blob, model, motion)) => {
+                        let (embedding, other_model) =
+                            embedding("frame_embeddings", key.asset, blob, model.as_deref())?;
+                        MomentSignals {
+                            ts_secs: Some(*ts),
+                            embedding,
+                            other_model,
+                            // The CHECK constraint bounds stored values;
+                            // this guards a hand-edited database.
+                            motion: motion
+                                .map(|m| m as f32)
+                                .filter(|m| m.is_finite() && (0.0..=1.0).contains(m)),
+                        }
+                    }
+                    None => MomentSignals::default(),
+                },
+            };
+            out.push(signals);
+        }
+        Ok(out)
     }
 
     /// Backfill probe metadata onto a video imported while ffprobe was
