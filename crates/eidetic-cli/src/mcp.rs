@@ -456,10 +456,16 @@ impl EideticMcp {
     ) -> Result<CallToolResult, ErrorData> {
         reply(
             async {
+                use anyhow::Context;
                 let path = PathBuf::from(&p.project);
                 let proj = ReelProject::load_untrusted(&path).await?;
                 let otio_path = proj.output.with_extension("otio");
-                otio::export(&proj, &otio_path)?;
+                let target = otio_path.clone();
+                // The export probes every video slot with ffprobe, which
+                // blocks, so it runs off the async executor.
+                tokio::task::spawn_blocking(move || otio::export(&proj, &target))
+                    .await
+                    .context("OTIO export thread panicked")??;
                 Ok(json!({ "otio": otio_path }))
             }
             .await,
@@ -645,13 +651,7 @@ impl EideticMcp {
         // render ever overwrites is one this project brought into existence.
         // The CLI keeps full freedom — the operator is trusted; the agent is
         // not.
-        anyhow::ensure!(
-            output
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("mp4")),
-            "output must be an .mp4 path, got {}",
-            output.display()
-        );
+        project::ensure_mp4(&output)?;
         let spec = ReelSpec {
             prompt: p.prompt,
             duration: p.duration.unwrap_or(30.0).clamp(3.0, 600.0),

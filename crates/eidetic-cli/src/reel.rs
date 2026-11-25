@@ -30,6 +30,8 @@ const VIDEO_LEAD_SECS: f64 = 1.5;
 const VIDEO_CLIP_SECS: f64 = 4.0;
 /// Photos hold for 3s with a slow Ken Burns push-in.
 const PHOTO_CLIP_SECS: f64 = 3.0;
+/// The longest joint a transition may last; project validation uses it too.
+pub const MAX_TRANSITION_SECS: f64 = 3.0;
 /// A hit scoring below this fraction of the best hit is padding, not content.
 const RELATIVE_SCORE_FLOOR: f64 = 0.35;
 /// Default Laplacian-variance floor for the sharpness gate. Calibrated on
@@ -432,8 +434,11 @@ impl Transition {
                  (optionally with :secs, e.g. crossfade:0.8)"
             ),
         };
-        if t.secs() < 0.0 || t.secs() > 3.0 {
-            bail!("transition duration {:.2}s is outside 0..3s", t.secs());
+        if t.secs() < 0.0 || t.secs() > MAX_TRANSITION_SECS {
+            bail!(
+                "transition duration {:.2}s is outside 0..{MAX_TRANSITION_SECS}s",
+                t.secs()
+            );
         }
         Ok(t)
     }

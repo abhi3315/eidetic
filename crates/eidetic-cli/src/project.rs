@@ -16,13 +16,27 @@ use std::path::{Path, PathBuf};
 /// Bumped when the schema changes incompatibly; loaders refuse newer files.
 const VERSION: u32 = 1;
 
+/// Refuse a render output that is not an `.mp4` path, so a render an agent
+/// asks for can never replace a file that is not a video.
+pub fn ensure_mp4(output: &Path) -> Result<()> {
+    anyhow::ensure!(
+        output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4")),
+        "output must be an .mp4 path, got {}",
+        output.display()
+    );
+    Ok(())
+}
+
 /// Project files are a few KB to a few hundred; anything bigger is not one.
 const MAX_PROJECT_BYTES: u64 = 8 << 20;
 /// Reading a small local file; this only catches a hung network mount.
 const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Headroom over the planner's densest cut: 600 s at its 0.6 s span floor
-/// is 1000 slots, and edits never add slots.
+/// Headroom over create_reel's densest cut: its 600 s cap at the planner's
+/// 0.6 s span floor is 1000 slots, and edits never add slots. CLI reels have
+/// no 600 s cap, so a long dense one can pass this and is refused here.
 const MAX_SLOTS: usize = 2000;
 /// A preview halves each side and rounds down to even, so a side under 4
 /// would render 0 px; 16 leaves a usable preview. 8192 covers 8K.
@@ -30,12 +44,9 @@ const MIN_SIDE: u32 = 16;
 const MAX_SIDE: u32 = 8192;
 /// An hour is far past any reel; past it the numbers are not a reel's.
 const MAX_REEL_SECS: f64 = 3600.0;
-/// The longest joint `Transition::parse` accepts.
-const MAX_TRANSITION_SECS: f64 = 3.0;
-/// What to tell the agent about a project it cannot repair through MCP,
-/// since every MCP tool refuses to load it.
-const REPAIR_HINT: &str = "fix the project file by hand or with `eidetic reel edit`, \
-    or plan the reel again with create_reel";
+/// How to repair a project every MCP tool refuses to load, so outside MCP.
+const REPAIR_HINT: &str = "fix the project file by hand (`eidetic reel edit` can retime, \
+    drop or re-transition its slots), or plan the reel again with create_reel";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReelProject {
@@ -98,8 +109,13 @@ impl ReelProject {
                 )
             })?
             .context("project reader panicked")??;
-        proj.validate()
-            .with_context(|| format!("{} is out of range", path.display()))?;
+        proj.validate().map_err(|e| {
+            anyhow::anyhow!("{} is out of range: {e:#}; {REPAIR_HINT}", path.display())
+        })?;
+        // render replaces the output, so a project nobody vetted may only
+        // name the kind of file create_reel would have written.
+        ensure_mp4(&proj.output)
+            .with_context(|| format!("{} cannot be rendered through MCP", path.display()))?;
         Ok(proj)
     }
 
@@ -143,7 +159,7 @@ impl ReelProject {
     pub fn validate(&self) -> Result<()> {
         use anyhow::ensure;
         let count = self.slots.len();
-        ensure!(count > 0, "the project has no slots; {REPAIR_HINT}");
+        ensure!(count > 0, "the project has no slots");
         ensure!(
             count <= MAX_SLOTS,
             "the project has {count} slots; at most {MAX_SLOTS}"
@@ -151,7 +167,7 @@ impl ReelProject {
         let sides = MIN_SIDE..=MAX_SIDE;
         ensure!(
             sides.contains(&self.width) && sides.contains(&self.height),
-            "project frame {}x{} is outside {MIN_SIDE}..{MAX_SIDE} px per side; {REPAIR_HINT}",
+            "project frame {}x{} is outside {MIN_SIDE}..{MAX_SIDE} px per side",
             self.width,
             self.height
         );
@@ -160,18 +176,19 @@ impl ReelProject {
             let n = i + 1;
             ensure!(
                 s.duration.is_finite() && s.duration > 0.0,
-                "slot {n} has an unusable duration ({}); {REPAIR_HINT}",
+                "slot {n} has an unusable duration ({})",
                 s.duration
             );
             ensure!(
                 s.start.is_finite() && s.start >= 0.0,
-                "slot {n} has an unusable start ({}); {REPAIR_HINT}",
+                "slot {n} has an unusable start ({})",
                 s.start
             );
             let t = s.transition_in.secs();
             ensure!(
-                (0.0..=MAX_TRANSITION_SECS).contains(&t),
-                "slot {n}'s transition lasts {t}s; transitions are 0..{MAX_TRANSITION_SECS}s"
+                (0.0..=reel::MAX_TRANSITION_SECS).contains(&t),
+                "slot {n}'s transition lasts {t}s; transitions are 0..{}s",
+                reel::MAX_TRANSITION_SECS
             );
         }
         // Also catches a sum that overflowed to infinity.
@@ -1156,6 +1173,26 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         );
     }
 
+    // Media length of every retimed video, probed off the async executor
+    // because ffprobe blocks.
+    let to_probe: Vec<(usize, PathBuf)> = retimes
+        .iter()
+        .filter(|(i, _)| proj.slots[*i].kind == reel::SlotKind::Video)
+        .map(|(i, _)| (*i, proj.slots[*i].source.clone()))
+        .collect();
+    let media_secs: std::collections::HashMap<usize, f64> =
+        tokio::task::spawn_blocking(move || {
+            to_probe
+                .into_iter()
+                .filter_map(|(i, source)| {
+                    let probe = eidetic_ingest::video::probe(&source).ok()??;
+                    Some((i, probe.duration_secs?))
+                })
+                .collect()
+        })
+        .await
+        .context("probe thread panicked")?;
+
     let mut retimed_video = false;
     for (i, secs) in retimes {
         let slot = &mut proj.slots[i];
@@ -1163,10 +1200,7 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         let mut secs = secs;
         // Clamp a video to the media past its in-point; a shortened file
         // would silently desync everything after it.
-        if slot.kind == reel::SlotKind::Video
-            && let Ok(Some(p)) = eidetic_ingest::video::probe(&slot.source)
-            && let Some(d) = p.duration_secs
-        {
+        if let Some(&d) = media_secs.get(&i) {
             let avail = (d - slot.start).max(0.3);
             if secs > avail {
                 eprintln!(
@@ -2495,11 +2529,16 @@ mod tests {
     }
 
     #[test]
-    fn the_transition_limit_is_the_one_edits_accept() {
-        let at = format!("crossfade:{MAX_TRANSITION_SECS}");
-        let over = format!("crossfade:{}", MAX_TRANSITION_SECS + 0.01);
-        assert!(Transition::parse(&at).is_ok());
-        assert!(Transition::parse(&over).is_err());
+    fn validate_accepts_the_longest_joint_an_edit_can_set() {
+        let mut p = project("x", Path::new("/tmp/x.mp4"));
+        let longest = format!("crossfade:{}", reel::MAX_TRANSITION_SECS);
+        p.slots[0].transition_in = Transition::parse(&longest).unwrap();
+        p.validate().unwrap();
+        p.slots[0].transition_in = Transition::Crossfade {
+            secs: reel::MAX_TRANSITION_SECS + 0.01,
+        };
+        let err = format!("{:#}", p.validate().unwrap_err());
+        assert!(err.contains("slot 1's transition lasts"), "{err}");
     }
 
     #[tokio::test]
@@ -2533,6 +2572,17 @@ mod tests {
         let err = err_of(ReelProject::load_untrusted(&good).await);
         assert!(
             err.contains("is out of range: project frame 0x1920"),
+            "{err}"
+        );
+        assert!(err.ends_with(REPAIR_HINT), "{err}");
+
+        // render replaces the output, so only an .mp4 one is accepted.
+        project("not a video", Path::new("/tmp/notes.txt"))
+            .save(&good)
+            .unwrap();
+        let err = err_of(ReelProject::load_untrusted(&good).await);
+        assert!(
+            err.contains("cannot be rendered through MCP: output must be an .mp4 path"),
             "{err}"
         );
     }

@@ -348,6 +348,42 @@ fn reel_edit_cli_shares_the_numbering_and_refuses_without_writing() {
     assert!(!dir.join("reel.mp4").exists(), "--dry-run rendered");
 }
 
+#[test]
+fn reel_edit_cli_repairs_a_project_the_mcp_tools_refuse() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path();
+    let project = four_photos(dir);
+    let mut broken = saved(&project);
+    broken["slots"][0]["duration"] = json!(-1.0);
+    std::fs::write(&project, serde_json::to_vec_pretty(&broken).unwrap()).unwrap();
+    let arg = project.to_str().unwrap();
+    let mut mcp = Mcp::start(dir);
+
+    let err = mcp
+        .call("export_otio", json!({"project": arg}))
+        .unwrap_err();
+    assert!(err.contains("unusable duration (-1)"), "{err}");
+    assert!(err.contains("eidetic reel edit"), "{err}");
+
+    // The CLI reads the operator's own file without range checks, so the
+    // route the refusal names can retime the bad slot.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
+    cmd.args(["reel", "edit"])
+        .arg(&project)
+        .args(["--retime", "1", "2", "--dry-run"]);
+    hermetic(&mut cmd, dir);
+    let out = cmd.output().expect("run eidetic reel edit");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(saved(&project)["slots"][0]["duration"], json!(2.0));
+
+    mcp.call("export_otio", json!({"project": arg})).unwrap();
+    assert!(dir.join("reel.otio").is_file());
+}
+
 // ---------------------------------------------------------------------------
 // Rendering (needs ffmpeg)
 // ---------------------------------------------------------------------------
