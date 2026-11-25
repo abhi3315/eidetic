@@ -426,6 +426,29 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_archive_fails_without_installing_a_dataset() {
+        let mut bytes = fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/geonames-zip/cities500.zip"),
+        )
+        .unwrap();
+        // The entry's deflated data follows its local header: 30 fixed bytes,
+        // then the file name and extra field whose lengths sit at offsets 26
+        // and 28. Flip a byte in the middle of that data.
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+        let data_start = 30 + name_len + extra_len;
+        bytes[data_start + 64] ^= 0xFF;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("cities500.zip");
+        fs::write(&zip_path, &bytes).unwrap();
+        let dest = tmp.path().join("cities500.txt");
+
+        assert!(extract_cities500(&zip_path, &dest).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
     fn haversine_matches_known_great_circle_distances() {
         // Loose tolerances because we use mean-radius, not WGS-84.
         let sf_nyc = haversine_m(37.7749, -122.4194, 40.7128, -74.0060);
