@@ -74,15 +74,6 @@ pub enum Tracker {
     BeatThis,
 }
 
-impl Tracker {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Tracker::Ellis => "ellis",
-            Tracker::BeatThis => "beat-this",
-        }
-    }
-}
-
 /// Identity of the model files an inferred grid came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProvenance {

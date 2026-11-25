@@ -1147,16 +1147,15 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
             // Near-duplicate screening compares each hit's matched moment
             // with every OTHER slot as it stands now (earlier swaps in this
             // batch included; the slot being replaced excluded).
-            let others: Vec<Slot> = proj
+            // Keys carry asset + moment, so a hit from video A at 20s and a
+            // slot of A at 2s keep their own signals.
+            let other_moments: Vec<reel::MomentRef> = proj
                 .slots
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| j != i)
-                .map(|(_, s)| s.clone())
+                .map(|(_, s)| reel::MomentRef::of_slot(s))
                 .collect();
-            // Keys carry asset + moment, so a hit from video A at 20s and a
-            // slot of A at 2s keep their own signals.
-            let other_moments = slot_keys(&others);
             let replaced = reel::MomentRef::of_slot(&proj.slots[*i]);
             let mut keys = result_keys(&hits);
             keys.extend(other_moments.iter().copied());

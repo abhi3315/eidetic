@@ -494,7 +494,7 @@ impl EideticMcp {
                 "next_first": (last < total).then_some(last + 1),
                 "tiles": sheet.tiles.iter().map(|t| json!({
                     "n": t.n,
-                    "kind": slot_kind(t.kind),
+                    "kind": t.kind,
                     "at_secs": round2(t.at),
                     "secs": round2(t.duration),
                     "transition_in": transition_spec(t.transition_in),
@@ -716,7 +716,7 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
                 "n": i + 1,
                 "asset": s.asset.to_string(),
                 "source": s.source,
-                "kind": slot_kind(s.kind),
+                "kind": s.kind,
                 "start": round2(s.start),
                 "secs": round2(s.duration),
                 "score": round2(s.score as f64),
@@ -751,7 +751,7 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
 /// Ellis's every-4th-beat guess for detected downbeats.
 fn grid_provenance(g: &eidetic_ingest::beats::BeatGrid) -> Value {
     json!({
-        "tracker": g.tracker.as_str(),
+        "tracker": g.tracker,
         "downbeats": if g.downbeats_inferred() { "inferred" } else { "heuristic-every-4th-beat" },
         "model": g.model,
         "fallback": g.fallback,
@@ -763,14 +763,6 @@ fn grid_provenance(g: &eidetic_ingest::beats::BeatGrid) -> Value {
 const SIGNALS_NOTE: &str = "motion (videos only): mean pixel change between the matched frame and one 0.2s later, 0..1, uncalibrated — compare slots, don't threshold; null = not measured. \
      similar_to: other slots that repeat this one — the same footage (same photo, or the same moment of the same video) or a near-duplicate stored embedding (same scene, maybe a different file); null = could not be checked. \
      width/height/rotation_cw come from file metadata: they can flag a rotation the render will not apply (may_render_sideways), but rotation 0 does not prove the picture is upright.";
-
-fn slot_kind(k: reel::SlotKind) -> &'static str {
-    match k {
-        reel::SlotKind::Video => "video",
-        reel::SlotKind::Photo => "photo",
-        reel::SlotKind::PhotoScenic => "photo_scenic",
-    }
-}
 
 /// A transition in the edit-op vocabulary, e.g. `crossfade:0.8`.
 fn transition_spec(t: reel::Transition) -> String {
@@ -801,33 +793,30 @@ impl ServerHandler for EideticMcp {
 
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
-        info.instructions = Some(
+        let (look, pixels) = if self.allow_previews {
+            (
+                "preview_sheet (look at every slot: same-scene repeats, \
+                 sideways or weak shots) → ",
+                "The operator opted into previews: preview_sheet returns real \
+                 frames from the library as an image; every other tool \
+                 returns metadata only.",
+            )
+        } else {
+            (
+                "",
+                "Tools return metadata only — paths, timecodes, scores — \
+                 never pixels.",
+            )
+        };
+        info.instructions = Some(format!(
             "Eidetic: a fully local media library (photos, videos, faces, \
              speech) with a beat-synced reel editor. Search and inspect \
              with the context tools; direct an edit with create_reel → \
              edit_reel (iterate on the cut list — check every slot's \
              score, swap weak ones, keep the hero shot on the drop) → \
-             render (preview first, full-res when happy) → export_otio \
-             for hand-polish. Tools return metadata only — paths, \
-             timecodes, scores — never pixels."
-                .to_string(),
-        );
-        if self.allow_previews {
-            info.instructions = Some(
-                "Eidetic: a fully local media library (photos, videos, faces, \
-                 speech) with a beat-synced reel editor. Search and inspect \
-                 with the context tools; direct an edit with create_reel → \
-                 edit_reel (iterate on the cut list — check every slot's \
-                 score, swap weak ones, keep the hero shot on the drop) → \
-                 preview_sheet (look at every slot: same-scene repeats, \
-                 sideways or weak shots) → render (preview first, full-res \
-                 when happy) → export_otio for hand-polish. The operator \
-                 opted into previews: preview_sheet returns real frames from \
-                 the library as an image; every other tool returns metadata \
-                 only."
-                    .to_string(),
-            );
-        }
+             {look}render (preview first, full-res when happy) → \
+             export_otio for hand-polish. {pixels}"
+        ));
         info
     }
 }
