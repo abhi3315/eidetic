@@ -16,7 +16,7 @@ This is one person's photo library on one person's hardware. Not a SaaS, not mul
 
 ## Stack (current)
 
-- **Language:** Rust 1.92, edition 2024
+- **Language:** Rust 1.94, edition 2024
 - **Async runtime:** Tokio
 - **Web framework:** Axum (added when `eidetic-server` exists)
 - **Database:** embedded SQLite, single file, no server (see ADR-0005; supersedes ADR-0002)

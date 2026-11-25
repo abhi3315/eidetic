@@ -11,7 +11,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 authors = ["Abhishek Sharma"]
 
@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 # Database (embedded SQLite; libsqlite3-sys is bundled + statically linked)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -74,6 +74,8 @@ axum = "0.8"
 maud = "0.27"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "fs"] }
+# Collects response bodies in the server's handler tests.
+http-body-util = "0.1"
 # MIME type parsing for ServeFile's typed content-type argument
 mime = "0.3"
 
@@ -82,7 +84,7 @@ clap = { version = "4", features = ["derive"] }
 
 # MCP server (official Rust SDK; goals-v0.8.md phase 1). Default features
 # already include server + macros; transport-io adds the stdio transport.
-rmcp = { version = "3.2", features = ["transport-io"] }
+rmcp = { version = "3.11", features = ["transport-io"] }
 # MCP image content is base64 (the same major rmcp already links).
 base64 = "0.23"
 # JSON Schema derive for MCP tool parameter types (the version rmcp uses).
@@ -101,8 +103,10 @@ kamadak-exif = "0.6"
 # ureq 3.x changed the request-builder / response-body API.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
-# Zip decompression for the downloaded cities500.zip blob.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# Zip decompression for the downloaded cities500.zip blob. Only the flate2
+# (zlib-rs) deflate backend: reading needs nothing else, and the full
+# `deflate` feature adds the write-only zopfli encoder.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Directory walking
 walkdir = "2"

@@ -191,19 +191,29 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), Error> {
 fn download_and_extract_cities500(data_dir: &Path, dest: &Path) -> Result<(), Error> {
     let zip_path = data_dir.join("cities500.zip");
     download_to_file(&format!("{GEONAMES_BASE}/cities500.zip"), &zip_path)?;
+    extract_cities500(&zip_path, dest)?;
+    fs::remove_file(&zip_path).map_err(|source| Error::Io {
+        path: zip_path,
+        source,
+    })?;
+    Ok(())
+}
 
-    let zf = File::open(&zip_path).map_err(|source| Error::Io {
-        path: zip_path.clone(),
+/// Write the archive's `cities500.txt` to `dest`, via a `.partial` file so a
+/// failed extraction never leaves a truncated dataset behind.
+fn extract_cities500(zip_path: &Path, dest: &Path) -> Result<(), Error> {
+    let zf = File::open(zip_path).map_err(|source| Error::Io {
+        path: zip_path.to_path_buf(),
         source,
     })?;
     let mut archive = zip::ZipArchive::new(zf).map_err(|source| Error::Zip {
-        path: zip_path.clone(),
+        path: zip_path.to_path_buf(),
         source,
     })?;
     let mut entry = archive
         .by_name("cities500.txt")
         .map_err(|source| Error::Zip {
-            path: zip_path.clone(),
+            path: zip_path.to_path_buf(),
             source,
         })?;
 
@@ -221,12 +231,7 @@ fn download_and_extract_cities500(data_dir: &Path, dest: &Path) -> Result<(), Er
     fs::rename(&partial, dest).map_err(|source| Error::Io {
         path: dest.to_path_buf(),
         source,
-    })?;
-    fs::remove_file(&zip_path).map_err(|source| Error::Io {
-        path: zip_path,
-        source,
-    })?;
-    Ok(())
+    })
 }
 
 fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
@@ -395,6 +400,29 @@ mod tests {
     #[test]
     fn ensure_dataset_is_a_noop_when_all_files_already_present() {
         Geocoder::ensure_dataset(&fixture_dir()).expect("ensure_dataset");
+    }
+
+    /// The fixture is `geonames/cities500.txt` deflated into a standard zip,
+    /// the same shape as the archive GeoNames serves.
+    #[test]
+    fn extracts_cities500_from_a_deflated_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("cities500.zip");
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/geonames-zip/cities500.zip"),
+            &zip_path,
+        )
+        .unwrap();
+        let dest = tmp.path().join("cities500.txt");
+
+        extract_cities500(&zip_path, &dest).expect("extract");
+
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            fs::read(fixture_dir().join("cities500.txt")).unwrap()
+        );
+        assert!(!dest.with_extension("txt.partial").exists());
     }
 
     #[test]

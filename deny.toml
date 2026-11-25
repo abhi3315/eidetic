@@ -15,6 +15,11 @@ ignore = [
     # paste is unmaintained — pulled in via tokenizers (macro_rules_attribute) and
     # image → ravif → rav1e. Both still pin paste; no safe upgrade yet.
     "RUSTSEC-2024-0436",
+    # chrono is unmaintained, every version is affected and no fixed release
+    # exists. sqlx's `chrono` feature and the `DateTime<Utc>` columns across
+    # the workspace depend on it; leaving it means moving the stored-datetime
+    # layer to `jiff` or `time`.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
