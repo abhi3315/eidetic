@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use eidetic_core::Sha256;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// 64 KiB read buffer. Large enough to amortize syscall overhead,
@@ -15,19 +15,35 @@ pub fn hash_file(path: &Path) -> Result<Sha256> {
         path: path.to_path_buf(),
         source,
     })?;
+    hash_copy(&mut file, &mut std::io::sink()).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Stream everything `reader` yields into `writer`, returning the SHA-256 of
+/// the bytes that went through.
+///
+/// One pass produces both the copy and the digest, so a caller can never end
+/// up with a hash of one version of a file and a copy of another — which is
+/// the whole point for staging, where the digest names the CAS path the copy
+/// is about to occupy.
+pub(crate) fn hash_copy<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+) -> std::io::Result<Sha256> {
     let mut hasher = Sha256Hasher::new();
     let mut buf = [0u8; READ_BUF_SIZE];
 
     loop {
-        let n = file.read(&mut buf).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        writer.write_all(&buf[..n])?;
     }
+    writer.flush()?;
 
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&hasher.finalize());

@@ -26,9 +26,20 @@ not invented.
      right person, not just any face.
 4. **`edit_reel`** with a batch of ops. Slot numbers refer to the cut list
    you were just shown; the whole batch resolves against it, so combine
-   freely (swap 3 + drop 5 + retime 2 in one call).
+   freely (swap 3 + drop 5 + retime 2 in one call). That includes
+   `reorder`: with 4 slots, dropping 2 and reordering is
+   `drop 2` + `order [4, 1, 3]`, never the post-drop numbers. Ops apply
+   in a fixed order whatever order you list them: pin/unpin → retime →
+   transition → swap → drop → reorder. A bad op fails the whole call and
+   nothing is saved.
+   - A transition belongs to its shot and moves with it on reorder. To
+     put a joint into a position the reorder *creates*, use two calls:
+     `reorder [3, 1, 2]`, then `transition` slot 2 against the cut list
+     that call returned.
 5. **`render` with `preview: true`** and show the human. Pixels are the
    human's call — never claim a reel "looks good", you haven't seen it.
+   The preview lands at `<output>.preview.mp4` (the `output` the tool
+   returns); it never replaces the full-res reel or changes the project.
 6. Apply follow-ups to the same project; render full-res once, at the end.
 7. Offer **`export_otio`** when the user wants polish beyond the tools
    (speed-ramps, grading, captions): the cut opens in Kdenlive 25.04+ /

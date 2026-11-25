@@ -180,8 +180,8 @@ enum Command {
 
         /// Cut N candidate reels instead of one — different shot pools and
         /// transition styles, rendered as half-resolution previews
-        /// (reel.v1.mp4 …). Pick with your eyes, then re-render the winner
-        /// full-res: `eidetic reel edit reel.v2.eidetic.json`.
+        /// (reel.v1.preview.mp4 …). Pick with your eyes, then render the
+        /// winner full-res: `eidetic reel edit reel.v2.eidetic.json`.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=9))]
         variations: u32,
 
@@ -229,7 +229,10 @@ enum ReelAction {
     /// Edit a reel project file and re-render it. All slot numbers refer
     /// to the cut list as last printed (1-based); when several ops are
     /// combined in one call they are resolved against that same numbering,
-    /// then applied as pin/unpin → retime → swap → drop → reorder.
+    /// then applied as pin/unpin → retime → transition → swap → drop →
+    /// reorder. A transition belongs to its shot and moves with it on
+    /// --reorder; to set the joint into a NEW position, reorder first and
+    /// transition in a second edit.
     Edit {
         /// The project file a previous render wrote (reel.eidetic.json).
         project: PathBuf,
@@ -260,12 +263,14 @@ enum ReelAction {
 
         /// Set the transition INTO slot N: --transition N crossfade.
         /// Styles: cut, crossfade, dip, slide, whip — optionally with
-        /// :secs (e.g. crossfade:0.8). Repeatable. Slot 1 has no joint.
+        /// :secs (e.g. crossfade:0.8). Repeatable. Whichever shot ends up
+        /// first has no joint, so its transition is ignored.
         #[arg(long, num_args = 2, value_names = ["SLOT", "STYLE"])]
         transition: Vec<String>,
 
         /// Reorder the (surviving) slots: a comma-separated permutation
-        /// using the printed numbers, e.g. --reorder 3,1,2.
+        /// using the printed numbers, e.g. --reorder 3,1,2. With --drop,
+        /// list every slot not dropped, still by its printed number.
         #[arg(long)]
         reorder: Option<String>,
 
@@ -1280,30 +1285,32 @@ async fn main() -> anyhow::Result<()> {
                 variations,
             };
             let projects = project::plan_projects(&spec, &config).await?;
+            // Previews trade pixels for speed and land beside the output
+            // (reel.v1.preview.mp4); the project files keep the real
+            // geometry and output so the winner re-renders full-res.
+            let preview = variations > 1;
             if !dry_run {
                 for p in projects.iter().filter(|p| p.output != spec.output) {
-                    if p.output.exists() {
-                        anyhow::bail!(
-                            "{} already exists; pass a different --output",
-                            p.output.display()
-                        );
+                    for path in [&p.output, &p.render_target(preview).path] {
+                        if path.exists() {
+                            anyhow::bail!(
+                                "{} already exists; pass a different --output",
+                                path.display()
+                            );
+                        }
                     }
                 }
             }
-
-            // Previews trade pixels for speed; the project files remember
-            // the real geometry so the winner re-renders full-res.
-            let preview = (variations > 1).then_some(((w / 2) & !1, (h / 2) & !1));
 
             for proj in &projects {
                 proj.print_cut_list();
                 if dry_run {
                     continue;
                 }
-                let (rw, rh) = preview.unwrap_or((w, h));
-                println!("Rendering {rw}x{rh} @ 30fps…");
-                project::render_project(proj, preview).await?;
-                println!("Wrote {}", proj.output.display());
+                let target = proj.render_target(preview);
+                println!("Rendering {}x{} @ 30fps…", target.width, target.height);
+                project::render_project(proj, &target).await?;
+                println!("Wrote {}", target.path.display());
 
                 // Every render persists its cut list (goals-v0.8.md phase
                 // 0): the project file is what `reel edit` and agents
@@ -1316,12 +1323,12 @@ async fn main() -> anyhow::Result<()> {
                     println!("OTIO    {}", otio_path.display());
                 }
             }
-            if let Some((rw, rh)) = preview
-                && !dry_run
-            {
+            if preview && !dry_run {
+                let target = projects[0].render_target(true);
                 println!(
-                    "Previews are {rw}x{rh}; re-render the winner full-res with \
-                     `eidetic reel edit <winner>.eidetic.json`"
+                    "Previews are {}x{}; re-render the winner full-res with \
+                     `eidetic reel edit <winner>.eidetic.json`",
+                    target.width, target.height
                 );
             }
         }
@@ -2018,7 +2025,7 @@ async fn reel_edit(
     }
 
     println!("Rendering {}x{} @ 30fps…", proj.width, proj.height);
-    project::render_project(&proj, None).await?;
+    project::render_project(&proj, &proj.render_target(false)).await?;
     println!("Wrote {}", proj.output.display());
     Ok(())
 }

@@ -34,12 +34,13 @@ async fn try_import_file(
     config: &Paths,
     geocoder: Option<&Geocoder>,
 ) -> Result<ImportOutcome> {
-    // MIME detection reads only 512 bytes, acceptable before staging.
-    let Some(mime_type) = crate::meta::detect_mime(path)? else {
-        return Ok(ImportOutcome::Skipped);
-    };
-    if !mime_type.starts_with("image/") && !mime_type.starts_with("video/") {
-        return Ok(ImportOutcome::Skipped);
+    // A cheap gate: 512 bytes off the source rejects documents and archives
+    // before anything gets copied. It is not the answer we keep — these
+    // bytes can still change under us — so the staged copy gets sniffed
+    // again below.
+    match crate::meta::detect_mime(path)? {
+        Some(mime) if is_media(&mime) => {}
+        _ => return Ok(ImportOutcome::Skipped),
     }
 
     let ext = path
@@ -54,17 +55,44 @@ async fn try_import_file(
 
     // Hash the source directly so we can short-circuit duplicates before
     // copying the file to staging. On a re-import of a synced photo dir
-    // this avoids gigabytes of pointless I/O per duplicate.
-    let hash = hash_file(path)?;
-    let hash_hex = hash.to_string();
+    // this avoids gigabytes of pointless I/O per duplicate. This digest is
+    // good for that gate and nothing else: it describes the source as it was
+    // a moment ago, which is not necessarily what we end up storing.
+    let source_hash = hash_file(path)?;
 
-    if let Some(existing_id) = repo.find_by_hash(&hash_hex).await? {
+    if let Some(existing_id) = repo.find_by_hash(&source_hash.to_string()).await? {
         return Ok(ImportOutcome::Duplicate(existing_id));
     }
 
-    // Past the dedup gate. Stage a stable copy so EXIF and the CAS commit
-    // both read the same bytes that will end up canonical at the CAS path.
-    let stage = stage_file(path, &config.library_dir)?;
+    // Past the dedup gate. Stage a stable copy so EXIF, the CAS commit and
+    // the `hash` column all describe the same bytes — `hash` here is the
+    // digest of the copy itself, computed as it was written.
+    let (stage, hash) = stage_file(path, &config.library_dir)?;
+    let hash_hex = hash.to_string();
+
+    // Sniff the staged copy, and let it decide. Once we accept that the
+    // source can change between two reads, the type has to come from the
+    // same bytes as the digest: `mime_type` picks EXIF over ffprobe, the
+    // thumbnail strategy, and what every reader later believes this asset
+    // is. If the source became unsupported media, drop the staged copy
+    // without inserting an asset or committing a CAS file.
+    let Some(mime_type) = crate::meta::detect_mime(stage.path())? else {
+        return Ok(ImportOutcome::Skipped);
+    };
+    if !is_media(&mime_type) {
+        return Ok(ImportOutcome::Skipped);
+    }
+
+    // The source changed between the gate and the copy: an editor saving in
+    // place, or a sync client that was still writing when the walk reached
+    // the file. The staged bytes are what would be stored, so they get their
+    // own duplicate check — without it the commit lands a CAS file that the
+    // insert then rejects as a duplicate, and nothing ever removes it.
+    if hash != source_hash
+        && let Some(existing_id) = repo.find_by_hash(&hash_hex).await?
+    {
+        return Ok(ImportOutcome::Duplicate(existing_id));
+    }
 
     let file_size = std::fs::metadata(stage.path())
         .map_err(|source| Error::Io {
@@ -102,7 +130,7 @@ async fn try_import_file(
         None
     };
 
-    let storage_path = commit_staged(stage, &hash, ext.as_deref(), &config.library_dir)?;
+    let (storage_path, created) = commit_staged(stage, &hash, ext.as_deref(), &config.library_dir)?;
 
     let thumbnails_generated = if mime_type.starts_with("image/") {
         let src = storage_path.clone();
@@ -203,16 +231,40 @@ async fn try_import_file(
         pixel_height: video.as_ref().and_then(|v| v.height),
     };
 
+    // An insert error leaves a file we created in place on purpose: a
+    // concurrent import of the same bytes and extension may have found it
+    // at commit and be about to record it, and deleting it would leave that
+    // row pointing at nothing. It is verified content under its own hash, so
+    // the next import of it reuses it rather than tripping over it.
     match repo.insert_asset(new_asset).await? {
         InsertOutcome::Inserted(id) => {
             debug!(path = %path.display(), hash = %hash_hex, "imported");
             Ok(ImportOutcome::Imported(id))
         }
         InsertOutcome::Existing(id) => {
+            // A concurrent import of the same bytes committed its row first.
+            // If it stored them under another extension, the file this
+            // import created is referenced by nothing and goes; a file this
+            // import merely found, or the one the winning row points at,
+            // stays. The winner's row is already committed and owns the
+            // hash, so no later insert can come to reference ours.
+            let winner = repo.fetch_by_id(id).await?.map(|a| a.storage_path);
+            if created && winner.as_deref() != Some(storage_path.as_path()) {
+                std::fs::remove_file(&storage_path).map_err(|source| Error::Io {
+                    path: storage_path.clone(),
+                    source,
+                })?;
+            }
             debug!(path = %path.display(), hash = %hash_hex, "duplicate");
             Ok(ImportOutcome::Duplicate(id))
         }
     }
+}
+
+/// Photos and videos only — `infer` recognises a great deal more than that,
+/// and everything else is somebody else's file.
+fn is_media(mime: &str) -> bool {
+    mime.starts_with("image/") || mime.starts_with("video/")
 }
 
 /// Missing ffmpeg is one situation, not one situation per file: warn once

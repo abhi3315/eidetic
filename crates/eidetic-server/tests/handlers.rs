@@ -290,6 +290,57 @@ async fn thumbs_invalid_hash_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// The invalid-input error bodies quote the request back at the client.
+/// Whatever they quote, the response must be inert text: a browser that
+/// followed a link to this URL must not end up executing the segment.
+#[tokio::test]
+async fn error_bodies_are_served_as_inert_text() {
+    let (router, _repo, _faces, _tmp) = fixture().await;
+
+    // Percent-encoded `<script>alert(1)</script>` as the thumbnail size, so
+    // axum's path decoding hands the handler raw markup.
+    let payload = "%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/thumbs/{payload}/not-a-hash"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let content_types: Vec<&str> = response
+        .headers()
+        .get_all(axum::http::header::CONTENT_TYPE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        content_types,
+        vec!["text/plain; charset=utf-8"],
+        "error responses must be typed as text, exactly once"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff"),
+    );
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    // The echo is real — this test only means something because the payload
+    // reaches the body — but it arrives without any HTML wrapper around it.
+    assert!(body.contains("<script>alert(1)</script>"), "{body}");
+    assert!(
+        !body.to_ascii_lowercase().contains("<!doctype"),
+        "error body is being rendered as a document: {body}"
+    );
+}
+
 #[tokio::test]
 async fn thumb_serves_jpeg_bytes_when_file_exists() {
     let (router, _repo, _faces, tmp) = fixture().await;

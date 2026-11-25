@@ -147,8 +147,10 @@ struct CreateReelParams {
 struct EditReelParams {
     /// Path to the project file (reel.eidetic.json).
     project: String,
-    /// Mutations, applied as one batch: slot numbers are 1-based against
-    /// the current cut list, all resolved before anything changes.
+    /// Mutations, applied as one all-or-nothing batch. Every slot number
+    /// (reorder included) is 1-based against the cut list as it was BEFORE
+    /// this call, whatever order the ops are listed in; they then apply as
+    /// pin/unpin → retime → transition → swap → drop → reorder.
     ops: Vec<EditOp>,
 }
 
@@ -363,7 +365,15 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Mutate a reel project: swap a slot for a fresh search, drop, pin/unpin, retime, set transitions (cut/crossfade/dip/slide/whip, e.g. \"crossfade:0.8\"), reorder. Saves the project and returns the new cut list. Render separately."
+        description = "Mutate a reel project: swap a slot for a fresh search, drop, pin/unpin, retime, set transitions (cut/crossfade/dip/slide/whip, e.g. \"crossfade:0.8\"), reorder. \
+            Index basis: every slot number in one call — reorder included — is the 1-based \"n\" from the cut list BEFORE the call; a drop does not renumber later ops. \
+            Ops apply in a fixed order regardless of how they are listed: pin/unpin, retime, transition, swap, drop, reorder. \
+            A reorder lists every slot not dropped in this call exactly once (4 slots, drop 2 → order [4,1,3]). \
+            Pinned slots refuse swap and drop; pinning in the same call already protects, unpinning in the same call already releases. \
+            A transition belongs to its shot and moves with it on reorder; the shot that ends up first has no joint, so its transition is ignored. \
+            To put a transition into a NEW position, use two calls: first {\"op\":\"reorder\",\"order\":[3,1,2]}, then, against the returned numbering, {\"op\":\"transition\",\"slot\":2,\"style\":\"crossfade:0.8\"} (the joint between the new 1st and 2nd shots). \
+            All-or-nothing: an invalid op (bad slot number, pinned slot, bad reorder) changes nothing on disk. \
+            On success saves the project and returns the new cut list. Render separately."
     )]
     async fn edit_reel(
         &self,
@@ -382,7 +392,7 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Render a reel project to its output file with ffmpeg (H.264 + the audio track). preview=true renders half-resolution for fast review."
+        description = "Render a reel project with ffmpeg (H.264 + the audio track) and return the path written. Full renders replace the project's output; preview=true renders half-resolution to a separate <output>.preview.mp4, leaving the full-res output and the project file untouched. A failed render leaves any earlier file in place."
     )]
     async fn render(
         &self,
@@ -392,17 +402,14 @@ impl EideticMcp {
             async {
                 let path = PathBuf::from(&p.project);
                 let proj = ReelProject::load(&path)?;
-                let size = p
-                    .preview
-                    .unwrap_or(false)
-                    .then_some(((proj.width / 2) & !1, (proj.height / 2) & !1));
-                project::render_project(&proj, size).await?;
-                let (w, h) = size.unwrap_or((proj.width, proj.height));
+                let preview = p.preview.unwrap_or(false);
+                let target = proj.render_target(preview);
+                project::render_project(&proj, &target).await?;
                 Ok(json!({
-                    "output": proj.output,
-                    "size": format!("{w}x{h}"),
+                    "output": target.path,
+                    "size": format!("{}x{}", target.width, target.height),
                     "seconds": round2(proj.total_secs()),
-                    "preview": size.is_some(),
+                    "preview": preview,
                 }))
             }
             .await,
@@ -570,11 +577,15 @@ impl EideticMcp {
         // itself gets the same rule (see the boundary note above): a path
         // that already exists belongs to someone, and it is not this reel.
         for proj in &projects {
-            // Everything this project will ever write: the render target and
-            // the .otio sibling export_otio derives from it. Claiming both
-            // now means every later overwrite hits a file this project
-            // created.
-            for claimed in [proj.output.clone(), proj.output.with_extension("otio")] {
+            // Everything this project will ever write: the render target,
+            // its preview, and the .otio sibling export_otio derives from
+            // it. Claiming them now means every later overwrite hits a file
+            // this project created.
+            for claimed in [
+                proj.output.clone(),
+                proj.render_target(true).path,
+                proj.output.with_extension("otio"),
+            ] {
                 anyhow::ensure!(
                     !claimed.exists(),
                     "{} already exists; pick a different output (this \

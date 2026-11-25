@@ -392,6 +392,11 @@ impl Fit {
 /// Render the cut list to `output` at `width`x`height`, 30fps, H.264. With
 /// `audio`, the track is laid under the cut, trimmed to the reel length
 /// with a one-second fade-out.
+///
+/// `output` is only replaced once every ffmpeg step has succeeded: the
+/// final encode lands in a staging directory beside it and is renamed into
+/// place, so a failed render leaves any previous file at `output` intact
+/// and, on ordinary errors, no partial file behind.
 pub fn render(
     slots: &[Slot],
     output: &Path,
@@ -408,6 +413,17 @@ pub fn render(
     }
 
     let workdir = tempfile::tempdir().context("create reel work dir")?;
+    // Beside `output` so the publishing rename stays on one filesystem;
+    // same file name so ffmpeg picks the same muxer. Removed on drop, i.e.
+    // on every early return below.
+    let file_name = output
+        .file_name()
+        .with_context(|| format!("{} is not a file path", output.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".eidetic-render-")
+        .tempdir_in(crate::project::parent_dir(output))
+        .with_context(|| format!("create a staging dir next to {}", output.display()))?;
+    let staged = staging.path().join(file_name);
     let mut seg_paths = Vec::with_capacity(slots.len());
 
     for (i, slot) in slots.iter().enumerate() {
@@ -472,7 +488,7 @@ pub fn render(
 
     let total = total_secs(slots);
     let silent = match audio {
-        None => output.to_path_buf(),
+        None => staged.clone(),
         Some(_) => workdir.path().join("silent.mp4"),
     };
     if seg_paths.iter().all(|(_, fade)| *fade == 0.0) {
@@ -497,13 +513,15 @@ pub fn render(
                 "-t",
                 &format!("{total:.3}"),
             ])
-            .arg(output)
+            .arg(&staged)
             .status()
             .context("run ffmpeg audio mux")?;
         if !status.success() {
             bail!("ffmpeg audio mux failed");
         }
     }
+    std::fs::rename(&staged, output)
+        .with_context(|| format!("failed to publish the render to {}", output.display()))?;
     Ok(())
 }
 
@@ -1203,5 +1221,107 @@ mod tests {
         assert_eq!(back[0].kind, SlotKind::Video);
         assert!(back[0].pinned);
         assert_eq!(back[0].transition_in, Transition::Crossfade { secs: 0.5 });
+    }
+
+    // -- render publication (synthetic media; skipped without ffmpeg) -------
+
+    /// A one-frame solid-colour PNG, or None when ffmpeg is not installed.
+    fn synthetic_photo(dir: &Path) -> Option<PathBuf> {
+        let ffmpeg = eidetic_ingest::video::ffmpeg()?;
+        let path = dir.join("red.png");
+        let ok = Command::new(ffmpeg)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x36",
+            ])
+            .args(["-frames:v", "1"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "ffmpeg could not make a synthetic photo");
+        Some(path)
+    }
+
+    fn photo_slot(source: PathBuf) -> Slot {
+        Slot {
+            asset: AssetId::new(),
+            source,
+            kind: SlotKind::Photo,
+            start: 0.0,
+            duration: 0.5,
+            focus_x: None,
+            score: 0.0,
+            pinned: false,
+            transition_in: Transition::Cut,
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn render_replaces_the_output_only_when_ffmpeg_succeeds() {
+        let media = tempfile::tempdir().unwrap();
+        let Some(photo) = synthetic_photo(media.path()) else {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        };
+        let out_dir = tempfile::tempdir().unwrap();
+        let output = out_dir.path().join("reel.mp4");
+        std::fs::write(&output, b"previous reel").unwrap();
+
+        // Failure mid-pipeline (the second segment's source is gone): the
+        // previous file survives byte for byte and nothing is left beside it.
+        let slots = vec![
+            photo_slot(photo.clone()),
+            photo_slot(media.path().join("missing.png")),
+        ];
+        let err = render(&slots, &output, 64, 36, Fit::Blur, None).unwrap_err();
+        assert!(err.to_string().contains("segment 2"), "{err:#}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous reel");
+        assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
+
+        // Failure in the final ffmpeg run AFTER it has opened its output:
+        // AAC cannot encode 16 channels, which ffmpeg only discovers once
+        // the output file exists. Writing straight to `output` with -y
+        // truncated the previous reel here.
+        let track = media.path().join("sixteen.wav");
+        let ok = Command::new(eidetic_ingest::video::ffmpeg().unwrap())
+            .args(["-y", "-v", "error", "-f", "lavfi"])
+            .args([
+                "-i",
+                "anullsrc=channel_layout=hexadecagonal:sample_rate=48000",
+            ])
+            .args(["-t", "1"])
+            .arg(&track)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "ffmpeg could not make a synthetic 16-channel track");
+        let slots = vec![photo_slot(photo.clone()), photo_slot(photo.clone())];
+        let err = render(&slots, &output, 64, 36, Fit::Blur, Some(&track)).unwrap_err();
+        assert!(err.to_string().contains("audio mux"), "{err:#}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous reel");
+        assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
+
+        // Success publishes a real video over it, again without litter.
+        render(&slots, &output, 64, 36, Fit::Blur, None).unwrap();
+        let probe = eidetic_ingest::video::probe(&output)
+            .unwrap()
+            .expect("ffprobe ships with ffmpeg");
+        assert!(probe.duration_secs.unwrap_or(0.0) > 0.5, "{probe:?}");
+        assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
     }
 }

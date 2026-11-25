@@ -298,7 +298,9 @@ pub enum ServerError {
 }
 ```
 
-Handlers return `Result<impl IntoResponse, ServerError>`. The error type renders a minimal HTML page (status code + brief message) and `tracing::error!`-logs the source. No stack traces in the response body.
+Handlers return `Result<impl IntoResponse, ServerError>`. The error type answers with a one-line `text/plain; charset=utf-8` body (brief message, `nosniff`) and `tracing::error!`-logs the source. No stack traces in the response body.
+
+Plain text rather than a rendered page: these bodies quote request-derived strings — a thumbnail size, a hash, a dav path — and an HTML error page turns any missing escape there into reflected XSS against a server with no authentication.
 
 ---
 

@@ -67,10 +67,32 @@ impl ReelProject {
         Ok(project)
     }
 
+    /// Atomically replace the project using a complete, synced sibling file.
+    /// Editing decisions cannot be regenerated, so failures before replacement
+    /// must leave the previous project intact. Existing handles and hard links
+    /// keep reading the old file rather than observing an in-place truncation.
+    ///
+    /// The parent directory is not synced: this protects against interrupted
+    /// writes, but does not guarantee persistence of the rename after power loss.
     pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+
         let json = serde_json::to_vec_pretty(self).context("serialize project")?;
-        std::fs::write(path, json)
+        let dir = parent_dir(path);
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".eidetic-project-")
+            .suffix(".json.tmp")
+            .tempfile_in(dir)
+            .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
+        // NamedTempFile removes itself on drop, so every early return below
+        // leaves the destination alone and no litter in the directory.
+        tmp.write_all(&json)
+            .and_then(|()| tmp.flush())
+            .and_then(|()| tmp.as_file().sync_all())
             .with_context(|| format!("failed to write project file {}", path.display()))?;
+        tmp.persist(path)
+            .map_err(|e| e.error)
+            .with_context(|| format!("failed to replace project file {}", path.display()))?;
         Ok(())
     }
 
@@ -118,6 +140,17 @@ impl ReelProject {
 
 fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// The directory `path` lives in, for staging a temp file beside it — the
+/// rename has to stay on one filesystem. A bare filename like
+/// `reel.eidetic.json` has an empty parent, which means the current
+/// directory.
+pub(crate) fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,10 +425,43 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
     )])
 }
 
-/// Render a project to its recorded output — or to a smaller preview
-/// geometry when `size` overrides (variation previews).
-pub async fn render_project(proj: &ReelProject, size: Option<(u32, u32)>) -> Result<()> {
-    let (w, h) = size.unwrap_or((proj.width, proj.height));
+/// Where a render lands and at what size.
+pub struct RenderTarget {
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ReelProject {
+    /// The full-resolution render at the project's output, or a
+    /// half-resolution preview beside it: `reel.mp4` → `reel.preview.mp4`.
+    /// A preview never lands on the output, so reviewing a cut cannot
+    /// replace the full-res reel, and the project's own geometry and output
+    /// stay what the next full render uses.
+    pub fn render_target(&self, preview: bool) -> RenderTarget {
+        if !preview {
+            return RenderTarget {
+                path: self.output.clone(),
+                width: self.width,
+                height: self.height,
+            };
+        }
+        let ext = self
+            .output
+            .extension()
+            .map_or_else(|| "mp4".into(), |e| e.to_string_lossy().into_owned());
+        RenderTarget {
+            path: self.output.with_extension(format!("preview.{ext}")),
+            width: (self.width / 2) & !1,
+            height: (self.height / 2) & !1,
+        }
+    }
+}
+
+/// Render a project's cut list to `target` (see
+/// [`ReelProject::render_target`]).
+pub async fn render_project(proj: &ReelProject, target: &RenderTarget) -> Result<()> {
+    let (w, h) = (target.width, target.height);
     let fit = reel::Fit::parse(&proj.frame, proj.height > proj.width)?;
     if let Some(track) = &proj.audio {
         anyhow::ensure!(
@@ -405,7 +471,7 @@ pub async fn render_project(proj: &ReelProject, size: Option<(u32, u32)>) -> Res
         );
     }
     let slots = proj.slots.clone();
-    let output = proj.output.clone();
+    let output = target.path.clone();
     let audio = proj.audio.clone();
     tokio::task::spawn_blocking(move || reel::render(&slots, &output, w, h, fit, audio.as_deref()))
         .await
@@ -490,7 +556,8 @@ pub(crate) async fn framing_focus(
 
 /// One structured mutation of a cut list. `slot` numbers are 1-based
 /// against the cut list as last printed; a batch resolves every number
-/// against that same numbering before anything is applied.
+/// against that same numbering before anything is applied, whatever order
+/// the ops are listed in. A drop does not renumber later ops in the batch.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOp {
@@ -506,8 +573,10 @@ pub enum EditOp {
         slot: usize,
         secs: f64,
     },
-    /// Set the transition INTO a slot: cut, crossfade, dip, slide, whip —
-    /// optionally with :secs (e.g. "crossfade:0.8").
+    /// Set the transition INTO a slot's shot: cut, crossfade, dip, slide,
+    /// whip — optionally with :secs (e.g. "crossfade:0.8"). The transition
+    /// moves with the shot on reorder; the shot that ends up first has no
+    /// joint, so its transition is ignored.
     Transition {
         slot: usize,
         style: String,
@@ -522,16 +591,21 @@ pub enum EditOp {
     Drop {
         slot: usize,
     },
-    /// Permute the surviving slots; must list each exactly once.
+    /// The new order, as original slot numbers: must list every slot not
+    /// dropped in this batch exactly once (e.g. drop 2 of 4, then order
+    /// [4, 1, 3]). At most one per batch.
     Reorder {
         order: Vec<usize>,
     },
 }
 
 /// Apply a batch of ops to a project, in the documented fixed order:
-/// pin/unpin → retime → transition → swap → drop → reorder. Progress and
-/// swap decisions go to stderr; the caller prints (or returns) the new cut
-/// list.
+/// pin/unpin → retime → transition → swap → drop → reorder, every slot
+/// number meaning the ORIGINAL position. Pins apply first, so a batch that
+/// pins a slot also refuses to swap or drop it, and one that unpins it
+/// allows both. Any error leaves `proj` partly mutated in memory; callers
+/// save only on success. Progress and swap decisions go to stderr; the
+/// caller prints (or returns) the new cut list.
 pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) -> Result<()> {
     use std::collections::HashSet;
 
@@ -618,11 +692,10 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         slot.duration = secs;
     }
 
+    // A transition belongs to its shot and travels with it through the
+    // reorder below; only the shot that ends up first has no joint.
+    let transitioned: HashSet<usize> = transitions.iter().map(|(i, _)| *i).collect();
     for (i, t) in transitions {
-        if i == 0 {
-            eprintln!("slot 1 opens the reel and has no joint; transition ignored");
-            continue;
-        }
         proj.slots[i].transition_in = t;
     }
 
@@ -681,7 +754,8 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
                 &scenes,
                 &focus,
             );
-            // The joint belongs to the timeline position, not the shot.
+            // A swap replaces the footage, not the edit decision: the
+            // slot keeps its joint (and its length, above).
             slot.transition_in = old.transition_in;
             used.insert(slot.asset);
             eprintln!("slot {}: {} -> {}", i + 1, old.describe(), slot.describe());
@@ -714,6 +788,12 @@ pub async fn apply_ops(proj: &mut ReelProject, ops: &[EditOp], config: &Config) 
         !order.is_empty(),
         "every slot was dropped; nothing left to render"
     );
+    if transitioned.contains(&order[0]) {
+        eprintln!(
+            "slot {} opens the reel and has no joint; its transition is ignored",
+            order[0] + 1
+        );
+    }
     let mut old: Vec<Option<Slot>> = proj.slots.drain(..).map(Some).collect();
     proj.slots = order
         .iter()
@@ -793,6 +873,374 @@ mod tests {
         p.save(&path).unwrap();
         let err = ReelProject::load(&path).unwrap_err().to_string();
         assert!(err.contains("version"), "{err}");
+    }
+
+    fn project(prompt: &str, out: &Path) -> ReelProject {
+        ReelProject::new(
+            prompt.into(),
+            (1080, 1920),
+            "auto".into(),
+            None,
+            None,
+            out,
+            vec![slot()],
+        )
+    }
+
+    #[test]
+    fn save_replaces_an_existing_project_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reel.eidetic.json");
+
+        project("first", &path).save(&path).unwrap();
+        project("second", &path).save(&path).unwrap();
+
+        assert_eq!(ReelProject::load(&path).unwrap().prompt, "second");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("reel.eidetic.json")]);
+    }
+
+    /// Replacement, not overwrite-in-place. The hard link is a second name
+    /// for the saved file's inode; a `save` that truncates and rewrites that
+    /// inode — as `fs::write` did — changes what the link resolves to, and
+    /// a save that fails halfway leaves the link on a half-written project.
+    /// After a rename the link still names the old inode, complete.
+    ///
+    /// This is the property the previous implementation did not have, and the
+    /// closest a test can get to "a reader mid-save sees a whole project"
+    /// without racing a second thread.
+    #[test]
+    fn save_replaces_the_file_rather_than_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reel.eidetic.json");
+        project("first", &path).save(&path).unwrap();
+
+        let link = dir.path().join("first.hardlink.json");
+        std::fs::hard_link(&path, &link).unwrap();
+
+        project("second", &path).save(&path).unwrap();
+
+        let old = ReelProject::load(&link).expect("old inode is still a whole project");
+        assert_eq!(old.prompt, "first");
+        assert_eq!(old.slots.len(), 1);
+        assert_eq!(ReelProject::load(&path).unwrap().prompt, "second");
+
+        // And the two names are now different files, not one shared inode.
+        assert_ne!(
+            std::fs::read(&link).unwrap(),
+            std::fs::read(&path).unwrap(),
+            "save wrote through the existing inode"
+        );
+    }
+
+    /// What this covers: a save that fails at the rename removes its temp
+    /// file, does not disturb the destination, and does not touch unrelated
+    /// projects in the same directory. It does *not* cover an overwrite of
+    /// an existing project failing partway — see
+    /// `save_replaces_the_file_rather_than_writing_through_it` for that.
+    ///
+    /// A directory at the destination is the portable way to make `persist`
+    /// fail after the temp file has been fully written and synced.
+    #[test]
+    fn failed_save_removes_its_temp_file_and_leaves_other_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("reel.eidetic.json");
+        project("keep me", &good).save(&good).unwrap();
+
+        let blocked = dir.path().join("blocked.eidetic.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let err = project("never lands", &blocked)
+            .save(&blocked)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blocked.eidetic.json"), "{err}");
+
+        assert_eq!(ReelProject::load(&good).unwrap().prompt, "keep me");
+        assert!(blocked.is_dir());
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                std::ffi::OsString::from("blocked.eidetic.json"),
+                std::ffi::OsString::from("reel.eidetic.json"),
+            ],
+            "a temp file was left behind"
+        );
+    }
+
+    #[test]
+    fn bare_filenames_stage_in_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("reel.eidetic.json")), Path::new("."));
+        assert_eq!(
+            parent_dir(Path::new("out/reel.eidetic.json")),
+            Path::new("out")
+        );
+        assert_eq!(
+            parent_dir(Path::new("/tmp/reel.eidetic.json")),
+            Path::new("/tmp")
+        );
+    }
+
+    #[test]
+    fn previews_render_beside_the_output_at_half_size() {
+        let p = ReelProject::new(
+            "x".into(),
+            (1080, 1920),
+            "auto".into(),
+            None,
+            None,
+            Path::new("/out/reel.v2.mp4"),
+            vec![],
+        );
+        let full = p.render_target(false);
+        assert_eq!(full.path, PathBuf::from("/out/reel.v2.mp4"));
+        assert_eq!((full.width, full.height), (1080, 1920));
+        let preview = p.render_target(true);
+        assert_eq!(preview.path, PathBuf::from("/out/reel.v2.preview.mp4"));
+        assert_eq!((preview.width, preview.height), (540, 960));
+    }
+
+    // -- apply_ops -----------------------------------------------------------
+    //
+    // None of these swap successfully, so no model or database is touched:
+    // the config points into an empty temp dir, and a swap that got as far
+    // as loading SigLIP would fail loudly rather than download anything.
+
+    fn config(dir: &Path) -> Config {
+        Config {
+            paths: eidetic_core::config::Paths {
+                library_dir: dir.join("library"),
+                models_cache: dir.join("models"),
+            },
+            database_path: dir.join("eidetic.db"),
+        }
+    }
+
+    /// Four unpinned photo slots with hard cuts (photos: retime never
+    /// probes).
+    fn four() -> ReelProject {
+        let slots = (0..4)
+            .map(|i| Slot {
+                kind: SlotKind::Photo,
+                start: 0.0,
+                duration: 2.0 + i as f64,
+                focus_x: None,
+                pinned: false,
+                transition_in: Transition::Cut,
+                ..slot()
+            })
+            .collect();
+        ReelProject::new(
+            "x".into(),
+            (320, 180),
+            "auto".into(),
+            None,
+            None,
+            Path::new("/tmp/x.mp4"),
+            slots,
+        )
+    }
+
+    fn assets(p: &ReelProject) -> Vec<AssetId> {
+        p.slots.iter().map(|s| s.asset).collect()
+    }
+
+    async fn apply(p: &mut ReelProject, ops: serde_json::Value) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let ops: Vec<EditOp> = serde_json::from_value(ops).unwrap();
+        apply_ops(p, &ops, &config(dir.path())).await
+    }
+
+    #[tokio::test]
+    async fn a_mixed_batch_resolves_every_number_against_the_original_list() {
+        let mut p = four();
+        let a = assets(&p);
+        // Listed in the reverse of the application order on purpose: the
+        // listing order must not matter.
+        apply(
+            &mut p,
+            serde_json::json!([
+                {"op": "reorder", "order": [4, 1, 3]},
+                {"op": "drop", "slot": 2},
+                {"op": "transition", "slot": 1, "style": "crossfade:0.4"},
+                {"op": "retime", "slot": 4, "secs": 1.5},
+                {"op": "pin", "slot": 3},
+            ]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(assets(&p), vec![a[3], a[0], a[2]]);
+        assert_eq!(p.slots[0].duration, 1.5, "retime followed original slot 4");
+        assert_eq!(
+            p.slots[1].transition_in,
+            Transition::Crossfade { secs: 0.4 },
+            "the transition travels with original slot 1's shot"
+        );
+        assert!(p.slots[2].pinned, "the pin followed original slot 3");
+        assert!(!p.slots[0].pinned && !p.slots[1].pinned);
+    }
+
+    /// The two-call recipe the edit_reel description gives for putting a
+    /// joint into a position the reorder creates.
+    #[tokio::test]
+    async fn transition_after_a_reorder_uses_the_new_numbering() {
+        let mut p = four();
+        let a = assets(&p);
+        apply(
+            &mut p,
+            serde_json::json!([{"op": "reorder", "order": [3, 1, 2, 4]}]),
+        )
+        .await
+        .unwrap();
+        apply(
+            &mut p,
+            serde_json::json!([{"op": "transition", "slot": 2, "style": "dip"}]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(assets(&p), vec![a[2], a[0], a[1], a[3]]);
+        assert_eq!(p.slots[1].asset, a[0]);
+        assert!(matches!(
+            p.slots[1].transition_in,
+            Transition::DipToBlack { .. }
+        ));
+        assert!(
+            p.slots
+                .iter()
+                .enumerate()
+                .all(|(i, s)| i == 1 || s.transition_in == Transition::Cut)
+        );
+    }
+
+    /// Transition and reorder in ONE call: the transition names the shot,
+    /// so moving slot 1 later still gives it its joint (it used to be
+    /// dropped as "slot 1 has no joint"), and the shot moved to the front
+    /// carries its transition inertly.
+    #[tokio::test]
+    async fn transition_and_reorder_in_one_call_follow_the_shot() {
+        let mut p = four();
+        let a = assets(&p);
+        apply(
+            &mut p,
+            serde_json::json!([
+                {"op": "transition", "slot": 1, "style": "whip"},
+                {"op": "transition", "slot": 3, "style": "crossfade"},
+                {"op": "reorder", "order": [3, 1, 2, 4]},
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(assets(&p), vec![a[2], a[0], a[1], a[3]]);
+        assert!(matches!(p.slots[1].transition_in, Transition::Whip { .. }));
+        // First on the timeline: stored, but render never reads slot 0's
+        // joint.
+        assert!(matches!(
+            p.slots[0].transition_in,
+            Transition::Crossfade { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pins_guard_drop_and_swap_within_the_same_batch() {
+        let mut p = four();
+        p.slots[1].pinned = true;
+
+        for ops in [
+            serde_json::json!([{"op": "drop", "slot": 2}]),
+            serde_json::json!([{"op": "swap", "slot": 2, "query": "beach"}]),
+            serde_json::json!([{"op": "pin", "slot": 3}, {"op": "drop", "slot": 3}]),
+            serde_json::json!([{"op": "swap", "slot": 3, "query": "beach"}, {"op": "pin", "slot": 3}]),
+        ] {
+            let mut q = four();
+            q.slots[1].pinned = true;
+            let err = apply(&mut q, ops.clone()).await.unwrap_err().to_string();
+            assert!(err.contains("is pinned"), "{ops}: {err}");
+        }
+
+        // Unpinning in the same batch releases the slot.
+        let a = assets(&p);
+        apply(
+            &mut p,
+            serde_json::json!([{"op": "drop", "slot": 2}, {"op": "unpin", "slot": 2}]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(assets(&p), vec![a[0], a[2], a[3]]);
+    }
+
+    #[tokio::test]
+    async fn invalid_numbers_and_orders_are_refused() {
+        for (ops, want) in [
+            (serde_json::json!([{"op": "pin", "slot": 0}]), "no slot 0"),
+            (serde_json::json!([{"op": "drop", "slot": 5}]), "no slot 5"),
+            (
+                serde_json::json!([{"op": "transition", "slot": 9, "style": "cut"}]),
+                "no slot 9",
+            ),
+            (
+                serde_json::json!([{"op": "reorder", "order": [1, 2, 3, 5]}]),
+                "no slot 5",
+            ),
+            (
+                serde_json::json!([{"op": "reorder", "order": [1, 1, 2, 3]}]),
+                "exactly once",
+            ),
+            (
+                serde_json::json!([{"op": "reorder", "order": [3, 1, 2]}]),
+                "exactly once",
+            ),
+            // A reorder beside a drop still uses the ORIGINAL numbers:
+            // meaning "4,1,3" in post-drop numbering as [3,1,2] names the
+            // dropped slot 2 and misses slot 4...
+            (
+                serde_json::json!([{"op": "drop", "slot": 2}, {"op": "reorder", "order": [3, 1, 2]}]),
+                "exactly once",
+            ),
+            (
+                serde_json::json!([
+                    {"op": "reorder", "order": [1, 2, 3, 4]},
+                    {"op": "reorder", "order": [4, 3, 2, 1]},
+                ]),
+                "at most one reorder",
+            ),
+            (
+                serde_json::json!([{"op": "retime", "slot": 1, "secs": 0.1}]),
+                "0.3s",
+            ),
+            (
+                serde_json::json!([{"op": "transition", "slot": 2, "style": "wipe"}]),
+                "wipe",
+            ),
+            (
+                serde_json::json!(
+                    [1, 2, 3, 4].map(|s| serde_json::json!({"op": "drop", "slot": s}))
+                ),
+                "every slot was dropped",
+            ),
+        ] {
+            let mut p = four();
+            let err = apply(&mut p, ops.clone()).await.unwrap_err().to_string();
+            assert!(err.contains(want), "{ops}: {err}");
+        }
+
+        // ...while naming the survivors by their original numbers works.
+        let mut p = four();
+        let a = assets(&p);
+        apply(
+            &mut p,
+            serde_json::json!([{"op": "drop", "slot": 2}, {"op": "reorder", "order": [4, 1, 3]}]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(assets(&p), vec![a[3], a[0], a[2]]);
     }
 
     #[test]

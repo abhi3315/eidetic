@@ -2,7 +2,7 @@
 //! `docs/superpowers/specs/2026-05-19-http-server-design.md` for scope.
 
 use axum::Router;
-use axum::response::{Html, IntoResponse};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use eidetic_db::{AssetsRepo, FacesRepo};
 use eidetic_ml::SiglipEmbedder;
@@ -56,7 +56,7 @@ pub(crate) enum ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> axum::response::Response {
-        use axum::http::StatusCode;
+        use axum::http::{StatusCode, header};
         let (status, body) = match &self {
             ServerError::NotFound(what) => (StatusCode::NOT_FOUND, format!("Not found: {what}")),
             ServerError::BadRequest(why) => {
@@ -91,7 +91,21 @@ impl IntoResponse for ServerError {
                 )
             }
         };
-        (status, Html(format!("<!doctype html><pre>{body}</pre>"))).into_response()
+        // Plain text, never HTML. These bodies quote request-derived strings
+        // — a thumbnail size, a hash, a dav path — and rendering them as a
+        // document turns one missing escape into reflected XSS against a
+        // server that has no auth to protect it. `nosniff` stops a browser
+        // from second-guessing the type when the body happens to open with
+        // markup.
+        (
+            status,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            body,
+        )
+            .into_response()
     }
 }
 
