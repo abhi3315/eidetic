@@ -437,12 +437,8 @@ pub fn render(
         let seg_path = workdir.path().join(format!("seg_{i:03}.mp4"));
         let rendered = slot.duration + fade;
         let mut vf = match slot.kind {
-            SlotKind::Video => match slot.focus_x {
-                Some(fx) => focus_filter(width, height, fit.resolve(true), fx),
-                None => normalize_filter(width, height, fit.resolve(false)),
-            },
             SlotKind::Photo => ken_burns_filter(width, height, rendered),
-            SlotKind::PhotoScenic => blur_fill_filter(width, height),
+            SlotKind::Video | SlotKind::PhotoScenic => still_filter(slot, width, height, fit),
         };
         // Real phone footage carries non-square sample aspect ratios; the
         // concat/xfade filters refuse inputs whose SARs differ, so every
@@ -890,18 +886,43 @@ pub fn photo_source(r: &SearchResult, library_dir: &Path) -> PathBuf {
     r.storage_path.clone()
 }
 
+/// How `slot`'s picture sits in a `w`x`h` frame, as one still: exactly the
+/// render's framing for videos and scenic photos, and for photos the
+/// cover-crop the Ken Burns push-in starts from. Shared with the preview
+/// sheet so a tile shows what the reel will.
+pub(crate) fn still_filter(slot: &Slot, w: u32, h: u32, fit: Fit) -> String {
+    match slot.kind {
+        SlotKind::Video => match slot.focus_x {
+            Some(fx) => focus_filter(w, h, fit.resolve(true), fx),
+            None => normalize_filter(w, h, fit.resolve(false)),
+        },
+        SlotKind::Photo => normalize_filter(w, h, Fit::Cover),
+        SlotKind::PhotoScenic => blur_fill_filter(w, h),
+    }
+}
+
 /// Cover-crop centred on a horizontal focus point (0..1 of source width) —
 /// the crop window slides to keep faces in frame, clamped to the image.
 /// Pad mode has no crop to steer, so focus degrades to the plain filter.
 fn focus_filter(w: u32, h: u32, fit: Fit, fx: f64) -> String {
     match fit {
         Fit::Pad | Fit::Blur | Fit::Auto => normalize_filter(w, h, fit),
-        Fit::Cover => format!(
-            "scale={w}:{h}:force_original_aspect_ratio=increase,\
-             crop={w}:{h}:'clip(iw*{fx:.4}-ow/2,0,iw-ow)':'(ih-oh)/2',\
-             fps=30,format=yuv420p"
-        ),
+        Fit::Cover => format!("{},fps=30,format=yuv420p", cover_filter(w, h, Some(fx))),
     }
+}
+
+/// Cover-fit to `w`x`h`: crop the source to the frame's aspect (the window
+/// steered to horizontal focus `fx`, else centred), then scale. The same
+/// picture as scaling to cover and cropping after, but ffmpeg never holds an
+/// enlarged intermediate — scale-first turns a 32000x16 panorama covering a
+/// 180x320 frame into a 640000x320 one. Here nothing is ever larger than the
+/// source or the frame.
+fn cover_filter(w: u32, h: u32, fx: Option<f64>) -> String {
+    let x = match fx {
+        Some(fx) => format!("clip(iw*{fx:.4}-ow/2,0,iw-ow)"),
+        None => "(iw-ow)/2".to_string(),
+    };
+    format!("crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})':'{x}':'(ih-oh)/2',scale={w}:{h}")
 }
 
 /// Fit the input to the frame per `fit`, normalise fps/pixfmt so concat's
@@ -912,23 +933,28 @@ fn normalize_filter(w: u32, h: u32, fit: Fit) -> String {
             "scale={w}:{h}:force_original_aspect_ratio=decrease,\
              pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p"
         ),
-        Fit::Cover => format!(
-            "scale={w}:{h}:force_original_aspect_ratio=increase,\
-             crop={w}:{h},fps=30,format=yuv420p"
-        ),
+        Fit::Cover => format!("{},fps=30,format=yuv420p", cover_filter(w, h, None)),
         Fit::Blur | Fit::Auto => blur_fill_filter(w, h),
     }
 }
 
 /// The cinematic mismatched-aspect treatment: the frame is a blurred,
 /// darkened cover of the clip, with the clip itself fitted inside intact.
+///
+/// The blur radius is 20 wherever the frame allows it (every render size),
+/// and shrinks for frames boxblur would otherwise refuse: a radius must stay
+/// under half of each plane, so a 320x32 preview tile of a 10:1 reel caps
+/// luma at 15 and 4:2:0 chroma at 7.
 fn blur_fill_filter(w: u32, h: u32) -> String {
     format!(
         "split[bg][fg];\
-         [bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},\
-         boxblur=20:2,eq=brightness=-0.15[b];\
+         [bg]{},\
+         boxblur=luma_radius='min(20,min(w,h)/2-1)':luma_power=2:\
+         chroma_radius='min(20,min(cw,ch)/2-1)':chroma_power=2,\
+         eq=brightness=-0.15[b];\
          [fg]scale={w}:{h}:force_original_aspect_ratio=decrease[f];\
-         [b][f]overlay=(W-w)/2:(H-h)/2,fps=30,format=yuv420p"
+         [b][f]overlay=(W-w)/2:(H-h)/2,fps=30,format=yuv420p",
+        cover_filter(w, h, None)
     )
 }
 
@@ -940,10 +966,10 @@ fn ken_burns_filter(w: u32, h: u32, secs: f64) -> String {
     // how long the beat span holds the photo.
     let rate = 0.15 / frames as f64;
     format!(
-        "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},\
-         zoompan=z='min(zoom+{rate:.6},1.15)':\
+        "{},zoompan=z='min(zoom+{rate:.6},1.15)':\
          x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':\
-         d={frames}:s={w}x{h}:fps=30,format=yuv420p"
+         d={frames}:s={w}x{h}:fps=30,format=yuv420p",
+        cover_filter(w, h, None)
     )
 }
 

@@ -5,10 +5,14 @@
 //! for Claude Code / Codex / Cursor / local LM Studio clients. Two hard
 //! rules, both from the market research:
 //!
-//! 1. **Metadata only.** Tools return paths, timecodes, scores and
-//!    transcript excerpts — never pixels. Connecting a cloud agent sends
-//!    tool *results* to that provider; keeping pixels out bounds what can
-//!    leak (and the fully-local LM Studio path stays first-class).
+//! 1. **Metadata only, unless the operator opts in.** Tools return paths,
+//!    timecodes, scores and transcript excerpts — never pixels. Connecting
+//!    a cloud agent sends tool *results* to that provider; keeping pixels
+//!    out bounds what can leak (and the fully-local LM Studio path stays
+//!    first-class). The one exception is `preview_sheet` (goals-v0.9.md
+//!    phase 1), which exists only when the server was started with
+//!    `--allow-previews`: without it the tool is not listed, and a direct
+//!    call is refused before any file is read.
 //! 2. **Compact output.** Agent sessions compound context fast; every
 //!    result is small JSON, capped lists, rounded numbers.
 //!
@@ -16,7 +20,7 @@
 //! (tracing already does).
 
 use crate::project::{self, EditOp, ReelProject, ReelSpec};
-use crate::{otio, reel};
+use crate::{otio, preview, reel};
 use eidetic_core::Config;
 use eidetic_db::{AssetsRepo, FacesRepo, SearchFilters};
 use rmcp::handler::server::wrapper::Parameters;
@@ -44,10 +48,18 @@ pub struct EideticMcp {
     /// pay for it at all. Same resident-worker shape as `eidetic-server`,
     /// with the eager load traded for a `OnceCell`.
     embedder: OnceCell<mpsc::Sender<EmbedJob>>,
+    /// `eidetic mcp --allow-previews`: may a tool return pixels?
+    allow_previews: bool,
 }
 
+/// What a preview call gets from a metadata-only server.
+const PREVIEWS_OFF: &str = "preview_sheet is disabled: this server is metadata-only. \
+    The sheet shows real frames from the library to the model, so the operator must opt \
+    in by restarting the server as `eidetic mcp --allow-previews`. Until then, render \
+    with preview=true and ask the human to watch it.";
+
 /// Serve the library over stdio until the client disconnects.
-pub async fn serve() -> anyhow::Result<()> {
+pub async fn serve(allow_previews: bool) -> anyhow::Result<()> {
     use anyhow::Context;
     let config = Config::from_env()?;
     let pool = eidetic_db::connect(&config)
@@ -59,6 +71,7 @@ pub async fn serve() -> anyhow::Result<()> {
         repo: AssetsRepo::new(pool),
         faces,
         embedder: OnceCell::new(),
+        allow_previews,
     };
     let service = server
         .serve(rmcp::transport::stdio())
@@ -166,6 +179,15 @@ struct RenderParams {
 struct ProjectParams {
     /// Path to the project file (reel.eidetic.json).
     project: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PreviewParams {
+    /// Path to the project file (reel.eidetic.json).
+    project: String,
+    /// First slot on the sheet, 1-based (default 1). A sheet holds at most
+    /// 24 slots; longer reels page with first=25, first=49, …
+    first: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -392,7 +414,7 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Render a reel project with ffmpeg (H.264 + the audio track) and return the path written. Full renders replace the project's output; preview=true renders half-resolution to a separate <output>.preview.mp4, leaving the full-res output and the project file untouched. A failed render leaves any earlier file in place."
+        description = "Render a reel project with ffmpeg (H.264 + the audio track) and return the path written. Full renders replace the project's output; preview=true renders half-resolution to a separate file whose extension is replaced by .preview.mp4 (output reel.mp4 → reel.preview.mp4), leaving the full-res output and the project file untouched. A failed render leaves any earlier file in place."
     )]
     async fn render(
         &self,
@@ -433,6 +455,60 @@ impl EideticMcp {
             }
             .await,
         )
+    }
+
+    #[tool(
+        description = "PRIVACY OPT-IN: available only when the operator started the server with `eidetic mcp --allow-previews`; otherwise it is refused and nothing is read. \
+            Returns a JPEG contact sheet of a reel project so you can judge the cut with your own vision: one tile per slot (the midpoint frame of a video slot's span, or the photo), framed and rotated the way the render frames it, labelled with slot number, duration and incoming transition (OPEN on slot 1). \
+            These are real frames from the user's library; with a cloud client they are sent to its provider. \
+            At most 24 slots per sheet (page with first); tiles are at most 320px on the long edge. \
+            A text block with the per-tile timestamps comes first, so clients that cannot show images still get the metadata. \
+            Reads only: the project file and any rendered video are left untouched, and no sheet file is written."
+    )]
+    async fn preview_sheet(
+        &self,
+        Parameters(p): Parameters<PreviewParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Checked before the project is even opened: a metadata-only server
+        // must not touch pixels, not merely withhold them.
+        if !self.allow_previews {
+            return reply(Err(anyhow::anyhow!(PREVIEWS_OFF)));
+        }
+        let sheet = async {
+            let path = PathBuf::from(&p.project);
+            let proj = preview::load_project(&path).await?;
+            let first = p.first.unwrap_or(1) as usize;
+            let sheet = preview::contact_sheet(&proj, first).await?;
+            let last = sheet.tiles.last().map_or(first, |t| t.n);
+            let total = proj.slots.len();
+            let meta = json!({
+                "project": path,
+                "format": "image/jpeg",
+                "size": format!("{}x{}", sheet.width, sheet.height),
+                "slots": format!("{first}-{last} of {total}"),
+                "next_first": (last < total).then_some(last + 1),
+                "tiles": sheet.tiles.iter().map(|t| json!({
+                    "n": t.n,
+                    "kind": slot_kind(t.kind),
+                    "at_secs": round2(t.at),
+                    "secs": round2(t.duration),
+                    "transition_in": transition_spec(t.transition_in),
+                })).collect::<Vec<_>>(),
+            });
+            Ok::<_, anyhow::Error>((meta, sheet.jpeg))
+        }
+        .await;
+        match sheet {
+            Ok((meta, jpeg)) => {
+                use base64::Engine;
+                let data = base64::engine::general_purpose::STANDARD.encode(jpeg);
+                Ok(CallToolResult::success(vec![
+                    ContentBlock::text(meta.to_string()),
+                    ContentBlock::image(data, "image/jpeg"),
+                ]))
+            }
+            Err(e) => reply(Err(e)),
+        }
     }
 }
 
@@ -626,29 +702,52 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
                 "n": i + 1,
                 "asset": s.asset.to_string(),
                 "source": s.source,
-                "kind": match s.kind {
-                    reel::SlotKind::Video => "video",
-                    reel::SlotKind::Photo => "photo",
-                    reel::SlotKind::PhotoScenic => "photo_scenic",
-                },
+                "kind": slot_kind(s.kind),
                 "start": round2(s.start),
                 "secs": round2(s.duration),
                 "score": round2(s.score as f64),
                 "pinned": s.pinned,
-                "transition_in": match s.transition_in {
-                    reel::Transition::Cut => "cut".to_string(),
-                    reel::Transition::Crossfade { secs } => format!("crossfade:{secs}"),
-                    reel::Transition::DipToBlack { secs } => format!("dip:{secs}"),
-                    reel::Transition::Slide { secs } => format!("slide:{secs}"),
-                    reel::Transition::Whip { secs } => format!("whip:{secs}"),
-                },
+                "transition_in": transition_spec(s.transition_in),
             })
         }).collect::<Vec<_>>(),
     })
 }
 
+fn slot_kind(k: reel::SlotKind) -> &'static str {
+    match k {
+        reel::SlotKind::Video => "video",
+        reel::SlotKind::Photo => "photo",
+        reel::SlotKind::PhotoScenic => "photo_scenic",
+    }
+}
+
+/// A transition in the edit-op vocabulary, e.g. `crossfade:0.8`.
+fn transition_spec(t: reel::Transition) -> String {
+    match t {
+        reel::Transition::Cut => "cut".to_string(),
+        reel::Transition::Crossfade { secs } => format!("crossfade:{secs}"),
+        reel::Transition::DipToBlack { secs } => format!("dip:{secs}"),
+        reel::Transition::Slide { secs } => format!("slide:{secs}"),
+        reel::Transition::Whip { secs } => format!("whip:{secs}"),
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for EideticMcp {
+    /// The tool list, minus `preview_sheet` on a metadata-only server: an
+    /// agent should not be offered what it would be refused.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let mut tools = Self::tool_router().list_all();
+        if !self.allow_previews {
+            tools.retain(|t| t.name != "preview_sheet");
+        }
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(
@@ -662,6 +761,22 @@ impl ServerHandler for EideticMcp {
              timecodes, scores — never pixels."
                 .to_string(),
         );
+        if self.allow_previews {
+            info.instructions = Some(
+                "Eidetic: a fully local media library (photos, videos, faces, \
+                 speech) with a beat-synced reel editor. Search and inspect \
+                 with the context tools; direct an edit with create_reel → \
+                 edit_reel (iterate on the cut list — check every slot's \
+                 score, swap weak ones, keep the hero shot on the drop) → \
+                 preview_sheet (look at every slot: same-scene repeats, \
+                 sideways or weak shots) → render (preview first, full-res \
+                 when happy) → export_otio for hand-polish. The operator \
+                 opted into previews: preview_sheet returns real frames from \
+                 the library as an image; every other tool returns metadata \
+                 only."
+                    .to_string(),
+            );
+        }
         info
     }
 }

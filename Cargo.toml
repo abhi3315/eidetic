@@ -76,6 +76,8 @@ clap = { version = "4", features = ["derive"] }
 # MCP server (official Rust SDK; goals-v0.8.md phase 1). Default features
 # already include server + macros; transport-io adds the stdio transport.
 rmcp = { version = "3.2", features = ["transport-io"] }
+# MCP image content is base64 (the same major rmcp already links).
+base64 = "0.23"
 # JSON Schema derive for MCP tool parameter types (the version rmcp uses).
 schemars = "1"
 

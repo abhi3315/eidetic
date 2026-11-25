@@ -54,7 +54,44 @@ impl ReelProject {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read project file {}", path.display()))?;
-        let project: ReelProject = serde_json::from_slice(&bytes)
+        Self::parse(path, &bytes)
+    }
+
+    /// [`load`](Self::load) for paths nobody vetted: refuses anything but a
+    /// regular file (a FIFO would block the read forever, a device would
+    /// never end) and reads at most `max_bytes`, so a hostile or mistaken
+    /// path costs a bounded allocation.
+    pub fn load_bounded(path: &Path, max_bytes: u64) -> Result<Self> {
+        use std::io::Read;
+        let not_a_file = || {
+            anyhow::anyhow!(
+                "{} is not a regular file; pass a reel project file",
+                path.display()
+            )
+        };
+        // Checked before opening: opening a FIFO for reading blocks until a
+        // writer appears. Re-checked on the handle in case the path was
+        // swapped in between.
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("failed to read project file {}", path.display()))?;
+        anyhow::ensure!(meta.is_file(), not_a_file());
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to read project file {}", path.display()))?;
+        anyhow::ensure!(file.metadata()?.is_file(), not_a_file());
+        let mut bytes = Vec::new();
+        file.take(max_bytes + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read project file {}", path.display()))?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= max_bytes,
+            "{} is larger than {max_bytes} bytes; that is not a reel project file",
+            path.display()
+        );
+        Self::parse(path, &bytes)
+    }
+
+    fn parse(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let project: ReelProject = serde_json::from_slice(bytes)
             .with_context(|| format!("{} is not a reel project file", path.display()))?;
         if project.version > VERSION {
             anyhow::bail!(

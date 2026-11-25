@@ -2,6 +2,7 @@ mod dupes;
 mod eval;
 mod mcp;
 mod otio;
+mod preview;
 mod project;
 mod reel;
 
@@ -218,10 +219,18 @@ enum Command {
     /// database and report corruption, missing files and orphans.
     Verify,
     /// Serve the library to an AI agent over MCP on stdio (goals-v0.8.md).
-    /// Tools return metadata only — paths, timecodes, scores, transcripts —
-    /// never pixels. Register in Claude Code with:
+    /// By default tools return metadata only — paths, timecodes, scores,
+    /// transcripts — never pixels. Register in Claude Code with:
     ///   claude mcp add eidetic -- eidetic mcp
-    Mcp,
+    Mcp {
+        /// Privacy opt-in: expose the preview_sheet tool, which returns a
+        /// JPEG contact sheet of a reel's slots (real frames from your
+        /// photos and videos) to the connected model. With a cloud client
+        /// those pixels go to its provider. Off by default; without this
+        /// flag the tool is not listed and refuses to run.
+        #[arg(long)]
+        allow_previews: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1333,8 +1342,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Mcp => {
-            mcp::serve().await?;
+        Command::Mcp { allow_previews } => {
+            mcp::serve(allow_previews).await?;
         }
 
         Command::Transcode => {

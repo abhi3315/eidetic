@@ -998,6 +998,7 @@ name = "eidetic-cli"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "csv",
@@ -1006,6 +1007,7 @@ dependencies = [
  "eidetic-ingest",
  "eidetic-ml",
  "eidetic-server",
+ "image",
  "rmcp",
  "schemars",
  "serde",

@@ -36,9 +36,24 @@ not invented.
      put a joint into a position the reorder *creates*, use two calls:
      `reorder [3, 1, 2]`, then `transition` slot 2 against the cut list
      that call returned.
+   - **Look, if you are allowed to.** When the tool list includes
+     `preview_sheet`, the operator started the server with
+     `eidetic mcp --allow-previews` and agreed to show you real frames.
+     Call it after each round of edits: one JPEG with a tile per slot
+     (a video slot's midpoint frame, or the photo), framed and rotated
+     the way the render will, labelled `#n`, duration and incoming
+     transition. Catch what scores can't: three files of the same
+     posing scene, a clip whose content is sideways, a "rapids" match
+     that is really a stream. Sheets hold 24 slots; page with `first`.
+     It reads only — no file is written, the project is untouched.
+     Without the opt-in the tool is absent, and calling it anyway is
+     refused: never ask for a workaround (a shell, raw ffmpeg), ask the
+     human to look instead.
 5. **`render` with `preview: true`** and show the human. Pixels are the
-   human's call — never claim a reel "looks good", you haven't seen it.
-   The preview lands at `<output>.preview.mp4` (the `output` the tool
+   human's call — never claim a reel "looks good" on a sheet's
+   evidence alone; it shows single frames, not motion or music.
+   The preview's extension is replaced, not appended to: output
+   `reel.mp4` previews to `reel.preview.mp4` (the `output` the tool
    returns); it never replaces the full-res reel or changes the project.
 6. Apply follow-ups to the same project; render full-res once, at the end.
 7. Offer **`export_otio`** when the user wants polish beyond the tools
@@ -82,8 +97,8 @@ not invented.
 - Scores are cosine similarities (~0.05–0.4 range in practice); compare
   *within* a result list, never across queries.
 - The sharpness gate already dropped clearly-blurry candidates; a slot
-  that made it in is at worst soft. You cannot see pixels — only the human
-  can. Preview early.
+  that made it in is at worst soft. Without `preview_sheet` you cannot see
+  pixels — only the human can. Preview early.
 - `transcript` is recall fuel (what was said, when) — quote it when
   choosing voiceover shots, never burn it in as subtitles.
 - Renders are deterministic from the project file: same file, same reel.
