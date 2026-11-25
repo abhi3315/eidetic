@@ -35,16 +35,93 @@ const TIGHTNESS: f64 = 100.0;
 
 /// A track's rhythm, as the reel planner consumes it. Serializable because
 /// reel project files persist it (goals-v0.8.md phase 0).
+///
+/// Every way in — tracking, [`BeatGrid::from_inferred`], deserialization —
+/// goes through [`BeatGrid::sanitize`], so a grid never holds a non-finite,
+/// negative or unsorted beat, nor a downbeat index past the end of `beats`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawGrid")]
 pub struct BeatGrid {
     pub bpm: f64,
     /// Beat times in seconds, ascending.
     pub beats: Vec<f64>,
-    /// Indices into `beats` that start a bar (every 4th beat, anchored on
-    /// the strongest onset — the pragmatic stand-in for real downbeat ML).
+    /// Indices into `beats` that start a bar. What they mean depends on
+    /// `tracker`: model-inferred bar starts for [`Tracker::BeatThis`], but
+    /// for [`Tracker::Ellis`] only every 4th beat anchored on the strongest
+    /// onset — a guess, not a detected bar. [`BeatGrid::downbeats_inferred`]
+    /// is the one question planners should ask.
     pub downbeats: Vec<usize>,
     /// High-energy spans (seconds): where cuts should get denser.
     pub high_energy: Vec<(f64, f64)>,
+    /// Which tracker produced this grid. Project files written before
+    /// v0.9 lack the field and load as Ellis, which is what made them.
+    pub tracker: Tracker,
+    /// The model behind an inferred grid.
+    pub model: Option<ModelProvenance>,
+    /// Why a Beat This run was attempted and this Ellis grid used instead.
+    pub fallback: Option<String>,
+}
+
+/// The beat tracker behind a [`BeatGrid`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tracker {
+    /// The in-crate spectral-flux + dynamic-programming tracker. Its bars
+    /// are heuristic.
+    #[default]
+    Ellis,
+    /// Beat This! (ISMIR 2024) model inference: beats and downbeats.
+    BeatThis,
+}
+
+impl Tracker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tracker::Ellis => "ellis",
+            Tracker::BeatThis => "beat-this",
+        }
+    }
+}
+
+/// Identity of the model files an inferred grid came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProvenance {
+    pub name: String,
+    /// Immutable upstream revision the files were fetched from.
+    pub revision: String,
+    /// SHA-256 of the beat model the digest check accepted.
+    pub sha256: String,
+}
+
+/// The wire shape of [`BeatGrid`]: identical fields, optional where older
+/// project files omit them. Converted through `sanitize` on the way in.
+#[derive(Deserialize)]
+struct RawGrid {
+    bpm: f64,
+    beats: Vec<f64>,
+    downbeats: Vec<usize>,
+    high_energy: Vec<(f64, f64)>,
+    #[serde(default)]
+    tracker: Tracker,
+    #[serde(default)]
+    model: Option<ModelProvenance>,
+    #[serde(default)]
+    fallback: Option<String>,
+}
+
+impl From<RawGrid> for BeatGrid {
+    fn from(r: RawGrid) -> Self {
+        BeatGrid {
+            bpm: r.bpm,
+            beats: r.beats,
+            downbeats: r.downbeats,
+            high_energy: r.high_energy,
+            tracker: r.tracker,
+            model: r.model,
+            fallback: r.fallback,
+        }
+        .sanitize()
+    }
 }
 
 impl BeatGrid {
@@ -52,6 +129,101 @@ impl BeatGrid {
     pub fn is_high_energy(&self, t: f64) -> bool {
         self.high_energy.iter().any(|(a, b)| t >= *a && t < *b)
     }
+
+    /// Are `downbeats` real, model-detected bar starts? False for Ellis
+    /// grids, whose bars are every 4th beat by assumption.
+    pub fn downbeats_inferred(&self) -> bool {
+        self.tracker == Tracker::BeatThis && self.model.is_some()
+    }
+
+    /// A grid from model output: beat and downbeat *times* (seconds), as
+    /// Beat This reports them. Each downbeat maps to the nearest beat
+    /// within 70 ms; one that matches no beat is dropped rather than
+    /// invented. `pcm` is the 16 kHz track, used for the energy sections.
+    /// `None` when fewer than four usable beats remain — no tempo.
+    pub fn from_inferred(
+        beats: &[f64],
+        downbeat_times: &[f64],
+        pcm: &[f32],
+        model: ModelProvenance,
+    ) -> Option<Self> {
+        const SNAP_SECS: f64 = 0.07;
+        let mut beats: Vec<f64> = beats
+            .iter()
+            .copied()
+            .filter(|t| t.is_finite() && *t >= 0.0)
+            .collect();
+        beats.sort_by(f64::total_cmp);
+        beats.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        if beats.len() < 4 {
+            return None;
+        }
+        let mut downbeats: Vec<usize> = downbeat_times
+            .iter()
+            .filter(|t| t.is_finite())
+            .filter_map(|&t| {
+                let i = beats.partition_point(|b| *b < t);
+                [i.checked_sub(1), Some(i)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|&j| j < beats.len())
+                    .min_by(|&a, &b| (beats[a] - t).abs().total_cmp(&(beats[b] - t).abs()))
+                    .filter(|&j| (beats[j] - t).abs() <= SNAP_SECS)
+            })
+            .collect();
+        downbeats.sort_unstable();
+        downbeats.dedup();
+        Some(
+            BeatGrid {
+                bpm: median_bpm(&beats),
+                beats,
+                downbeats,
+                high_energy: high_energy_spans(pcm),
+                tracker: Tracker::BeatThis,
+                model: Some(model),
+                fallback: None,
+            }
+            .sanitize(),
+        )
+    }
+
+    /// Enforce the grid invariants: beats finite, non-negative, strictly
+    /// ascending; downbeats strictly ascending indices that still point at
+    /// the same beat *times* they did before cleaning; energy spans finite
+    /// and non-empty; bpm finite and positive (re-derived when not).
+    pub fn sanitize(mut self) -> Self {
+        let downbeat_times: Vec<f64> = self
+            .downbeats
+            .iter()
+            .filter_map(|&i| self.beats.get(i).copied())
+            .collect();
+        self.beats.retain(|t| t.is_finite() && *t >= 0.0);
+        self.beats.sort_by(f64::total_cmp);
+        self.beats.dedup();
+        self.downbeats = downbeat_times
+            .iter()
+            .filter_map(|t| self.beats.binary_search_by(|b| b.total_cmp(t)).ok())
+            .collect();
+        self.downbeats.sort_unstable();
+        self.downbeats.dedup();
+        self.high_energy
+            .retain(|(a, b)| a.is_finite() && b.is_finite() && a < b);
+        if !(self.bpm.is_finite() && self.bpm > 0.0) {
+            self.bpm = median_bpm(&self.beats);
+        }
+        self
+    }
+}
+
+/// Tempo from the median inter-beat interval; 0 when it cannot be told.
+fn median_bpm(beats: &[f64]) -> f64 {
+    let mut intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+    if intervals.is_empty() {
+        return 0.0;
+    }
+    intervals.sort_by(f64::total_cmp);
+    let mid = intervals[intervals.len() / 2];
+    if mid > 0.0 { 60.0 / mid } else { 0.0 }
 }
 
 /// Track beats in 16 kHz mono PCM. `None` when no stable tempo exists
@@ -79,12 +251,18 @@ pub fn track_beats(pcm: &[f32]) -> Option<BeatGrid> {
         .unwrap_or(0);
     let downbeats: Vec<usize> = (0..beats.len()).filter(|i| i % 4 == anchor % 4).collect();
 
-    Some(BeatGrid {
-        bpm,
-        beats,
-        downbeats,
-        high_energy: high_energy_spans(pcm),
-    })
+    Some(
+        BeatGrid {
+            bpm,
+            beats,
+            downbeats,
+            high_energy: high_energy_spans(pcm),
+            tracker: Tracker::Ellis,
+            model: None,
+            fallback: None,
+        }
+        .sanitize(),
+    )
 }
 
 /// Log-compressed spectral flux, locally mean-subtracted and rectified.
@@ -395,6 +573,73 @@ mod tests {
         assert!(
             (spans[0].1 - 60.0).abs() <= 1.0,
             "runs to the end: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn ellis_grids_never_claim_inferred_downbeats() {
+        let grid = track_beats(&click_track(120.0, 15.0)).expect("grid");
+        assert_eq!(grid.tracker, Tracker::Ellis);
+        assert!(!grid.downbeats_inferred());
+        assert!(grid.model.is_none() && grid.fallback.is_none());
+    }
+
+    /// A v0.8 project file's grid: no tracker/model/fallback fields.
+    #[test]
+    fn pre_v09_grids_load_as_heuristic_ellis() {
+        let json = r#"{"bpm":120.0,"beats":[0.0,0.5,1.0,1.5,2.0],
+                       "downbeats":[0,4],"high_energy":[]}"#;
+        let grid: BeatGrid = serde_json::from_str(json).expect("old grid parses");
+        assert_eq!(grid.tracker, Tracker::Ellis);
+        assert!(!grid.downbeats_inferred());
+        assert_eq!(grid.downbeats, vec![0, 4]);
+    }
+
+    /// A hand-edited or damaged grid: out-of-order and negative beats,
+    /// indices past the end, a zero-length energy span, a bogus bpm.
+    /// Loading cleans it; downbeats keep pointing at the same *times*.
+    #[test]
+    fn deserialization_sanitizes_hostile_grids() {
+        let json = r#"{"bpm":-3.0,"beats":[1.0,-2.0,0.5,1.5,1.0,2.0],
+                       "downbeats":[0,1,3,99],"high_energy":[[4.0,4.0],[1.0,3.0]],
+                       "tracker":"beat-this",
+                       "model":{"name":"m","revision":"r","sha256":"s"}}"#;
+        let grid: BeatGrid = serde_json::from_str(json).expect("parses");
+        assert_eq!(grid.beats, vec![0.5, 1.0, 1.5, 2.0]);
+        // Old index 0 was t=1.0 (now index 1); index 1 was t=-2.0 (gone);
+        // index 3 was t=1.5 (now 2); 99 never existed.
+        assert_eq!(grid.downbeats, vec![1, 2]);
+        assert_eq!(grid.high_energy, vec![(1.0, 3.0)]);
+        assert!((grid.bpm - 120.0).abs() < 1e-9);
+        assert!(grid.downbeats_inferred());
+    }
+
+    fn provenance() -> ModelProvenance {
+        ModelProvenance {
+            name: "beat_this_small".into(),
+            revision: "rev".into(),
+            sha256: "abc".into(),
+        }
+    }
+
+    #[test]
+    fn inferred_grids_snap_downbeats_and_drop_non_finite_times() {
+        let beats = [0.0, f64::NAN, 0.5, 1.0, f64::INFINITY, 1.5, 2.0, -1.0, 2.5];
+        // 0.02 snaps to beat 0; 1.48 snaps to 1.5; 2.25 is between beats
+        // and matches nothing within 70 ms, so it is dropped, not invented.
+        let downbeats = [0.02, 1.48, 2.25, f64::NAN];
+        let grid = BeatGrid::from_inferred(&beats, &downbeats, &[], provenance()).expect("grid");
+        assert_eq!(grid.beats, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
+        assert_eq!(grid.downbeats, vec![0, 3]);
+        assert!((grid.bpm - 120.0).abs() < 1e-9);
+        assert!(grid.downbeats_inferred());
+        assert!(grid.fallback.is_none());
+    }
+
+    #[test]
+    fn inferred_output_with_too_few_beats_is_no_tempo() {
+        assert!(
+            BeatGrid::from_inferred(&[0.0, 0.5, f64::NAN], &[0.0], &[], provenance()).is_none()
         );
     }
 

@@ -191,6 +191,110 @@ pub(crate) fn parent_dir(path: &Path) -> &Path {
 }
 
 // ---------------------------------------------------------------------------
+// Beat tracking backend selection (docs/beat-tracking.md).
+// ---------------------------------------------------------------------------
+
+/// Which tracker `EIDETIC_BEAT_TRACKER` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerChoice {
+    /// Ellis only; no model is ever touched.
+    Ellis,
+    /// The default: Beat This when this build has it *and* its model is
+    /// already cached and verifies; otherwise Ellis, with the reason kept
+    /// on the grid. Never downloads.
+    Auto,
+    /// Beat This, downloading the pinned model on first use. Any failure is
+    /// an error — the user asked for inferred bars, so heuristic ones are
+    /// not substituted.
+    BeatThis,
+}
+
+impl TrackerChoice {
+    pub fn from_env() -> Result<Self> {
+        Self::parse(std::env::var("EIDETIC_BEAT_TRACKER").ok().as_deref())
+    }
+
+    /// Unknown values fail loudly (the `EIDETIC_ACCELERATOR` rule): a typo
+    /// must not silently mean "Ellis".
+    fn parse(v: Option<&str>) -> Result<Self> {
+        match v.map(str::trim) {
+            None | Some("") | Some("auto") => Ok(Self::Auto),
+            Some("ellis") => Ok(Self::Ellis),
+            Some("beat-this") => Ok(Self::BeatThis),
+            Some(other) => anyhow::bail!(
+                "EIDETIC_BEAT_TRACKER={other:?} is not one of: auto, ellis, beat-this"
+            ),
+        }
+    }
+}
+
+/// Beat grid for `track` (whose 16 kHz decode is `pcm`) from the chosen
+/// backend. `None` means no stable tempo. Blocking; run off the runtime.
+pub fn detect_beats(
+    choice: TrackerChoice,
+    track: &Path,
+    pcm: &[f32],
+    models_dir: &Path,
+) -> Result<Option<BeatGrid>> {
+    use eidetic_ingest::beats::track_beats;
+    match choice {
+        TrackerChoice::Ellis => Ok(track_beats(pcm)),
+        // Without the feature there is nothing to try: plain Ellis, and no
+        // "fallback" note on every grid for a backend that was never built.
+        TrackerChoice::Auto if !cfg!(feature = "downbeats") => Ok(track_beats(pcm)),
+        TrackerChoice::Auto => match infer_beats(track, pcm, models_dir, false) {
+            Ok(grid) => Ok(grid),
+            Err(e) => {
+                let reason = format!("{e:#}");
+                eprintln!("Beat This unavailable ({reason}); using the Ellis tracker");
+                Ok(track_beats(pcm).map(|mut g| {
+                    g.fallback = Some(reason);
+                    g
+                }))
+            }
+        },
+        TrackerChoice::BeatThis => infer_beats(track, pcm, models_dir, true).context(
+            "EIDETIC_BEAT_TRACKER=beat-this failed (set it to auto or ellis to fall back)",
+        ),
+    }
+}
+
+#[cfg(feature = "downbeats")]
+fn infer_beats(
+    track: &Path,
+    pcm: &[f32],
+    models_dir: &Path,
+    download: bool,
+) -> Result<Option<BeatGrid>> {
+    use eidetic_ml::downbeats::{self, BeatThisTracker, Fetch};
+    let fetch = if download {
+        Fetch::Download
+    } else {
+        Fetch::CachedOnly
+    };
+    let mut tracker = BeatThisTracker::load(models_dir, fetch)?;
+    let pcm22 = eidetic_ingest::video::extract_audio_pcm_at(track, downbeats::SAMPLE_RATE)
+        .context("failed to decode the audio track for Beat This")?
+        .context("ffmpeg is required to decode audio")?;
+    let out = tracker.analyze(&pcm22)?;
+    Ok(BeatGrid::from_inferred(
+        &out.beats,
+        &out.downbeats,
+        pcm,
+        eidetic_ingest::beats::ModelProvenance {
+            name: downbeats::MODEL_NAME.into(),
+            revision: downbeats::REVISION.into(),
+            sha256: downbeats::BEAT_MODEL_SHA256.into(),
+        },
+    ))
+}
+
+#[cfg(not(feature = "downbeats"))]
+fn infer_beats(_: &Path, _: &[f32], _: &Path, _: bool) -> Result<Option<BeatGrid>> {
+    anyhow::bail!("this build has no Beat This support; rebuild with --features downbeats")
+}
+
+// ---------------------------------------------------------------------------
 // Generation: prompt → planned project(s). Shared by the CLI arm and the MCP
 // create_reel tool, so NOTHING here may write to stdout — under `eidetic mcp`
 // stdout is the protocol channel. Progress goes to stderr.
@@ -294,15 +398,28 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         let audio_len = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
         total = spec.duration.min(audio_len);
         let pcm_for_beats = pcm.clone();
-        grid =
-            tokio::task::spawn_blocking(move || eidetic_ingest::beats::track_beats(&pcm_for_beats))
-                .await
-                .context("beat thread panicked")?;
+        let (track_for_beats, models_dir) = (track.clone(), config.paths.models_cache.clone());
+        grid = tokio::task::spawn_blocking(move || {
+            detect_beats(
+                TrackerChoice::from_env()?,
+                &track_for_beats,
+                &pcm_for_beats,
+                &models_dir,
+            )
+        })
+        .await
+        .context("beat thread panicked")??;
         match &grid {
             Some(g) => eprintln!(
-                "Beat grid: {:.1} BPM, {} beats, {} high-energy section(s)",
+                "Beat grid: {:.1} BPM, {} beats, {} {} bar(s), {} high-energy section(s)",
                 g.bpm,
                 g.beats.len(),
+                g.downbeats.len(),
+                if g.downbeats_inferred() {
+                    "inferred"
+                } else {
+                    "heuristic"
+                },
                 g.high_energy.len()
             ),
             None => {
@@ -917,6 +1034,244 @@ mod tests {
             Transition::Crossfade { secs: 0.5 }
         );
         assert!(back.output.is_absolute());
+    }
+
+    #[test]
+    fn tracker_choice_defaults_to_auto_and_refuses_typos() {
+        assert_eq!(TrackerChoice::parse(None).unwrap(), TrackerChoice::Auto);
+        assert_eq!(TrackerChoice::parse(Some("")).unwrap(), TrackerChoice::Auto);
+        assert_eq!(
+            TrackerChoice::parse(Some("ellis")).unwrap(),
+            TrackerChoice::Ellis
+        );
+        assert_eq!(
+            TrackerChoice::parse(Some("beat-this")).unwrap(),
+            TrackerChoice::BeatThis
+        );
+        let err = TrackerChoice::parse(Some("beatthis"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("auto, ellis, beat-this"), "{err}");
+    }
+
+    /// A v0.8 project file: its grid has no tracker/model/fallback. It must
+    /// load, and must not claim its every-4th-beat bars were inferred.
+    #[test]
+    fn pre_v09_projects_load_with_heuristic_bars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.eidetic.json");
+        let json = r#"{
+            "version": 1,
+            "created": "2026-08-01T10:00:00Z",
+            "modified": "2026-08-01T10:00:00Z",
+            "prompt": "rafting",
+            "width": 1080, "height": 1920, "frame": "auto",
+            "audio": "/music/track.m4a",
+            "grid": {"bpm": 120.0, "beats": [0.0, 0.5, 1.0, 1.5, 2.0],
+                     "downbeats": [0, 4], "high_energy": [[1.0, 2.0]]},
+            "output": "/out/reel.mp4",
+            "slots": []
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let p = ReelProject::load(&path).unwrap();
+        let g = p.grid.expect("grid kept");
+        assert_eq!(g.tracker, eidetic_ingest::beats::Tracker::Ellis);
+        assert!(!g.downbeats_inferred());
+        assert_eq!(g.downbeats, vec![0, 4]);
+    }
+
+    #[test]
+    fn inferred_grid_provenance_round_trips() {
+        use eidetic_ingest::beats::{BeatGrid, ModelProvenance};
+        let beats: Vec<f64> = (0..12).map(|i| i as f64 * 0.5).collect();
+        let grid = BeatGrid::from_inferred(
+            &beats,
+            &[0.0, 1.5, 3.0],
+            &[],
+            ModelProvenance {
+                name: "beat_this_small".into(),
+                revision: "rev".into(),
+                sha256: "digest".into(),
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("reel.mp4");
+        let p = ReelProject::new(
+            "x".into(),
+            (1080, 1920),
+            "auto".into(),
+            None,
+            Some(grid),
+            &out,
+            vec![],
+        );
+        let path = ReelProject::path_for(&out);
+        p.save(&path).unwrap();
+        let g = ReelProject::load(&path).unwrap().grid.unwrap();
+        assert!(g.downbeats_inferred());
+        assert_eq!(g.downbeats, vec![0, 3, 6]);
+        assert_eq!(g.model.unwrap().sha256, "digest");
+    }
+
+    /// 120 BPM clicks at 16 kHz — enough for Ellis to lock on.
+    fn clicks_16k(secs: f64) -> Vec<f32> {
+        let n = (secs * 16_000.0) as usize;
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        (0..n)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let r = (seed as f64 / u64::MAX as f64) as f32 - 0.5;
+                let since = i % 8000;
+                r * 0.01
+                    + if since < 800 {
+                        r * (1.0 - since as f32 / 800.0)
+                    } else {
+                        0.0
+                    }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ellis_choice_never_touches_models() {
+        let models = tempfile::tempdir().unwrap();
+        let g = detect_beats(
+            TrackerChoice::Ellis,
+            Path::new("/nonexistent.wav"),
+            &clicks_16k(15.0),
+            models.path(),
+        )
+        .unwrap()
+        .expect("tempo");
+        assert_eq!(g.tracker, eidetic_ingest::beats::Tracker::Ellis);
+        assert!(!g.downbeats_inferred() && g.fallback.is_none());
+        assert_eq!(std::fs::read_dir(models.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(not(feature = "downbeats"))]
+    #[test]
+    fn default_build_auto_is_plain_ellis_and_explicit_beat_this_errors() {
+        let models = tempfile::tempdir().unwrap();
+        let pcm = clicks_16k(15.0);
+        let track = Path::new("/nonexistent.wav");
+        let g = detect_beats(TrackerChoice::Auto, track, &pcm, models.path())
+            .unwrap()
+            .expect("tempo");
+        assert_eq!(g.tracker, eidetic_ingest::beats::Tracker::Ellis);
+        assert!(g.fallback.is_none());
+        let err = detect_beats(TrackerChoice::BeatThis, track, &pcm, models.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--features downbeats"),
+            "{err:#}"
+        );
+    }
+
+    /// Auto with nothing cached: Ellis, the reason recorded, and nothing
+    /// downloaded or written into the models dir.
+    #[cfg(feature = "downbeats")]
+    #[test]
+    fn auto_without_a_cached_model_falls_back_and_says_why() {
+        let models = tempfile::tempdir().unwrap();
+        let g = detect_beats(
+            TrackerChoice::Auto,
+            Path::new("/nonexistent.wav"),
+            &clicks_16k(15.0),
+            models.path(),
+        )
+        .unwrap()
+        .expect("tempo");
+        assert_eq!(g.tracker, eidetic_ingest::beats::Tracker::Ellis);
+        assert!(!g.downbeats_inferred());
+        let why = g.fallback.expect("fallback reason");
+        assert!(why.contains("not cached"), "{why}");
+        assert_eq!(std::fs::read_dir(models.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "downbeats")]
+    #[test]
+    fn auto_with_a_corrupt_cached_model_falls_back_and_says_why() {
+        let models = tempfile::tempdir().unwrap();
+        let cache = eidetic_ml::downbeats::cache_dir(models.path());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("mel_spectrogram.onnx"), b"truncated").unwrap();
+        let g = detect_beats(
+            TrackerChoice::Auto,
+            Path::new("/nonexistent.wav"),
+            &clicks_16k(15.0),
+            models.path(),
+        )
+        .unwrap()
+        .expect("tempo");
+        assert!(!g.downbeats_inferred());
+        let why = g.fallback.expect("fallback reason");
+        assert!(why.contains("digest"), "{why}");
+    }
+
+    /// The whole production path — ffmpeg decode at 22.05 kHz, digest
+    /// check, ort inference, grid construction — on a synthetic WAV with
+    /// the supplied (never downloaded) model files. Skips, saying so, when
+    /// the files or ffmpeg are absent.
+    #[cfg(feature = "downbeats")]
+    #[test]
+    fn auto_with_cached_models_infers_downbeats_end_to_end() {
+        let src = std::env::var_os("EIDETIC_BEAT_THIS_MODELS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/beat-this-support")
+            });
+        if !src.join("beat_this_small.onnx").is_file() || eidetic_ingest::video::ffmpeg().is_none()
+        {
+            eprintln!("SKIPPED: needs supplied Beat This models and ffmpeg");
+            return;
+        }
+        let models = tempfile::tempdir().unwrap();
+        let cache = eidetic_ml::downbeats::cache_dir(models.path());
+        std::fs::create_dir_all(&cache).unwrap();
+        for name in ["mel_spectrogram.onnx", "beat_this_small.onnx"] {
+            std::fs::copy(src.join(name), cache.join(name)).unwrap();
+        }
+        let pcm = clicks_16k(20.0);
+        let wav = models.path().join("clicks.wav");
+        write_wav_16k(&wav, &pcm);
+
+        let g = detect_beats(TrackerChoice::Auto, &wav, &pcm, models.path())
+            .unwrap()
+            .expect("tempo");
+        assert_eq!(g.tracker, eidetic_ingest::beats::Tracker::BeatThis);
+        assert!(g.downbeats_inferred(), "{g:?}");
+        assert!(g.fallback.is_none());
+        assert!((g.bpm - 120.0).abs() < 6.0, "bpm {}", g.bpm);
+        assert!(!g.downbeats.is_empty());
+        assert_eq!(
+            g.model.as_ref().unwrap().sha256,
+            eidetic_ml::downbeats::BEAT_MODEL_SHA256
+        );
+    }
+
+    #[cfg(feature = "downbeats")]
+    fn write_wav_16k(path: &Path, pcm: &[f32]) {
+        let data: Vec<u8> = pcm
+            .iter()
+            .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+            .collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&16_000u32.to_le_bytes());
+        out.extend_from_slice(&32_000u32.to_le_bytes()); // byte rate
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).unwrap();
     }
 
     #[test]

@@ -330,7 +330,7 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Analyse a music file: BPM, beat grid, and high-energy sections (choruses/drops — where the hero shots belong). No stable tempo means the track is speech or ambience."
+        description = "Analyse a music file: BPM, beat grid, bar starts, and high-energy sections (choruses/drops — where the hero shots belong). provenance.downbeats says whether bars were inferred by the Beat This model or are the Ellis tracker's every-4th-beat guess; fallback explains why a requested model was not used. No stable tempo means the track is speech or ambience."
     )]
     async fn beats(
         &self,
@@ -586,12 +586,15 @@ impl EideticMcp {
         use anyhow::Context;
         let track = PathBuf::from(&p.audio);
         anyhow::ensure!(track.exists(), "audio file not found: {}", track.display());
+        let models_dir = self.config.paths.models_cache.clone();
         let grid = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(Option<eidetic_ingest::beats::BeatGrid>, f64)> {
+                let choice = project::TrackerChoice::from_env()?;
                 let pcm = eidetic_ingest::video::extract_audio_pcm(&track)?
                     .context("ffmpeg is required to decode audio")?;
                 let secs = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
-                Ok((eidetic_ingest::beats::track_beats(&pcm), secs))
+                let grid = project::detect_beats(choice, &track, &pcm, &models_dir)?;
+                Ok((grid, secs))
             },
         )
         .await
@@ -608,8 +611,12 @@ impl EideticMcp {
                 "bpm": round2(g.bpm),
                 "beat_count": g.beats.len(),
                 "first_beats": g.beats.iter().take(8).map(|b| round2(*b)).collect::<Vec<_>>(),
+                "bar_count": g.downbeats.len(),
+                "first_bars": g.downbeats.iter().take(8)
+                    .filter_map(|&i| g.beats.get(i)).map(|t| round2(*t)).collect::<Vec<_>>(),
                 "high_energy_sections": g.high_energy.iter()
                     .map(|(a, b)| json!([round2(*a), round2(*b)])).collect::<Vec<_>>(),
+                "provenance": grid_provenance(&g),
             }),
         })
     }
@@ -702,6 +709,7 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
         "seconds": round2(proj.total_secs()),
         "audio": proj.audio,
         "bpm": proj.grid.as_ref().map(|g| round2(g.bpm)),
+        "beat_grid": proj.grid.as_ref().map(grid_provenance),
         "slots": proj.slots.iter().enumerate().map(|(i, s)| {
             json!({
                 "n": i + 1,
@@ -715,6 +723,17 @@ fn cut_list_json(proj: &ReelProject, project_path: &Path) -> Value {
                 "transition_in": transition_spec(s.transition_in),
             })
         }).collect::<Vec<_>>(),
+    })
+}
+
+/// Where a grid's beats and bars came from — so an agent never mistakes
+/// Ellis's every-4th-beat guess for detected downbeats.
+fn grid_provenance(g: &eidetic_ingest::beats::BeatGrid) -> Value {
+    json!({
+        "tracker": g.tracker.as_str(),
+        "downbeats": if g.downbeats_inferred() { "inferred" } else { "heuristic-every-4th-beat" },
+        "model": g.model,
+        "fallback": g.fallback,
     })
 }
 

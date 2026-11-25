@@ -22,6 +22,9 @@ cuda = ["eidetic-ml/cuda", "eidetic-server/cuda"]
 # Speech transcription + spoken-word search (whisper.cpp via cmake).
 speech = ["eidetic-ml/speech"]
 speech-cuda = ["eidetic-ml/speech-cuda"]
+# Beat This! downbeat inference (docs/beat-tracking.md). Without it the
+# Ellis tracker's every-4th-beat bars are the only ones available.
+downbeats = ["eidetic-ml/downbeats"]
 
 [dependencies]
 eidetic-core = { path = "../eidetic-core" }

@@ -359,6 +359,12 @@ fn parse_has_audio(json: &serde_json::Value) -> bool {
 /// format. `Ok(Some(vec![]))` for a video with no (or empty) audio stream;
 /// `Ok(None)` when ffmpeg is missing.
 pub fn extract_audio_pcm(path: &Path) -> Result<Option<Vec<f32>>> {
+    extract_audio_pcm_at(path, 16_000)
+}
+
+/// [`extract_audio_pcm`] at another sample rate — Beat This wants 22.05 kHz,
+/// and upsampling the 16 kHz decode would leave its top mel bands empty.
+pub fn extract_audio_pcm_at(path: &Path, sample_rate: u32) -> Result<Option<Vec<f32>>> {
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
@@ -378,7 +384,9 @@ pub fn extract_audio_pcm(path: &Path) -> Result<Option<Vec<f32>>> {
     let output = Command::new(ffmpeg)
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-vn", "-f", "f32le", "-ac", "1", "-ar", "16000", "-"])
+        .args(["-vn", "-f", "f32le", "-ac", "1", "-ar"])
+        .arg(sample_rate.to_string())
+        .arg("-")
         .output()
         .map_err(|source| Error::Io {
             path: path.to_path_buf(),

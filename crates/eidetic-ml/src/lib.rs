@@ -1,3 +1,5 @@
+#[cfg(feature = "downbeats")]
+pub mod downbeats;
 mod error;
 pub mod face;
 pub mod image_io;

@@ -629,12 +629,111 @@ fn extendable_secs(ffmpeg: &Path, slot: &Slot, want: f64) -> f64 {
     if avail < 0.15 { 0.0 } else { avail }
 }
 
-/// Cut spans from a beat grid (goals-v0.7.md phase 1): each span starts on
-/// a beat and runs 4 beats in normal sections, 2 in high-energy ones —
-/// the convention auto-editors converge on — with a 0.6 s floor absorbing
-/// very fast tempi. Spans stop at `total_secs`.
-pub fn beat_spans(grid: &BeatGrid, total_secs: f64) -> Vec<(f64, f64)> {
-    const MIN_SPAN: f64 = 0.6;
+/// Shortest span a cut may make; absorbs very fast tempi.
+const MIN_SPAN: f64 = 0.6;
+
+/// One music span the planner fills with one shot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub start: f64,
+    pub end: f64,
+    /// The cut into this span lands on an *inferred* downbeat. Always false
+    /// for Ellis grids: their bars are a guess, and nothing downstream may
+    /// treat them as real.
+    pub on_downbeat: bool,
+}
+
+/// Cut spans from a beat grid. With inferred downbeats (goals-v0.9.md
+/// phase 2) they are bar-quantized: one span per bar, split at the middle
+/// beat in high-energy sections, whatever the meter — a 3-beat bar is a
+/// 3-beat span, and pickup beats before the first bar become their own
+/// lead-in (or merge into the first bar when too short to hold a shot).
+/// Without them (Ellis) each span starts on a beat and runs 4 beats in
+/// normal sections, 2 in high-energy ones — the convention auto-editors
+/// converge on. Either way a 0.6 s floor absorbs very fast tempi and spans
+/// stop at `total_secs`.
+pub fn beat_spans(grid: &BeatGrid, total_secs: f64) -> Vec<Span> {
+    if grid.downbeats_inferred() && !grid.downbeats.is_empty() {
+        return bar_spans(grid, total_secs);
+    }
+    pulse_spans(grid, total_secs)
+        .into_iter()
+        .map(|(start, end)| Span {
+            start,
+            end,
+            on_downbeat: false,
+        })
+        .collect()
+}
+
+/// Bar-quantized spans over inferred downbeats; see [`beat_spans`].
+fn bar_spans(grid: &BeatGrid, total_secs: f64) -> Vec<Span> {
+    // A downbeat this close to t=0 means the reel opens on the bar line.
+    const OPENS_ON_BAR: f64 = 0.1;
+    let (beats, bars) = (&grid.beats, &grid.downbeats);
+    let bar_time = |k: usize| {
+        bars.get(k)
+            .map_or(total_secs, |&i| beats[i].min(total_secs))
+    };
+
+    // Candidate cut points: each bar line, plus the middle beat of a
+    // high-energy bar when both halves can hold a shot.
+    let mut cuts: Vec<(f64, bool)> = Vec::new();
+    for (k, &i) in bars.iter().enumerate() {
+        let start = beats[i];
+        if start >= total_secs {
+            break;
+        }
+        cuts.push((start, true));
+        if grid.is_high_energy(start) {
+            let next = bars.get(k + 1).copied().unwrap_or(beats.len());
+            let mid = i + (next - i).div_ceil(2);
+            if mid < next {
+                let t = beats[mid];
+                if t - start >= MIN_SPAN && bar_time(k + 1) - t >= MIN_SPAN && t < total_secs {
+                    cuts.push((t, false));
+                }
+            }
+        }
+    }
+
+    // The pickup: beats before the first bar are a lead-in span of their
+    // own, unless too short, in which case the first bar starts at 0.
+    let mut bounds: Vec<(f64, bool)> = match cuts.first() {
+        Some(&(t0, _)) if t0 < MIN_SPAN => {
+            cuts.remove(0);
+            vec![(0.0, t0 < OPENS_ON_BAR)]
+        }
+        _ => vec![(0.0, false)],
+    };
+    for (t, on_downbeat) in cuts {
+        let last = bounds.last().map_or(0.0, |b| b.0);
+        if t - last >= MIN_SPAN {
+            bounds.push((t, on_downbeat));
+        }
+    }
+
+    let mut spans: Vec<Span> = bounds
+        .windows(2)
+        .map(|w| Span {
+            start: w[0].0,
+            end: w[1].0,
+            on_downbeat: w[0].1,
+        })
+        .collect();
+    let (last, on_downbeat) = bounds[bounds.len() - 1];
+    if total_secs - last >= MIN_SPAN || spans.is_empty() {
+        spans.push(Span {
+            start: last,
+            end: total_secs,
+            on_downbeat,
+        });
+    }
+    spans
+}
+
+/// The every-N-beats spans for grids without inferred bars.
+fn pulse_spans(grid: &BeatGrid, total_secs: f64) -> Vec<(f64, f64)> {
     let mut spans = Vec::new();
     let beats = &grid.beats;
     if beats.is_empty() {
@@ -687,10 +786,13 @@ const SECTION_FADE_SECS: f64 = 0.5;
 /// dissolve as "the song changed here".
 ///
 /// Music structure shapes the assignment (goals-v0.8.md phase 0.5): the
-/// hero shots are saved for the drops. The first span of each high-energy
-/// section gets the best remaining hit; every other span takes the rest in
-/// score order — so the reel still opens strong, but its strongest moment
-/// lands where the song peaks.
+/// hero shots are saved for the drops. Each high-energy section's hero span
+/// gets the best remaining hit; every other span takes the rest in score
+/// order — so the reel still opens strong, but its strongest moment lands
+/// where the song peaks. With inferred downbeats the hero span is the
+/// first span that starts on a bar line inside the section (a pickup,
+/// half-bar, or a bar that begins before the drop is passed over); with
+/// Ellis grids it is simply the section's first span.
 pub fn plan_synced(
     results: &[SearchResult],
     grid: &BeatGrid,
@@ -705,16 +807,36 @@ pub fn plan_synced(
     let n = spans.len().min(strong.len());
     let hot: Vec<bool> = spans
         .iter()
-        .map(|(a, b)| grid.is_high_energy((a + b) / 2.0))
+        .map(|s| grid.is_high_energy((s.start + s.end) / 2.0))
         .collect();
     // Which hit fills which span: drops first (best hits), rest in order.
     let mut hit_for_span = vec![usize::MAX; n];
     let mut next = 0usize;
-    for i in 0..n {
-        if hot[i] && (i == 0 || !hot[i - 1]) {
-            hit_for_span[i] = next;
-            next += 1;
+    let mut i = 0;
+    while i < n {
+        if !hot[i] {
+            i += 1;
+            continue;
         }
+        let run_end = (i..n).find(|&j| !hot[j]).unwrap_or(n);
+        // A run is "hot" by span midpoints, so its first span can start
+        // before the section does (a bar straddling the drop). With real
+        // bars the hero goes on the first bar line *inside* the section —
+        // possibly the span right after the run, when the section ends
+        // before that bar's midpoint.
+        let hero = if grid.downbeats_inferred() {
+            let starts_hot = |j: &usize| grid.is_high_energy(spans[*j].start);
+            (i..(run_end + 1).min(n))
+                .filter(starts_hot)
+                .find(|&j| spans[j].on_downbeat)
+                .or_else(|| (i..run_end).find(starts_hot))
+                .unwrap_or(i)
+        } else {
+            i
+        };
+        hit_for_span[hero] = next;
+        next += 1;
+        i = run_end;
     }
     for h in &mut hit_for_span {
         if *h == usize::MAX {
@@ -725,8 +847,8 @@ pub fn plan_synced(
 
     let mut slots = Vec::new();
     let mut total = 0.0;
-    for (i, (_, end)) in spans.iter().enumerate().take(n) {
-        let span = end - total;
+    for (i, s) in spans.iter().enumerate().take(n) {
+        let span = s.end - total;
         let slot = fill_span(&strong[hit_for_span[i]], span, library_dir, scenes, focus);
         total += slot.duration;
         slots.push(slot);
@@ -1095,7 +1217,28 @@ mod tests {
             downbeats: (0..beats.len()).step_by(4).collect(),
             beats,
             high_energy: vec![],
+            tracker: eidetic_ingest::beats::Tracker::Ellis,
+            model: None,
+            fallback: None,
         }
+    }
+
+    /// A Beat This grid: 0.5 s beats for `secs`, bars starting at the given
+    /// beat indices (which is what makes meter and pickups expressible).
+    fn inferred_grid(secs: f64, bars: Vec<usize>) -> BeatGrid {
+        let mut g = grid_120bpm(secs);
+        g.downbeats = bars;
+        g.tracker = eidetic_ingest::beats::Tracker::BeatThis;
+        g.model = Some(eidetic_ingest::beats::ModelProvenance {
+            name: "beat_this_small".into(),
+            revision: "test".into(),
+            sha256: "test".into(),
+        });
+        g
+    }
+
+    fn starts(spans: &[Span]) -> Vec<f64> {
+        spans.iter().map(|s| s.start).collect()
     }
 
     #[test]
@@ -1103,8 +1246,73 @@ mod tests {
         let spans = beat_spans(&grid_120bpm(20.0), 10.0);
         // 4 beats at 120 BPM = 2 s per span, 5 spans in 10 s.
         assert_eq!(spans.len(), 5, "{spans:?}");
-        assert!((spans[0].1 - spans[0].0 - 2.0).abs() < 1e-9);
-        assert_eq!(spans[0].0, 0.0, "lead-in merges into the first span");
+        assert!((spans[0].end - spans[0].start - 2.0).abs() < 1e-9);
+        assert_eq!(spans[0].start, 0.0, "lead-in merges into the first span");
+        assert!(
+            spans.iter().all(|s| !s.on_downbeat),
+            "Ellis bars are never real"
+        );
+    }
+
+    /// Ellis's downbeats are a guess: even when they say "bar every 3",
+    /// the planner keeps its 4-beat pulse and never marks a downbeat.
+    #[test]
+    fn heuristic_downbeats_do_not_drive_bar_spans() {
+        let mut grid = grid_120bpm(20.0);
+        grid.downbeats = (0..grid.beats.len()).step_by(3).collect();
+        let spans = beat_spans(&grid, 10.0);
+        assert_eq!(starts(&spans), vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+        assert!(spans.iter().all(|s| !s.on_downbeat));
+    }
+
+    #[test]
+    fn inferred_three_four_bars_cut_every_three_beats() {
+        let bars: Vec<usize> = (0..40).step_by(3).collect();
+        let spans = beat_spans(&inferred_grid(20.0, bars), 9.0);
+        // 3 beats x 0.5 s = 1.5 s bars, not the 2 s a 4-beat guess makes.
+        assert_eq!(starts(&spans), vec![0.0, 1.5, 3.0, 4.5, 6.0, 7.5]);
+        assert!(spans.iter().all(|s| s.on_downbeat), "{spans:?}");
+        assert!((spans[5].end - 9.0).abs() < 1e-9);
+    }
+
+    /// Mixed meter (7/8-style 3+4 bars): each span is exactly one bar.
+    #[test]
+    fn inferred_irregular_bars_follow_the_model() {
+        let spans = beat_spans(&inferred_grid(20.0, vec![0, 3, 7, 10, 14]), 8.5);
+        assert_eq!(starts(&spans), vec![0.0, 1.5, 3.5, 5.0, 7.0]);
+        let lens: Vec<f64> = spans.iter().map(|s| s.end - s.start).collect();
+        assert_eq!(lens, vec![1.5, 2.0, 1.5, 2.0, 1.5]);
+    }
+
+    #[test]
+    fn a_long_pickup_becomes_its_own_lead_in() {
+        // Two pickup beats (1.0 s) before the first bar at beat 2.
+        let bars: Vec<usize> = (2..40).step_by(4).collect();
+        let spans = beat_spans(&inferred_grid(20.0, bars), 9.0);
+        assert_eq!(starts(&spans), vec![0.0, 1.0, 3.0, 5.0, 7.0]);
+        assert!(!spans[0].on_downbeat, "the pickup is not a bar");
+        assert!(spans[1..].iter().all(|s| s.on_downbeat));
+    }
+
+    #[test]
+    fn a_short_pickup_merges_into_the_first_bar() {
+        // One pickup beat (0.5 s < the 0.6 s floor): no flash-cut lead-in.
+        let bars: Vec<usize> = (1..40).step_by(4).collect();
+        let spans = beat_spans(&inferred_grid(20.0, bars), 8.5);
+        assert_eq!(starts(&spans), vec![0.0, 2.5, 4.5, 6.5]);
+        assert!(!spans[0].on_downbeat, "the cut at 0.5 s was absorbed");
+        assert!((spans[0].end - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inferred_hot_bars_split_at_the_middle_beat() {
+        let bars: Vec<usize> = (0..40).step_by(4).collect();
+        let mut grid = inferred_grid(20.0, bars);
+        grid.high_energy = vec![(4.0, 8.0)];
+        let spans = beat_spans(&grid, 10.0);
+        assert_eq!(starts(&spans), vec![0.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let on: Vec<bool> = spans.iter().map(|s| s.on_downbeat).collect();
+        assert_eq!(on, vec![true, true, true, false, true, false, true]);
     }
 
     #[test]
@@ -1114,8 +1322,8 @@ mod tests {
         let spans = beat_spans(&grid, 12.0);
         let in_hot: Vec<f64> = spans
             .iter()
-            .filter(|(a, _)| *a >= 4.0 && *a < 8.0)
-            .map(|(a, b)| b - a)
+            .filter(|s| s.start >= 4.0 && s.start < 8.0)
+            .map(|s| s.end - s.start)
             .collect();
         assert!(!in_hot.is_empty());
         assert!(
@@ -1171,8 +1379,8 @@ mod tests {
         // Exactly the two joints where the energy state flips.
         let expected: Vec<usize> = (1..spans.len())
             .filter(|&i| {
-                grid.is_high_energy((spans[i - 1].0 + spans[i - 1].1) / 2.0)
-                    != grid.is_high_energy((spans[i].0 + spans[i].1) / 2.0)
+                grid.is_high_energy((spans[i - 1].start + spans[i - 1].end) / 2.0)
+                    != grid.is_high_energy((spans[i].start + spans[i].end) / 2.0)
             })
             .collect();
         assert_eq!(fades, expected);
@@ -1202,6 +1410,86 @@ mod tests {
         assert!((slots[0].score - 0.49).abs() < 1e-6);
         // Everything else keeps score order down the timeline.
         assert!(slots[3].score > slots[4].score);
+    }
+
+    /// The pickup-boundary case: the drop starts at t=0 with a 1 s pickup
+    /// before the first real bar at 1.0 s. The hero belongs on that bar
+    /// line, not on the pickup — while an Ellis grid, which has no real
+    /// bars, keeps the old first-span rule.
+    #[test]
+    fn inferred_hero_lands_on_the_first_bar_line_of_the_drop() {
+        let bars: Vec<usize> = (2..60).step_by(4).collect();
+        let mut grid = inferred_grid(30.0, bars);
+        grid.high_energy = vec![(0.0, 6.0)];
+        let results: Vec<_> = (0..16)
+            .map(|i| hit(0.5 - i as f32 * 0.01, None, None))
+            .collect();
+        let plan =
+            |g: &BeatGrid| plan_synced(&results, g, 10.0, &lib(), &HashMap::new(), &HashMap::new());
+
+        let spans = beat_spans(&grid, 10.0);
+        assert_eq!(spans[0].start, 0.0);
+        assert!(!spans[0].on_downbeat && spans[1].on_downbeat);
+        assert_eq!(spans[1].start, 1.0);
+        let slots = plan(&grid);
+        assert!((slots[1].score - 0.5).abs() < 1e-6, "hero on the bar line");
+        assert!(
+            (slots[0].score - 0.49).abs() < 1e-6,
+            "pickup gets the next best"
+        );
+        assert!((slots[0].duration - 1.0).abs() < 1e-9, "pickup span is 1 s");
+
+        let mut heuristic = grid.clone();
+        heuristic.tracker = eidetic_ingest::beats::Tracker::Ellis;
+        heuristic.model = None;
+        let slots = plan(&heuristic);
+        assert!((slots[0].score - 0.5).abs() < 1e-6, "Ellis: first span");
+    }
+
+    /// The drop starts between bar lines (t=1, bars at 0/2/4/6). The bar
+    /// [0,2) straddles it and its midpoint is hot, but it starts before the
+    /// drop: the hero belongs on the first bar line inside it, t=2.
+    #[test]
+    fn inferred_hero_skips_a_bar_that_starts_before_the_drop() {
+        let bars: Vec<usize> = (0..60).step_by(4).collect();
+        let mut grid = inferred_grid(30.0, bars);
+        grid.high_energy = vec![(1.0, 7.0)];
+        let results: Vec<_> = (0..16)
+            .map(|i| hit(0.5 - i as f32 * 0.01, None, None))
+            .collect();
+        let plan =
+            |g: &BeatGrid| plan_synced(&results, g, 10.0, &lib(), &HashMap::new(), &HashMap::new());
+
+        let spans = beat_spans(&grid, 10.0);
+        assert_eq!(starts(&spans)[..2], [0.0, 2.0]);
+        assert!(grid.is_high_energy((spans[0].start + spans[0].end) / 2.0));
+        let slots = plan(&grid);
+        assert!((slots[1].score - 0.5).abs() < 1e-6, "hero on the t=2 bar");
+        assert!((slots[0].score - 0.49).abs() < 1e-6, "not before the drop");
+
+        // Ellis keeps its first-hot-span rule unchanged.
+        let mut heuristic = grid.clone();
+        heuristic.tracker = eidetic_ingest::beats::Tracker::Ellis;
+        heuristic.model = None;
+        let slots = plan(&heuristic);
+        assert!((slots[0].score - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn plan_synced_cuts_three_four_on_every_bar() {
+        let bars: Vec<usize> = (0..60).step_by(3).collect();
+        let grid = inferred_grid(30.0, bars);
+        let results: Vec<_> = (0..8).map(|_| hit(0.5, None, None)).collect();
+        let slots = plan_synced(
+            &results,
+            &grid,
+            6.0,
+            &lib(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let lens: Vec<f64> = slots.iter().map(|s| s.duration).collect();
+        assert_eq!(lens, vec![1.5, 1.5, 1.5, 1.5]);
     }
 
     #[test]

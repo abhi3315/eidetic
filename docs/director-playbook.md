@@ -14,7 +14,10 @@ not invented.
 1. **Scout before you cut.** `library_stats` for scale, `search_library`
    with 2–3 phrasings of the user's idea, `list_persons` if people are
    named. With music: `beats` on the track first — BPM, duration, and the
-   high-energy sections decide everything else.
+   high-energy sections decide everything else. Check
+   `provenance.downbeats`: `inferred` means the bar lines came from the
+   Beat This model and the planner cuts on them; `heuristic-every-4th-beat`
+   means they are a guess, so don't tell the user a cut is "on the one".
 2. **`create_reel`** plans and saves a project file without rendering.
    Iteration on the cut list is free; renders are not. Don't render yet.
 3. **Audit every slot** in the returned cut list:
@@ -69,11 +72,14 @@ not invented.
   tail slot has the lowest score in the list, swap or drop it. Ending on
   the second-best shot of the reel is a classic move.
 - **Save the hero for the drop.** The planner already puts the best hit on
-  the first beat of each high-energy section — respect that when swapping:
+  the first beat of each high-energy section (with inferred downbeats, the
+  first bar line of it — a pickup before the bar is skipped) — respect
+  that when swapping:
   don't move the weakest shot onto a drop, and pin the drop slot once
   you're happy with it.
 - **Cut density follows energy.** Verses/calm sections hold shots ~4
-  beats, choruses ~2 (the planner does this). If you retime, keep that
+  beats, choruses ~2 (the planner does this; with inferred downbeats it is
+  one bar and half a bar, whatever the meter). If you retime, keep that
   shape: long holds in loud sections feel dead, fast cuts in quiet ones
   feel nervous.
 - **Transitions are punctuation, not decoration.** Hard cuts on beats are

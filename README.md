@@ -22,7 +22,7 @@ Written in Rust.
   - `--fields score,ts,date,path`: tab-separated column output
   - `--json`: full JSON array
 - `eidetic reel "sunset at the beach"`: cut a short mp4 from the best-matching photos and video moments (needs ffmpeg)
-  - `--audio track.mp3`: detect the track's beats (pure-Rust Ellis tracker) and land every cut on the grid — 4 beats per shot normally, 2 in high-energy sections — with the music laid underneath and faded out. Tracks with no stable tempo fall back to fixed-length cuts
+  - `--audio track.mp3`: detect the track's beats (pure-Rust Ellis tracker) and land every cut on the grid — 4 beats per shot normally, 2 in high-energy sections — with the music laid underneath and faded out. Tracks with no stable tempo fall back to fixed-length cuts. A `--features downbeats` build can use the Beat This! model instead: real downbeats, so cuts are one bar (half a bar when hot) in any meter and hero shots land on bar lines. Select with `EIDETIC_BEAT_TRACKER`; see [docs/beat-tracking.md](docs/beat-tracking.md)
   - `--portrait`: 1080x1920 — the Instagram/Shorts format. Framing is per-clip auto: shots with faces get a face-following cover-crop; scenic shots render fit-inside over a blurred backdrop (no black bars, no butchered panoramas). Force a style with `--frame cover|blur|pad`
   - **Voiceover mode** (speech build): when `--audio` is narration rather than music, Whisper transcribes it and each spoken span auto-selects the best-matching shot — "here we reached Pangong" puts the Pangong clip on screen while you say it. Mode is detected automatically: beats → music-synced, speech → voiceover, neither → fixed cuts
   - Video hits become ~4s clips around the matched frame, snapped inside the shot's scene boundaries so cuts never splice across shots; photos hold 3s with a Ken Burns push-in
@@ -88,6 +88,7 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_ACCELERATOR` | _unset_ (= CPU) | ONNX Runtime execution provider: `cpu`, `cuda`, or `coreml`. `cuda` needs a build with `--features cuda` plus an ONNX Runtime ≥ 1.27 CUDA build at runtime (see [ADR-0006](docs/adr/0006-gpu-execution-provider.md)). CoreML is macOS-only and **does not currently accelerate this workload** — see "Why CoreML is opt-in" below. |
 | `EIDETIC_FACE_MODEL` | `auraface` | Face detection/recognition pair: `auraface` (YuNet + AuraFace, 512-dim), `sface` (smaller, 128-dim), or `buffalo_l` (InsightFace, **non-commercial weights**). Face rows and detection runs are keyed by model, so switching re-queues face work for the new pair. |
 | `EIDETIC_SPEECH_MODEL` | `small` | Whisper model for `eidetic transcribe` (speech builds): `base`, `small`, or `large-v3-turbo`. Transcript runs are keyed by model, so switching re-transcribes. |
+| `EIDETIC_BEAT_TRACKER` | `auto` | Beat tracker for music reels: `auto` (Beat This if built with `downbeats` and its model is already cached and verified, else Ellis; never downloads), `ellis`, or `beat-this` (downloads the pinned ~11 MB model on first use, verifies SHA-256, and errors rather than substituting Ellis). Unknown values are rejected. See [docs/beat-tracking.md](docs/beat-tracking.md). |
 | `EIDETIC_BIND` | `127.0.0.1:8080` | `eidetic serve` bind address (same as `--bind`). Non-loopback values are refused without `--expose` — the server has no authentication. |
 | `EIDETIC_FFMPEG_PATH` / `EIDETIC_FFPROBE_PATH` | found on `PATH` | Explicit ffmpeg/ffprobe binaries when they aren't on PATH. |
 | `ORT_DYLIB_PATH` | _unset_ | CUDA builds only: path to an ONNX Runtime ≥ 1.27 CUDA `libonnxruntime.so` loaded at runtime ([ADR-0006](docs/adr/0006-gpu-execution-provider.md)). |
@@ -166,6 +167,7 @@ cargo test --workspace
 | `heic` | **on** | HEIC/HEIF decoding via libheif. Needs the libheif C library installed at build time (`libheif-dev` / `libheif-devel`). |
 | `cuda` | off | NVIDIA GPU inference via the ONNX Runtime CUDA execution provider. Requires an ONNX Runtime ≥ 1.27 CUDA build supplied at runtime through `ORT_DYLIB_PATH`, plus CUDA 13 + cuDNN 9 on the host. See [ADR-0006](docs/adr/0006-gpu-execution-provider.md). |
 | `speech` | off | Speech-to-text over video audio via whisper.cpp (`eidetic transcribe` + spoken-word search). Off by default because whisper-rs compiles C through cmake, which is a heavier build dependency than the libheif linkage `heic` already brings in. Model (~466 MB, `EIDETIC_SPEECH_MODEL`: `base`, `small` default, `large-v3-turbo`) downloads on first run. |
+| `downbeats` | off | Beat and downbeat inference with Beat This! (ISMIR 2024) via the `beat-this` crate, run on the same ONNX Runtime as the other models. The crate pulls `rten`, `symphonia` and `rubato` in unconditionally (pure Rust, unused at runtime here), so this costs compile time only. Model files download only when `EIDETIC_BEAT_TRACKER=beat-this` is set. See [docs/beat-tracking.md](docs/beat-tracking.md). |
 | `speech-cuda` | off | `speech` with whisper.cpp's CUDA kernels — GPU transcription. Needs nvcc at build time with a host compiler your CUDA toolkit supports: nvcc 12.9 cannot parse gcc 16 headers (Fedora 44+), so install a compat gcc (`sudo dnf install gcc14-c++`) and build with `CUDAHOSTCXX=$(which g++-14)`, or use a CUDA 13 toolkit. |
 
 ```bash
@@ -211,6 +213,12 @@ HEIC is on by default because it is the primary format for iPhone photos and lib
 Geographic data © [GeoNames](https://www.geonames.org/), licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Used for the
 offline reverse geocoding that populates the place columns during import.
+
+Downbeat inference (`downbeats` builds) uses Beat This! by Francesco
+Foscarin, Jan Schlüter and Gerhard Widmer (ISMIR 2024), through
+[beat-this-rs](https://github.com/danigb/beat-this-rs) by danigb (MIT). The
+ONNX models are fetched from a pinned beat-this-rs commit and are not
+redistributed here.
 
 ## License
 

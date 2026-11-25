@@ -34,6 +34,13 @@ ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"] }
 whisper-rs = "0.16"
 # FFT for the beat tracker (pure Rust, no native deps).
 rustfft = "6"
+# Beat This! downbeat inference (MIT, ISMIR 2024 port). Optional, behind the
+# `downbeats` feature. Its own `ort` feature stays OFF: it would force
+# ort/load-dynamic + coreml on every build; eidetic-ml implements the
+# crate's Runtime/Model traits over the workspace ort instead. The crate
+# still pulls rten, symphonia and rubato unconditionally (pure Rust, unused
+# at runtime here) — the compile-time cost of not forking it.
+beat-this = { version = "=1.0.0", default-features = false }
 
 # HuggingFace Hub (model file download)
 hf-hub = "0.5"

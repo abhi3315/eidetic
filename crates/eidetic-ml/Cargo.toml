@@ -25,8 +25,17 @@ speech = ["dep:whisper-rs"]
 # GPU speech decode: whisper.cpp compiled with CUDA kernels. Needs the CUDA
 # toolkit (nvcc) at build time on top of the speech feature's cmake.
 speech-cuda = ["speech", "whisper-rs/cuda"]
+# Real beat + downbeat inference via Beat This! (ONNX, run on the workspace
+# ort). Off by default; the Ellis tracker in eidetic-ingest stays the
+# no-model path. See docs/beat-tracking.md.
+downbeats = ["dep:beat-this", "dep:anyhow", "dep:sha2", "dep:ureq", "dep:tempfile"]
 
 [dependencies]
+beat-this = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 eidetic-core = { path = "../eidetic-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
