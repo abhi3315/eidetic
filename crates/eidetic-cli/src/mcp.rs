@@ -408,9 +408,13 @@ impl EideticMcp {
     ) -> Result<CallToolResult, ErrorData> {
         reply(
             async {
+                use anyhow::Context;
                 let path = PathBuf::from(&p.project);
-                let mut proj = ReelProject::load(&path)?;
+                let mut proj = ReelProject::load_untrusted(&path).await?;
                 project::apply_ops(&mut proj, &p.ops, &self.config).await?;
+                // An edit must not save what the next load would refuse.
+                proj.validate()
+                    .context("the edit would leave the project out of range; nothing was saved")?;
                 proj.save(&path)?;
                 Ok(cut_list_json(&proj, &path))
             }
@@ -428,7 +432,7 @@ impl EideticMcp {
         reply(
             async {
                 let path = PathBuf::from(&p.project);
-                let proj = ReelProject::load(&path)?;
+                let proj = ReelProject::load_untrusted(&path).await?;
                 let preview = p.preview.unwrap_or(false);
                 let target = proj.render_target(preview);
                 project::render_project(&proj, &target).await?;
@@ -453,7 +457,7 @@ impl EideticMcp {
         reply(
             async {
                 let path = PathBuf::from(&p.project);
-                let proj = ReelProject::load(&path)?;
+                let proj = ReelProject::load_untrusted(&path).await?;
                 let otio_path = proj.output.with_extension("otio");
                 otio::export(&proj, &otio_path)?;
                 Ok(json!({ "otio": otio_path }))
@@ -481,7 +485,7 @@ impl EideticMcp {
         }
         let sheet = async {
             let path = PathBuf::from(&p.project);
-            let proj = preview::load_project(&path).await?;
+            let proj = ReelProject::load_untrusted(&path).await?;
             let first = p.first.unwrap_or(1) as usize;
             let sheet = preview::contact_sheet(&proj, first).await?;
             let last = sheet.tiles.last().map_or(first, |t| t.n);
@@ -665,6 +669,8 @@ impl EideticMcp {
         // itself gets the same rule (see the boundary note above): a path
         // that already exists belongs to someone, and it is not this reel.
         for proj in &projects {
+            // Every other tool refuses a project out of range; never save one.
+            proj.validate()?;
             // Everything this project will ever write: the render target,
             // its preview, and the .otio sibling export_otio derives from
             // it. Claiming them now means every later overwrite hits a file

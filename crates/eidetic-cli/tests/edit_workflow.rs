@@ -40,9 +40,14 @@ impl Mcp {
     }
 
     fn start_with(home: &Path, args: &[&str]) -> Mcp {
+        Mcp::start_env(home, args, &[])
+    }
+
+    fn start_env(home: &Path, args: &[&str], envs: &[(&str, &Path)]) -> Mcp {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
         cmd.arg("mcp").args(args);
         hermetic(&mut cmd, home);
+        cmd.envs(envs.iter().copied());
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -942,4 +947,318 @@ fn preview_sheet_refuses_project_paths_it_cannot_read_boundedly() {
     } else {
         eprintln!("skipping the FIFO case: mkfifo unavailable");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Project paths from the agent: bounded reads, range checks
+// ---------------------------------------------------------------------------
+
+/// Every MCP tool that reads a project, called on `project`. edit_reel
+/// retimes slot 1, which probes the source when that slot is a video.
+fn project_tool_calls(project: &Path) -> Vec<(&'static str, Value)> {
+    let p = project.to_str().unwrap();
+    vec![
+        (
+            "edit_reel",
+            json!({"project": p, "ops": [{"op": "retime", "slot": 1, "secs": 1.0}]}),
+        ),
+        ("render", json!({"project": p, "preview": false})),
+        ("render", json!({"project": p, "preview": true})),
+        ("export_otio", json!({"project": p})),
+        ("preview_sheet", json!({"project": p})),
+    ]
+}
+
+/// What a path holds, comparable across calls: a directory's listing, a
+/// FIFO's kind, or a file's bytes.
+#[cfg(unix)]
+fn contents(path: &Path) -> Vec<u8> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    if meta.is_dir() {
+        listing(path).join("\n").into_bytes()
+    } else if meta.file_type().is_fifo() {
+        b"<fifo>".to_vec()
+    } else {
+        std::fs::read(path).unwrap()
+    }
+}
+
+/// Outputs a project in `dir` could write, with recognisable bytes.
+fn write_sentinels(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    ["reel.mp4", "reel.preview.mp4", "reel.otio"]
+        .iter()
+        .map(|name| {
+            let path = dir.join(name);
+            let bytes = format!("sentinel {name}").into_bytes();
+            std::fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn every_project_tool_refuses_unreadable_projects_without_writing() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("work");
+    std::fs::create_dir(&dir).unwrap();
+    let sentinels = write_sentinels(&dir);
+
+    let huge = dir.join("huge.eidetic.json");
+    std::fs::write(&huge, vec![b' '; 9 << 20]).unwrap();
+    let subdir = dir.join("a-directory.eidetic.json");
+    std::fs::create_dir(&subdir).unwrap();
+    let not_a_project = dir.join("hello.eidetic.json");
+    std::fs::write(&not_a_project, br#"{"hello":1}"#).unwrap();
+    let truncated = dir.join("truncated.eidetic.json");
+    let whole = std::fs::read(four_photos(&dir)).unwrap();
+    std::fs::write(&truncated, &whole[..whole.len() / 2]).unwrap();
+    let mut cases = vec![
+        (huge, "larger than"),
+        (subdir, "not a regular file"),
+        (not_a_project, "not a reel project file"),
+        (truncated, "not a reel project file"),
+    ];
+    // A FIFO with no writer: opening it for reading would block forever.
+    let fifo = dir.join("fifo.eidetic.json");
+    if Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        cases.push((fifo, "not a regular file"));
+    } else {
+        eprintln!("skipping the FIFO case: mkfifo unavailable");
+    }
+
+    let mut mcp = Mcp::start_with(home.path(), &["--allow-previews"]);
+    let files_before = listing(&dir);
+    for (project, want) in &cases {
+        let before = contents(project);
+        for (tool, args) in project_tool_calls(project) {
+            let err = mcp.call(tool, args.clone()).unwrap_err();
+            assert!(err.contains(want), "{tool} {args}: want {want:?}: {err}");
+            assert_eq!(contents(project), before, "{tool} changed {project:?}");
+            for (path, bytes) in &sentinels {
+                assert_eq!(
+                    &std::fs::read(path).unwrap(),
+                    bytes,
+                    "{tool} wrote {path:?}"
+                );
+            }
+            assert_eq!(listing(&dir), files_before, "{tool} {args}");
+            assert!(listing(&home.path().join("tmp")).is_empty(), "{tool}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn every_project_tool_refuses_out_of_range_projects_before_any_subprocess() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("work");
+    std::fs::create_dir(&dir).unwrap();
+    // Stands in for ffmpeg and ffprobe: any run leaves the marker behind.
+    let marker = home.path().join("subprocess-ran");
+    let fake = home.path().join("fake-ffmpeg.sh");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut mcp = Mcp::start_env(
+        home.path(),
+        &["--allow-previews"],
+        &[
+            ("EIDETIC_FFMPEG_PATH", fake.as_path()),
+            ("EIDETIC_FFPROBE_PATH", fake.as_path()),
+        ],
+    );
+
+    let clip = dir.join("clip.mp4");
+    let still = dir.join("still.png");
+    std::fs::write(&clip, b"not decoded").unwrap();
+    std::fs::write(&still, b"not decoded").unwrap();
+    // Slot 1 is a video, so a retime or an OTIO export would probe it.
+    let valid = || {
+        let path = write_project(
+            &dir,
+            (320, 180),
+            "auto",
+            &[
+                SlotSpec {
+                    source: clip.clone(),
+                    kind: "video",
+                    start: 0.5,
+                    duration: 1.0,
+                    transition_in: json!("cut"),
+                },
+                photo(&still, 1.0),
+            ],
+        );
+        let project = saved(&path);
+        (path, project)
+    };
+    let sentinels = write_sentinels(&dir);
+
+    let many = vec![valid().1["slots"][1].clone(); 2001];
+    type Breaker = Box<dyn Fn(&mut Value)>;
+    let cases: Vec<(&str, Breaker)> = vec![
+        (
+            "frame 0x180 is outside",
+            Box::new(|p| p["width"] = json!(0)),
+        ),
+        (
+            "frame 100000x180 is outside",
+            Box::new(|p| p["width"] = json!(100000)),
+        ),
+        ("has no slots", Box::new(|p| p["slots"] = json!([]))),
+        (
+            "2001 slots; at most 2000",
+            Box::new(move |p| p["slots"] = json!(many)),
+        ),
+        (
+            "slot 1 has an unusable duration (-1)",
+            Box::new(|p| p["slots"][0]["duration"] = json!(-1.0)),
+        ),
+        // Finite and positive, so only the total refuses it.
+        (
+            "the reel runs",
+            Box::new(|p| p["slots"][0]["duration"] = json!(1e308)),
+        ),
+        (
+            "slot 1 has an unusable start (-2)",
+            Box::new(|p| p["slots"][0]["start"] = json!(-2.0)),
+        ),
+        (
+            "slot 2's transition lasts 99s",
+            Box::new(|p| p["slots"][1]["transition_in"] = json!({"crossfade": {"secs": 99.0}})),
+        ),
+    ];
+    for (want, break_it) in &cases {
+        let (path, mut project) = valid();
+        break_it(&mut project);
+        std::fs::write(&path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for (tool, args) in project_tool_calls(&path) {
+            let err = mcp.call(tool, args.clone()).unwrap_err();
+            assert!(err.contains("is out of range"), "{tool}: {err}");
+            assert!(err.contains(want), "{tool}: want {want:?}: {err}");
+            assert!(!marker.exists(), "{tool} started a subprocess for {want:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{tool} wrote");
+            for (out, bytes) in &sentinels {
+                assert_eq!(&std::fs::read(out).unwrap(), bytes, "{tool} wrote {out:?}");
+            }
+        }
+    }
+
+    // An edit that would leave a valid project out of range saves nothing.
+    for op in [
+        json!({"op": "retime", "slot": 2, "secs": 100000.0}),
+        json!({"op": "transition", "slot": 2, "style": "crossfade:nan"}),
+    ] {
+        let (path, _) = valid();
+        let before = std::fs::read(&path).unwrap();
+        let err = mcp
+            .call(
+                "edit_reel",
+                json!({"project": path.to_str().unwrap(), "ops": [op]}),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("out of range; nothing was saved"),
+            "{op}: {err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{op} wrote");
+    }
+    assert!(!marker.exists());
+
+    // The marker is live: a valid project's export does probe its video.
+    let (path, _) = valid();
+    mcp.call("export_otio", json!({"project": path.to_str().unwrap()}))
+        .unwrap();
+    assert!(marker.exists(), "the fake ffprobe never ran");
+}
+
+#[test]
+fn legacy_projects_still_load_and_edit_through_mcp() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path();
+    let (p0, p1) = (dir.join("p0.png"), dir.join("p1.png"));
+    let track = dir.join("track.wav");
+    // The v0.8 shape: a grid without tracker, model or fallback; photo
+    // slots without start, score, pinned, transition_in, motion, geometry
+    // or near_duplicates.
+    let legacy = json!({
+        "version": 1,
+        "created": "2026-08-01T10:00:00Z",
+        "modified": "2026-08-01T10:00:00Z",
+        "prompt": "rafting",
+        "width": 320, "height": 180, "frame": "auto",
+        "audio": track,
+        "grid": {"bpm": 120.0, "beats": [0.0, 0.5, 1.0, 1.5, 2.0],
+                 "downbeats": [0, 4], "high_energy": [[1.0, 2.0]]},
+        "output": dir.join("reel.mp4"),
+        "slots": [
+            {"asset": uuid::Uuid::new_v4().to_string(), "source": p0,
+             "kind": "photo", "duration": 1.0},
+            {"asset": uuid::Uuid::new_v4().to_string(), "source": p1,
+             "kind": "photo", "duration": 1.0},
+        ],
+    });
+    let project = dir.join("reel.eidetic.json");
+    std::fs::write(&project, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    let arg = project.to_str().unwrap();
+    let mut mcp = Mcp::start(dir);
+
+    let ops = json!([
+        {"op": "pin", "slot": 1},
+        {"op": "transition", "slot": 2, "style": "crossfade:0.4"},
+    ]);
+    let out = mcp
+        .call("edit_reel", json!({"project": arg, "ops": ops}))
+        .unwrap();
+    assert_eq!(out["slots"][0]["pinned"], json!(true));
+    let disk = saved(&project);
+    assert_eq!(disk["slots"][0]["pinned"], json!(true));
+    assert_eq!(
+        disk["slots"][1]["transition_in"]["crossfade"]["secs"],
+        json!(0.4)
+    );
+    assert_eq!(disk["grid"]["bpm"], json!(120.0));
+
+    let out = mcp.call("export_otio", json!({"project": arg})).unwrap();
+    assert_eq!(out["otio"], json!(dir.join("reel.otio")));
+    assert!(dir.join("reel.otio").is_file());
+
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        eprintln!("skipping the legacy render: ffmpeg not installed");
+        return;
+    }
+    for (path, colour) in [(&p0, "red"), (&p1, "blue")] {
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c={colour}:s=320x180"),
+            "-frames:v",
+            "1",
+            path.to_str().unwrap(),
+        ]);
+    }
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=3",
+        track.to_str().unwrap(),
+    ]);
+    let out = mcp
+        .call("render", json!({"project": arg, "preview": true}))
+        .unwrap();
+    assert_eq!(out["output"], json!(dir.join("reel.preview.mp4")));
+    assert_eq!(size_of(&dir.join("reel.preview.mp4")), (160, 90));
 }
