@@ -670,7 +670,9 @@ impl AssetsRepo {
         let sql = format!(
             "SELECT asset_id, vector, model_id FROM embeddings WHERE asset_id IN ({placeholders})"
         );
-        let mut q = sqlx::query_as::<_, (String, Vec<u8>, Option<String>)>(&sql);
+        // Safe: constant text plus `?` placeholders; every id goes through `.bind`.
+        let mut q =
+            sqlx::query_as::<_, (String, Vec<u8>, Option<String>)>(sqlx::AssertSqlSafe(sql));
         for id in &ids {
             q = q.bind(id_text(*id));
         }
@@ -687,7 +689,8 @@ impl AssetsRepo {
              WHERE asset_id IN ({placeholders}) ORDER BY asset_id, ts_secs"
         );
         type FrameRow = (String, f64, Vec<u8>, Option<String>, Option<f64>);
-        let mut q = sqlx::query_as::<_, FrameRow>(&sql);
+        // Safe: constant text plus `?` placeholders; every id goes through `.bind`.
+        let mut q = sqlx::query_as::<_, FrameRow>(sqlx::AssertSqlSafe(sql));
         for id in &ids {
             q = q.bind(id_text(*id));
         }
@@ -1300,7 +1303,9 @@ impl AssetsRepo {
                 _ => {}
             }
         }
-        let mut q = sqlx::query_as::<_, (String,)>(&sql);
+        // Safe: only constant fragments and `?` placeholders; every filter
+        // value goes through `.bind`.
+        let mut q = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql));
         if let Some(p) = &filters.person {
             q = q.bind(format!("%{p}%"));
         }
@@ -1457,7 +1462,8 @@ impl AssetsRepo {
             duration_secs: Option<f64>,
         }
 
-        let mut q = sqlx::query_as::<_, MetaRow>(&sql);
+        // Safe: constant text plus `?` placeholders; every id goes through `.bind`.
+        let mut q = sqlx::query_as::<_, MetaRow>(sqlx::AssertSqlSafe(sql));
         for (id, _, _) in &ranked {
             q = q.bind(id_text(*id));
         }

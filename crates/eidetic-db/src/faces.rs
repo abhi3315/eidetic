@@ -575,7 +575,8 @@ impl FacesRepo {
     /// Every face attributed to `person`, best (highest score) first.
     pub async fn fetch_faces_for_person(&self, person: PersonId) -> crate::Result<Vec<PersonFace>> {
         let sql = format!("{PERSON_FACE_SELECT} WHERE f.person_id = ? ORDER BY f.score DESC, f.id");
-        let rows: Vec<PersonFaceRow> = sqlx::query_as(&sql)
+        // Safe: a constant SELECT plus a `?` placeholder; the id goes through `.bind`.
+        let rows: Vec<PersonFaceRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(id_text(person))
             .fetch_all(&self.pool)
             .await
@@ -586,7 +587,8 @@ impl FacesRepo {
     /// One face by id, with the crop-relevant geometry and its asset's path.
     pub async fn fetch_face(&self, face: FaceId) -> crate::Result<Option<PersonFace>> {
         let sql = format!("{PERSON_FACE_SELECT} WHERE f.id = ?");
-        let row: Option<PersonFaceRow> = sqlx::query_as(&sql)
+        // Safe: a constant SELECT plus a `?` placeholder; the id goes through `.bind`.
+        let row: Option<PersonFaceRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(id_text(face))
             .fetch_optional(&self.pool)
             .await

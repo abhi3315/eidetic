@@ -24,7 +24,7 @@ use crate::{otio, preview, reel};
 use eidetic_core::Config;
 use eidetic_db::{AssetsRepo, FacesRepo, SearchFilters};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -791,8 +791,8 @@ impl ServerHandler for EideticMcp {
         Ok(rmcp::model::ListToolsResult::with_all_items(tools))
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         let (look, pixels) = if self.allow_previews {
             (
                 "preview_sheet (look at every slot: same-scene repeats, \

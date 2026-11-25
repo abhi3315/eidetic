@@ -36,6 +36,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-http-body-util = "0.1"
+http-body-util = { workspace = true }
 tower = { workspace = true }
 tempfile = { workspace = true }
