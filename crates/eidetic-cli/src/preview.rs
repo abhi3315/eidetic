@@ -9,7 +9,9 @@
 //! reel will, sideways clips included.
 //!
 //! Everything is bounded because the input is an arbitrary project file:
-//! the project read is bounded by `ReelProject::load_untrusted`, at most
+//! the project read is bounded by `ReelProject::load_untrusted`, only
+//! sources that resolve to regular files inside the library are decoded
+//! (one outside it refuses the whole project — see [`library_sources`]), at most
 //! [`MAX_TILES`] slots per sheet, tiles at most [`TILE_EDGE`] px, sources over [`MAX_SOURCE_PIXELS`] refused by the
 //! decoder, every ffmpeg buffer capped by `-max_alloc` (the framing filters
 //! crop before they scale, so no intermediate outgrows its source or tile),
@@ -21,9 +23,9 @@
 
 use crate::project::ReelProject;
 use crate::reel::{self, Slot, SlotKind, Transition};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use image::{Rgb, RgbImage};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -40,10 +42,12 @@ const MAX_SOURCE_PIXELS: u64 = 50_000_000;
 /// downstream is larger. Anything that asks for more fails instead of
 /// taking the machine's memory.
 const MAX_ALLOC_BYTES: u64 = 256 << 20;
-/// One ffmpeg frame grab. Seeking into a local file takes well under a
-/// second; this only catches a wedged decoder or a stalled disk.
+/// One ffmpeg frame grab, and separately the check that resolves every
+/// slot's source before any grab. Seeking into a local file takes well
+/// under a second; this only catches a wedged decoder or a stalled disk.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
-/// The whole sheet, so a project of slow slots cannot hold the server.
+/// Every frame grab of the sheet, so a project of slow slots cannot hold
+/// the server. The source check runs before it, outside this budget.
 const SHEET_TIMEOUT: Duration = Duration::from_secs(90);
 const JPEG_QUALITY: u8 = 80;
 
@@ -113,15 +117,81 @@ pub fn tile_timestamp(n: usize, slot: &Slot) -> Result<f64> {
     }
 }
 
+/// Every slot's source, resolved (symlinks and `..` followed), if each one
+/// is a regular file inside `library_dir`; any other source refuses the
+/// whole project, whichever page is asked for. Both sides are resolved, so
+/// a library directory reached through a symlink still matches.
+///
+/// Hard links and a path component swapped after this check are not
+/// caught; only someone who can already write to the library can do either.
+fn library_sources(slots: &[Slot], library_dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = std::fs::canonicalize(library_dir).map_err(|e| {
+        anyhow!(
+            "the library directory {} cannot be resolved ({e}); preview_sheet only shows \
+             files from the library",
+            library_dir.display()
+        )
+    })?;
+    slots
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let n = i + 1;
+            let real = match std::fs::canonicalize(&slot.source) {
+                Ok(real) => real,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "slot {n}'s source is missing: {} — swap or drop the slot",
+                    slot.source.display()
+                ),
+                Err(e) => bail!(
+                    "slot {n}'s source cannot be resolved ({e}): {}",
+                    slot.source.display()
+                ),
+            };
+            ensure!(
+                real.starts_with(&root),
+                "slot {n}'s source is outside the library ({}): {} — preview_sheet only shows \
+                 files from the library; swap the slot or re-plan with create_reel",
+                root.display(),
+                slot.source.display()
+            );
+            // Directories and FIFOs would fail or block the decoder.
+            ensure!(
+                std::fs::metadata(&real).is_ok_and(|m| m.is_file()),
+                "slot {n}'s source is not a regular file: {} — swap or drop the slot",
+                slot.source.display()
+            );
+            Ok(real)
+        })
+        .collect()
+}
+
 /// Build the sheet for slots `first..` (1-based) of `proj`, at most
-/// [`MAX_TILES`] of them.
-pub async fn contact_sheet(proj: &ReelProject, first: usize) -> Result<Sheet> {
+/// [`MAX_TILES`] of them. Every slot's source must lie inside
+/// `library_dir` (see [`library_sources`]), which is checked before ffmpeg
+/// is even looked up.
+pub async fn contact_sheet(proj: &ReelProject, first: usize, library_dir: &Path) -> Result<Sheet> {
     let total = proj.slots.len();
     ensure!(total > 0, "the project has no slots to preview");
     ensure!(
         (1..=total).contains(&first),
         "first={first} is outside the cut list (slots 1-{total})"
     );
+    // Resolving paths blocks, and a stalled mount must not hold the server.
+    let (all, lib) = (proj.slots.clone(), library_dir.to_path_buf());
+    let sources = tokio::time::timeout(
+        FRAME_TIMEOUT,
+        tokio::task::spawn_blocking(move || library_sources(&all, &lib)),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "checking the slot sources took longer than {}s; the library may be on a slow or \
+             sleeping disk — retry once it is reachable",
+            FRAME_TIMEOUT.as_secs()
+        )
+    })?
+    .context("the slot source check panicked")??;
     let Some(ffmpeg) = eidetic_ingest::video::ffmpeg() else {
         bail!("ffmpeg not found; install it (or set EIDETIC_FFMPEG_PATH) to build preview sheets");
     };
@@ -140,11 +210,6 @@ pub async fn contact_sheet(proj: &ReelProject, first: usize) -> Result<Sheet> {
     let mut tiles = Vec::with_capacity(slots.len());
     for &(n, slot) in &slots {
         let at = tile_timestamp(n, slot)?;
-        ensure!(
-            slot.source.is_file(),
-            "slot {n}'s source is missing: {} — swap or drop the slot",
-            slot.source.display()
-        );
         tiles.push(Tile {
             n,
             kind: slot.kind,
@@ -170,7 +235,8 @@ pub async fn contact_sheet(proj: &ReelProject, first: usize) -> Result<Sheet> {
         for (k, (&(n, slot), tile)) in slots.iter().zip(&tiles).enumerate() {
             let png = work.path().join(format!("tile_{k:03}.png"));
             let vf = reel::still_filter(slot, tw, th, fit);
-            grab_frame(ffmpeg, n, slot, tile.at, &vf, &png).await?;
+            // The resolved path, so ffmpeg opens exactly what was checked.
+            grab_frame(ffmpeg, n, slot, &sources[n - 1], tile.at, &vf, &png).await?;
             let frame = decode_tile(n, &png, (tw, th))?;
             let (col, row) = (k as u32 % cols, k as u32 / cols);
             let x = GAP + col * (cell_w + GAP);
@@ -203,11 +269,13 @@ pub async fn contact_sheet(proj: &ReelProject, first: usize) -> Result<Sheet> {
     })
 }
 
-/// Decode one framed still of `slot` at `at` seconds into `png`.
+/// Decode one framed still of `slot`, read from `source`, at `at` seconds
+/// into `png`. Errors name the source as the project spells it.
 async fn grab_frame(
     ffmpeg: &Path,
     n: usize,
     slot: &Slot,
+    source: &Path,
     at: f64,
     vf: &str,
     png: &Path,
@@ -220,7 +288,7 @@ async fn grab_frame(
         cmd.args(["-ss", &format!("{at:.3}")]);
     }
     cmd.arg("-i")
-        .arg(&slot.source)
+        .arg(source)
         .args(["-frames:v", "1", "-an", "-vf", vf])
         .args(["-f", "image2", "-c:v", "png"])
         .arg(png)
@@ -366,7 +434,8 @@ fn glyph(c: char) -> Option<[u8; 7]> {
 mod tests {
     use super::*;
     use eidetic_core::AssetId;
-    use std::path::PathBuf;
+    use eidetic_db::SearchResult;
+    use std::collections::HashMap;
 
     fn slot(kind: SlotKind, start: f64, duration: f64) -> Slot {
         Slot {
@@ -424,6 +493,147 @@ mod tests {
         assert_eq!(tile_size(1080, 1920).unwrap(), (180, 320));
         assert_eq!(tile_size(u32::MAX, 1).unwrap(), (320, 16));
         assert!(tile_size(0, 1080).is_err());
+    }
+
+    /// A search hit for a file stored at `lib/ab/cd/<hash>.<ext>`, with
+    /// dummy bytes there (and at its medium thumbnail when it has one).
+    fn stored(lib: &Path, byte: u8, ext: &str, video: bool, thumbs: bool) -> SearchResult {
+        let hash = eidetic_core::Sha256::from_hex(&format!("{byte:02x}").repeat(32)).unwrap();
+        let hex = hash.to_string();
+        let storage_path = lib
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.{ext}"));
+        let mut files = vec![storage_path.clone()];
+        if thumbs {
+            files.push(eidetic_ingest::thumbnail::thumbnail_path(
+                lib,
+                &hash,
+                eidetic_ingest::thumbnail::ThumbSize::Medium,
+            ));
+        }
+        for f in files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"media").unwrap();
+        }
+        SearchResult {
+            id: AssetId::new(),
+            storage_path,
+            score: 0.9,
+            frame_ts: video.then_some(1.0),
+            duration_secs: video.then_some(4.0),
+            speech: None,
+            mime_type: None,
+            file_size: 0,
+            thumbnails_generated: thumbs,
+            date_taken: None,
+            camera_make: None,
+            camera_model: None,
+            latitude: None,
+            longitude: None,
+        }
+    }
+
+    #[test]
+    fn planned_sources_pass_the_library_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("library");
+        let hits = [
+            stored(&lib, 0xab, "mp4", true, false),
+            stored(&lib, 0xcd, "png", false, true),
+            stored(&lib, 0xef, "png", false, false),
+        ];
+        let slots = reel::plan(
+            &hits,
+            60.0,
+            &lib,
+            &HashMap::new(),
+            &reel::Signals::default(),
+        );
+        assert_eq!(slots.len(), 3);
+        // One slot reads a thumbnail, one an original photo, one a video.
+        assert!(
+            slots
+                .iter()
+                .any(|s| s.source.starts_with(lib.join(".thumbs")))
+        );
+        let real_lib = std::fs::canonicalize(&lib).unwrap();
+        let want: Vec<PathBuf> = slots
+            .iter()
+            .map(|s| std::fs::canonicalize(&s.source).unwrap())
+            .collect();
+        assert_eq!(library_sources(&slots, &lib).unwrap(), want);
+        assert!(want.iter().all(|p| p.starts_with(&real_lib)));
+
+        // The same library reached through a symlinked directory, with the
+        // project spelling sources through the link or the real path.
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("library-link");
+            std::os::unix::fs::symlink(&lib, &link).unwrap();
+            assert_eq!(library_sources(&slots, &link).unwrap(), want);
+            let via_link = reel::plan(
+                &hits,
+                60.0,
+                &link,
+                &HashMap::new(),
+                &reel::Signals::default(),
+            );
+            assert_eq!(library_sources(&via_link, &link).unwrap(), want);
+            assert_eq!(library_sources(&via_link, &lib).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn sources_outside_the_library_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, outside) = (dir.path().join("library"), dir.path().join("outside"));
+        std::fs::create_dir_all(lib.join("album")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let ok = lib.join("ok.png");
+        let secret = outside.join("secret.png");
+        std::fs::write(&ok, b"media").unwrap();
+        std::fs::write(&secret, b"TOP SECRET").unwrap();
+        let with = |source: PathBuf| {
+            let mut bad = slot(SlotKind::Photo, 0.0, 1.0);
+            bad.source = source;
+            let mut good = slot(SlotKind::Photo, 0.0, 1.0);
+            good.source = ok.clone();
+            vec![good, bad]
+        };
+        let refused = |source: PathBuf, want: &str| {
+            let err = library_sources(&with(source.clone()), &lib)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("slot 2's source"), "{source:?}: {err}");
+            assert!(err.contains(want), "{source:?}: want {want:?}: {err}");
+            assert!(!err.contains("TOP SECRET"), "{err}");
+        };
+
+        refused(secret.clone(), "outside the library");
+        refused(
+            lib.join("..").join("outside").join("secret.png"),
+            "outside the library",
+        );
+        refused(lib.join("album"), "not a regular file");
+        refused(lib.join("gone.png"), "is missing");
+        refused(outside.join("gone.png"), "is missing");
+        // Any failure other than "not found" is not reported as missing.
+        #[cfg(unix)]
+        refused(ok.join("x.png"), "cannot be resolved");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&secret, lib.join("link.png")).unwrap();
+            refused(lib.join("link.png"), "outside the library");
+            symlink(&outside, lib.join("sub")).unwrap();
+            refused(lib.join("sub").join("secret.png"), "outside the library");
+        }
+        // A library directory that does not exist refuses everything.
+        let err = library_sources(&with(ok.clone())[..1], &dir.path().join("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be resolved"), "{err}");
     }
 
     #[test]

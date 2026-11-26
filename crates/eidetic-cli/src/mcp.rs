@@ -482,6 +482,7 @@ impl EideticMcp {
         description = "PRIVACY OPT-IN: available only when the operator started the server with `eidetic mcp --allow-previews`; otherwise it is refused and nothing is read. \
             Returns a JPEG contact sheet of a reel project so you can judge the cut with your own vision: one tile per slot (the midpoint frame of a video slot's span, or the photo), framed and rotated the way the render frames it, labelled with slot number, duration and incoming transition (OPEN on slot 1). \
             These are real frames from the user's library; with a cloud client they are sent to its provider. \
+            Every slot source must resolve to a regular file inside the library directory: a project naming any other file (an absolute path elsewhere, a `..` escape, or a symlink out of the library) is refused before anything is decoded, and the error names the slot. \
             At most 24 slots per sheet (page with first); tiles are at most 320px on the long edge. \
             A text block with the per-tile timestamps comes first, so clients that cannot show images still get the metadata. \
             Reads only: the project file and any rendered video are left untouched, and no sheet file is written."
@@ -499,7 +500,8 @@ impl EideticMcp {
             let path = PathBuf::from(&p.project);
             let proj = ReelProject::load_untrusted(&path).await?;
             let first = p.first.unwrap_or(1) as usize;
-            let sheet = preview::contact_sheet(&proj, first).await?;
+            let sheet =
+                preview::contact_sheet(&proj, first, &self.config.paths.library_dir).await?;
             let last = sheet.tiles.last().map_or(first, |t| t.n);
             let total = proj.slots.len();
             let meta = json!({

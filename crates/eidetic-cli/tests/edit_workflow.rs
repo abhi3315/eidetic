@@ -770,6 +770,33 @@ const BLUE: [bool; 3] = [false, false, true];
 const YELLOW: [bool; 3] = [true, true, false];
 const BLACK: [bool; 3] = [false, false, false];
 
+/// The library directory [`hermetic`] points the server at, created.
+/// preview_sheet only decodes sources inside it.
+fn library(home: &Path) -> PathBuf {
+    let lib = home.join("library");
+    std::fs::create_dir_all(&lib).unwrap();
+    lib
+}
+
+/// A stand-in for ffmpeg and ffprobe, and the marker any run of it leaves:
+/// every run appends its arguments to it, one per line.
+#[cfg(unix)]
+fn fake_ffmpeg(home: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = home.join("subprocess-ran");
+    let fake = home.join("fake-ffmpeg.sh");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (fake, marker)
+}
+
 /// Top-left corner of tile `k` on a sheet of 320x180 tiles, two columns.
 fn tile_origin(k: u32) -> (u32, u32) {
     (4 + (k % 2) * 324, 4 + (k / 2) * 224)
@@ -784,9 +811,10 @@ fn preview_sheet_shows_each_slot_as_the_render_frames_it() {
     let home = tempfile::tempdir().unwrap();
     let dir = home.path();
     let arg = |p: &Path| p.to_str().unwrap().to_string();
+    let lib = library(dir);
     // Red for the first second, green for the second, blue for the third:
     // the colour of a tile says which moment it was taken at.
-    let clip = dir.join("rgb.mp4");
+    let clip = lib.join("rgb.mp4");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -806,7 +834,7 @@ fn preview_sheet_shows_each_slot_as_the_render_frames_it() {
         "yuv420p",
         &arg(&clip),
     ]);
-    let still = dir.join("yellow.png");
+    let still = lib.join("yellow.png");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -818,7 +846,7 @@ fn preview_sheet_shows_each_slot_as_the_render_frames_it() {
     ]);
     // Landscape pixels (red left, blue right) a phone flagged as rotated:
     // the render shows it upright, i.e. portrait with red and blue stacked.
-    let flat = dir.join("flat.mp4");
+    let flat = lib.join("flat.mp4");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -834,7 +862,7 @@ fn preview_sheet_shows_each_slot_as_the_render_frames_it() {
         "yuv420p",
         &arg(&flat),
     ]);
-    let rotated = dir.join("rotated.mp4");
+    let rotated = lib.join("rotated.mp4");
     ffmpeg(&[
         "-display_rotation",
         "90",
@@ -934,7 +962,8 @@ fn preview_sheet_pages_long_reels_and_explains_bad_media() {
     }
     let home = tempfile::tempdir().unwrap();
     let dir = home.path();
-    let still = dir.join("still.png");
+    let lib = library(dir);
+    let still = lib.join("still.png");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -944,7 +973,7 @@ fn preview_sheet_pages_long_reels_and_explains_bad_media() {
         "1",
         still.to_str().unwrap(),
     ]);
-    let clip = dir.join("short.mp4");
+    let clip = lib.join("short.mp4");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -991,11 +1020,11 @@ fn preview_sheet_pages_long_reels_and_explains_bad_media() {
     }
 
     // Each broken slot is named, with what to do about it.
-    let garbage = dir.join("corrupt.png");
+    let garbage = lib.join("corrupt.png");
     std::fs::write(&garbage, b"not an image at all").unwrap();
     for (slot, want) in [
         (
-            photo(&dir.join("gone.png"), 1.0),
+            photo(&lib.join("gone.png"), 1.0),
             "slot 2's source is missing",
         ),
         (photo(&garbage, 1.0), "ffmpeg could not decode slot 2"),
@@ -1029,10 +1058,11 @@ fn preview_sheet_frames_extreme_aspects_within_its_memory_budget() {
     let home = tempfile::tempdir().unwrap();
     let dir = home.path();
     let arg = |p: &Path| p.to_str().unwrap().to_string();
+    let lib = library(dir);
     // A 1 MP sliver. Scaling it to cover a 180x320 tile BEFORE cropping
     // needs a 1280000x320 intermediate (410 MB of luma alone), which the
     // per-grab -max_alloc budget refuses; cropping first needs 9x16.
-    let sliver = dir.join("sliver.png");
+    let sliver = lib.join("sliver.png");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -1042,7 +1072,7 @@ fn preview_sheet_frames_extreme_aspects_within_its_memory_budget() {
         "1",
         &arg(&sliver),
     ]);
-    let clip = dir.join("clip.mp4");
+    let clip = lib.join("clip.mp4");
     ffmpeg(&[
         "-f",
         "lavfi",
@@ -1090,6 +1120,181 @@ fn preview_sheet_frames_extreme_aspects_within_its_memory_budget() {
     let (meta, img) = sheet(&mcp.call_raw("preview_sheet", json!({"project": arg(&project)})));
     assert_eq!(meta["tiles"].as_array().unwrap().len(), 3);
     assert!(img.width() <= 2048 && img.height() <= 2048);
+    assert!(listing(&dir.join("tmp")).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_sheet_refuses_sources_outside_the_library() {
+    use std::os::unix::fs::symlink;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path();
+    let (fake, marker) = fake_ffmpeg(dir);
+    let mut mcp = Mcp::start_env(
+        dir,
+        &["--allow-previews"],
+        &[
+            ("EIDETIC_FFMPEG_PATH", fake.as_path()),
+            ("EIDETIC_FFPROBE_PATH", fake.as_path()),
+        ],
+    );
+    let lib = library(dir);
+    let outside = dir.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let secret = outside.join("secret.png");
+    std::fs::write(&secret, b"TOP-SECRET-PIXELS").unwrap();
+    let ok = lib.join("ok.png");
+    std::fs::write(&ok, b"not decoded").unwrap();
+    symlink(&secret, lib.join("link.png")).unwrap();
+    symlink(&outside, lib.join("sub")).unwrap();
+
+    let refuse = |mcp: &mut Mcp, slots: &[SlotSpec], want: &str| {
+        let project = write_project(dir, (320, 180), "auto", slots);
+        let before = std::fs::read(&project).unwrap();
+        let result = mcp.call_raw(
+            "preview_sheet",
+            json!({"project": project.to_str().unwrap()}),
+        );
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(image_blocks(&result).is_empty(), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(want), "want {want:?}: {text}");
+        assert!(!text.contains("TOP-SECRET"), "{text}");
+        assert!(!marker.exists(), "ffmpeg ran before refusing: {text}");
+        assert_eq!(std::fs::read(&project).unwrap(), before);
+        assert!(listing(&dir.join("tmp")).is_empty());
+    };
+    for source in [
+        secret.clone(),
+        lib.join("..").join("outside").join("secret.png"),
+        lib.join("link.png"),
+        lib.join("sub").join("secret.png"),
+    ] {
+        refuse(
+            &mut mcp,
+            &[photo(&ok, 1.0), photo(&source, 1.0)],
+            "slot 2's source is outside the library",
+        );
+    }
+    refuse(
+        &mut mcp,
+        &[photo(&ok, 1.0), photo(&outside.join("nope.png"), 1.0)],
+        "slot 2's source is missing",
+    );
+    refuse(
+        &mut mcp,
+        &[photo(&ok, 1.0), photo(&lib, 1.0)],
+        "slot 2's source is not a regular file",
+    );
+    // The whole project is checked, not only the page the sheet shows.
+    let mut long: Vec<SlotSpec> = (0..29).map(|_| photo(&ok, 1.0)).collect();
+    long.push(photo(&secret, 1.0));
+    refuse(&mut mcp, &long, "slot 30's source is outside the library");
+
+    // The marker is live: an all-library project does reach ffmpeg, which
+    // opens the resolved file, not the link the project names.
+    let alias = lib.join("alias.png");
+    symlink(&ok, &alias).unwrap();
+    let project = write_project(dir, (320, 180), "auto", &[photo(&alias, 1.0)]);
+    let err = mcp
+        .call(
+            "preview_sheet",
+            json!({"project": project.to_str().unwrap()}),
+        )
+        .unwrap_err();
+    assert!(err.contains("ffmpeg could not decode slot 1"), "{err}");
+    let args = std::fs::read_to_string(&marker).expect("the fake ffmpeg never ran");
+    let args: Vec<&str> = args.lines().collect();
+    let input = args.iter().position(|a| *a == "-i").map(|i| args[i + 1]);
+    let real = std::fs::canonicalize(&ok).unwrap();
+    assert_eq!(input, Some(real.to_str().unwrap()), "{args:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_sheet_shows_library_media_reached_through_a_symlink() {
+    use eidetic_ingest::thumbnail::{ThumbSize, thumbnail_path};
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path();
+    let real = dir.join("real-library");
+    let link = dir.join("library-link");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // Laid out the way ingest stores media: content-addressed originals,
+    // medium thumbnails under .thumbs.
+    let stored = |byte: u8, ext: &str| {
+        let hash = eidetic_core::Sha256::from_hex(&format!("{byte:02x}").repeat(32)).unwrap();
+        let hex = hash.to_string();
+        let path = link
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.{ext}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        (path, hash)
+    };
+    let still = |path: &Path, colour: &str| {
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c={colour}:s=160x90"),
+            "-frames:v",
+            "1",
+            path.to_str().unwrap(),
+        ]);
+    };
+    let (clip, _) = stored(0xab, "mp4");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x90:rate=30",
+        "-t",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        clip.to_str().unwrap(),
+    ]);
+    let (original, hash) = stored(0xcd, "png");
+    still(&original, "red");
+    let thumb = thumbnail_path(&link, &hash, ThumbSize::Medium);
+    std::fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+    still(&thumb, "red");
+    let (plain, _) = stored(0xef, "png");
+    still(&plain, "blue");
+    let via_real = real.join(plain.strip_prefix(&link).unwrap());
+
+    let project = write_project(
+        dir,
+        (320, 180),
+        "auto",
+        &[
+            SlotSpec {
+                source: clip,
+                kind: "video",
+                start: 0.5,
+                duration: 1.0,
+                transition_in: json!("cut"),
+            },
+            photo(&thumb, 1.0),
+            photo(&plain, 1.0),
+            photo(&via_real, 1.0),
+        ],
+    );
+    let mut mcp = Mcp::start_env(
+        dir,
+        &["--allow-previews"],
+        &[("EIDETIC_LIBRARY_DIR", link.as_path())],
+    );
+    let (meta, _) = sheet(&mcp.call_raw(
+        "preview_sheet",
+        json!({"project": project.to_str().unwrap()}),
+    ));
+    assert_eq!(meta["tiles"].as_array().unwrap().len(), 4);
     assert!(listing(&dir.join("tmp")).is_empty());
 }
 
@@ -1232,19 +1437,10 @@ fn every_project_tool_refuses_unreadable_projects_without_writing() {
 #[cfg(unix)]
 #[test]
 fn every_project_tool_refuses_out_of_range_projects_before_any_subprocess() {
-    use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let dir = home.path().join("work");
     std::fs::create_dir(&dir).unwrap();
-    // Stands in for ffmpeg and ffprobe: any run leaves the marker behind.
-    let marker = home.path().join("subprocess-ran");
-    let fake = home.path().join("fake-ffmpeg.sh");
-    std::fs::write(
-        &fake,
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (fake, marker) = fake_ffmpeg(home.path());
     let mut mcp = Mcp::start_env(
         home.path(),
         &["--allow-previews"],
