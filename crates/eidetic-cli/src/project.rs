@@ -155,7 +155,8 @@ impl ReelProject {
     /// Refuse a project whose numbers no render could use: slot count,
     /// frame size and style, every slot's span and joint, and the total
     /// length. Pure arithmetic, so it runs before any ffmpeg or write.
-    /// Sources, audio and the output path are not checked here.
+    /// Sources, audio and the output path are not checked here; the
+    /// preview sheet checks sources against the library itself.
     pub fn validate(&self) -> Result<()> {
         use anyhow::ensure;
         let count = self.slots.len();
