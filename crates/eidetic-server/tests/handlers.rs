@@ -49,11 +49,24 @@ async fn seed_asset(
     let src_path = library.join(filename);
     std::fs::write(&src_path, bytes).unwrap();
 
-    let asset = NewAsset {
+    let asset = new_asset(filename, mime, src_path, bytes.len() as u64, hash_byte);
+    match repo.insert_asset(asset).await.expect("insert") {
+        eidetic_db::InsertOutcome::Inserted(id) | eidetic_db::InsertOutcome::Existing(id) => id,
+    }
+}
+
+fn new_asset(
+    filename: &str,
+    mime: &str,
+    storage_path: std::path::PathBuf,
+    file_size: u64,
+    hash_byte: u8,
+) -> NewAsset {
+    NewAsset {
         hash: format!("{hash_byte:02x}").repeat(32),
         original_filename: filename.to_string(),
-        storage_path: src_path,
-        file_size: bytes.len() as u64,
+        storage_path,
+        file_size,
         mime_type: Some(mime.to_string()),
         date_taken: None,
         latitude: None,
@@ -81,10 +94,154 @@ async fn seed_asset(
         video_codec: None,
         pixel_width: None,
         pixel_height: None,
-    };
-    match repo.insert_asset(asset).await.expect("insert") {
-        eidetic_db::InsertOutcome::Inserted(id) | eidetic_db::InsertOutcome::Existing(id) => id,
     }
+}
+
+/// Insert one asset taken at `taken`, with bytes at a path that does not
+/// depend on the visible filename. `hash_byte` must be unique per test.
+async fn seed_dav(
+    repo: &AssetsRepo,
+    tmp: &tempfile::TempDir,
+    filename: &str,
+    bytes: &[u8],
+    hash_byte: u8,
+    taken: chrono::DateTime<chrono::Utc>,
+) -> eidetic_core::AssetId {
+    let library = tmp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let path = library.join(format!("stored-{hash_byte:02x}.bin"));
+    std::fs::write(&path, bytes).unwrap();
+    let mut asset = new_asset(
+        filename,
+        "application/octet-stream",
+        path,
+        bytes.len() as u64,
+        hash_byte,
+    );
+    asset.date_taken = Some(taken);
+    match repo.insert_asset(asset).await.expect("insert") {
+        eidetic_db::InsertOutcome::Inserted(id) => id,
+        eidetic_db::InsertOutcome::Existing(_) => panic!("duplicate hash byte {hash_byte:#x}"),
+    }
+}
+
+async fn dav_request(
+    router: &eidetic_server::TestRouter,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, Vec<u8>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Depth", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (
+        status,
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+}
+
+/// File hrefs of a month listing (the collection's own href is dropped).
+async fn month_files(router: &eidetic_server::TestRouter, month: &str) -> Vec<String> {
+    let (status, body) = dav_request(router, "PROPFIND", month).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    String::from_utf8(body)
+        .unwrap()
+        .split("<D:href>")
+        .skip(1)
+        .filter_map(|s| s.split("</D:href>").next())
+        .filter(|h| *h != month)
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn dav_lists_every_colliding_asset_under_a_unique_name() {
+    use chrono::TimeZone;
+    let (router, repo, _faces, tmp) = fixture().await;
+    let base = chrono::Utc.with_ymd_and_hms(2024, 3, 15, 12, 0, 0).unwrap();
+    let at = |s: i64| base + chrono::Duration::seconds(s);
+
+    // C is inserted first only to learn its id prefix; it is listed last of
+    // the "a" group and has to retry past three taken names.
+    let c = seed_dav(&repo, &tmp, "a.jpg", b"bytes-c", 1, at(3)).await;
+    let c8 = c.as_uuid().simple().to_string()[..8].to_string();
+    seed_dav(&repo, &tmp, "a.jpg", b"bytes-a", 2, at(0)).await;
+    seed_dav(&repo, &tmp, &format!("a-{c8}.jpg"), b"bytes-b", 3, at(1)).await;
+    seed_dav(&repo, &tmp, &format!("a-{c8}-2.jpg"), b"bytes-d", 4, at(2)).await;
+    // Extensionless: G's natural name equals the name F would be given, yet
+    // G is listed after F.
+    seed_dav(&repo, &tmp, "notes", b"bytes-e", 5, at(4)).await;
+    let f = seed_dav(&repo, &tmp, "notes", b"bytes-f", 6, at(5)).await;
+    let f8 = f.as_uuid().simple().to_string()[..8].to_string();
+    seed_dav(&repo, &tmp, &format!("notes-{f8}"), b"bytes-g", 7, at(6)).await;
+    // Same name, same second: the listing's `id` tie-break decides which one
+    // keeps the plain name. Re-insert until the older row has the larger id,
+    // so insertion order alone would name the pair the other way round.
+    let mut pair = [(9u8, &b"bytes-i"[..]), (10, &b"bytes-j"[..])];
+    let mut ids = [
+        seed_dav(&repo, &tmp, "b.jpg", pair[0].1, pair[0].0, at(7)).await,
+        seed_dav(&repo, &tmp, "b.jpg", pair[1].1, pair[1].0, at(7)).await,
+    ];
+    while ids[0].as_uuid() < ids[1].as_uuid() {
+        assert!(repo.delete_asset(ids[0]).await.unwrap());
+        pair.swap(0, 1);
+        ids.swap(0, 1);
+        ids[1] = seed_dav(&repo, &tmp, "b.jpg", pair[1].1, pair[1].0, at(7)).await;
+    }
+    let b8 = ids[0].as_uuid().simple().to_string()[..8].to_string();
+    // Same name, another month.
+    let april = chrono::Utc.with_ymd_and_hms(2024, 4, 15, 12, 0, 0).unwrap();
+    seed_dav(&repo, &tmp, "a.jpg", b"bytes-h", 8, april).await;
+
+    let expected: Vec<(String, &[u8])> = vec![
+        ("a.jpg".into(), b"bytes-a"),
+        (format!("a-{c8}.jpg"), b"bytes-b"),
+        (format!("a-{c8}-2.jpg"), b"bytes-d"),
+        (format!("a-{c8}-3.jpg"), b"bytes-c"),
+        ("notes".into(), b"bytes-e"),
+        (format!("notes-{f8}"), b"bytes-g"),
+        (format!("notes-{f8}-2"), b"bytes-f"),
+        ("b.jpg".into(), pair[1].1),
+        (format!("b-{b8}.jpg"), pair[0].1),
+    ];
+
+    let mut got = month_files(&router, "/dav/2024/03/").await;
+    got.sort();
+    let mut want_hrefs: Vec<String> = expected
+        .iter()
+        .map(|(n, _)| format!("/dav/2024/03/{n}"))
+        .collect();
+    want_hrefs.sort();
+    assert_eq!(got, want_hrefs);
+
+    for (name, bytes) in &expected {
+        let (status, body) = dav_request(&router, "GET", &format!("/dav/2024/03/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(body, *bytes, "{name}");
+    }
+
+    assert_eq!(
+        month_files(&router, "/dav/2024/04/").await,
+        vec!["/dav/2024/04/a.jpg".to_string()]
+    );
+    let (status, body) = dav_request(&router, "GET", "/dav/2024/04/a.jpg").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"bytes-h");
 }
 
 #[tokio::test]
@@ -94,21 +251,9 @@ async fn dav_propfind_walks_the_virtual_tree_and_get_serves_bytes() {
     let _ = id;
 
     // Root listing: 207 with at least one year collection.
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PROPFIND")
-                .uri("/dav/")
-                .header("Depth", "1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::MULTI_STATUS);
-    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let (status, body) = dav_request(&router, "PROPFIND", "/dav/").await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    let body = String::from_utf8_lossy(&body).into_owned();
     assert!(body.contains("<D:collection/>"), "{body}");
     let year = body
         .split("/dav/")
@@ -118,21 +263,9 @@ async fn dav_propfind_walks_the_virtual_tree_and_get_serves_bytes() {
         .to_string();
 
     // Walk to the month, then list files.
-    let month_list = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PROPFIND")
-                .uri(format!("/dav/{year}/"))
-                .header("Depth", "1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(month_list.status(), StatusCode::MULTI_STATUS);
-    let body = String::from_utf8_lossy(&month_list.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let (status, body) = dav_request(&router, "PROPFIND", &format!("/dav/{year}/")).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    let body = String::from_utf8_lossy(&body).into_owned();
     let month = body
         .split(&format!("/dav/{year}/"))
         .nth(2)
@@ -140,20 +273,8 @@ async fn dav_propfind_walks_the_virtual_tree_and_get_serves_bytes() {
         .expect("a month href")
         .to_string();
 
-    let files = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PROPFIND")
-                .uri(format!("/dav/{year}/{month}/"))
-                .header("Depth", "1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = String::from_utf8_lossy(&files.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let (_, body) = dav_request(&router, "PROPFIND", &format!("/dav/{year}/{month}/")).await;
+    let body = String::from_utf8_lossy(&body).into_owned();
     assert!(body.contains("clip.jpg"), "{body}");
     assert!(
         body.contains("<D:getcontentlength>9</D:getcontentlength>"),
@@ -161,19 +282,10 @@ async fn dav_propfind_walks_the_virtual_tree_and_get_serves_bytes() {
     );
 
     // GET the file through DAV.
-    let got = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/dav/{year}/{month}/clip.jpg"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(got.status(), StatusCode::OK);
-    let bytes = got.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(&bytes[..], b"JPEGBYTES");
+    let (status, bytes) =
+        dav_request(&router, "GET", &format!("/dav/{year}/{month}/clip.jpg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"JPEGBYTES");
 
     // Read-only: PUT is refused.
     let put = router

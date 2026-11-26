@@ -44,7 +44,7 @@ pub struct EideticMcp {
     ///
     /// Loading the model costs ~1.4 GiB and several seconds, so it must
     /// happen at most once per session — but lazily, because an agent that
-    /// only reads metadata (`scenes`, `transcript`, `faces_in`) should never
+    /// only reads metadata (`scenes`, `transcript`, `library_stats`) should never
     /// pay for it at all. Same resident-worker shape as `eidetic-server`,
     /// with the eager load traded for a `OnceCell`.
     /// Paired with the loaded model's `model_id`.
@@ -361,17 +361,23 @@ impl EideticMcp {
         )
     }
 
-    #[tool(description = "Library totals: asset counts, embedded counts, size, date range.")]
+    #[tool(
+        description = "Library totals: asset counts, size, date range, and embedding readiness. embedded counts assets with a stored vector from any model; model is the active embedding model, ready is how many assets search can rank under it, and pending.images/pending.videos are what `eidetic embed` would process for it."
+    )]
     async fn library_stats(
         &self,
         Parameters(_): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, ErrorData> {
         reply(
             async {
-                let s = self.repo.fetch_stats().await?;
+                // From EIDETIC_MODEL alone: stats must not pay the model load.
+                let (model_id, _dim) = eidetic_ml::active_model()?;
+                let s = self.repo.fetch_stats(model_id).await?;
                 Ok(json!({
                     "assets": s.total, "images": s.images, "videos": s.videos,
-                    "embedded": s.embedded, "needs_embed": s.needs_embed,
+                    "embedded": s.embedded,
+                    "model": model_id, "ready": s.ready(),
+                    "pending": {"images": s.pending_images, "videos": s.pending_videos},
                     "bytes": s.total_bytes,
                     "earliest": s.earliest.map(|d| d.format("%Y-%m-%d").to_string()),
                     "latest": s.latest.map(|d| d.format("%Y-%m-%d").to_string()),

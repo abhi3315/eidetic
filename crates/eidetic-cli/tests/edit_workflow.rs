@@ -1,5 +1,6 @@
-//! The edit loop through its real entry points: the `eidetic mcp` stdio
-//! server (edit_reel, render) and `eidetic reel edit`.
+//! Real entry points (edit loop and stats): the `eidetic mcp` stdio server
+//! (edit_reel, render, library_stats), `eidetic reel edit` and
+//! `eidetic stats`.
 //!
 //! Hermetic by construction: every Eidetic path (database, library, model
 //! cache) and HOME point into a per-test temp dir, projects are written by
@@ -23,6 +24,7 @@ fn hermetic(cmd: &mut Command, home: &Path) {
         .env("EIDETIC_DATABASE_PATH", home.join("eidetic.db"))
         .env("EIDETIC_LIBRARY_DIR", home.join("library"))
         .env("EIDETIC_MODELS_CACHE", home.join("models"))
+        .env("EIDETIC_MODEL", "base")
         .env("EIDETIC_LOG", "error");
 }
 
@@ -382,6 +384,144 @@ fn reel_edit_cli_repairs_a_project_the_mcp_tools_refuse() {
 
     mcp.call("export_otio", json!({"project": arg})).unwrap();
     assert!(dir.join("reel.otio").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// Stats readiness
+// ---------------------------------------------------------------------------
+
+/// The id `EIDETIC_MODEL=base` resolves to (ADR-0013 pins the revision).
+const PINNED_BASE: &str = "siglip2-base-patch16-256@d1114256522a37ffa257a0a58017348ab0058db2";
+/// The same variant as migration 009 recorded it, before the pin.
+const LEGACY_BASE: &str = "siglip2-base-patch16-256";
+
+/// Seed `home`'s database: a photo embedded under the legacy id, one under
+/// the pinned id, and a video with no frames at all.
+fn seed_mixed_library(home: &Path) {
+    let config = eidetic_core::Config {
+        database_path: home.join("eidetic.db"),
+        paths: eidetic_core::Paths {
+            library_dir: home.join("library"),
+            models_cache: home.join("models"),
+        },
+    };
+    let asset = |byte: char, name: &str, mime: &str| eidetic_db::NewAsset {
+        hash: byte.to_string().repeat(64),
+        original_filename: name.to_string(),
+        storage_path: home.join("library").join(name),
+        file_size: 1,
+        mime_type: Some(mime.to_string()),
+        date_taken: None,
+        latitude: None,
+        longitude: None,
+        camera_make: None,
+        camera_model: None,
+        lens_make: None,
+        lens_model: None,
+        focal_length: None,
+        focal_length_35mm: None,
+        aperture: None,
+        shutter: None,
+        iso: None,
+        orientation: None,
+        altitude: None,
+        gps_direction: None,
+        exif_raw: None,
+        country_code: None,
+        country_name: None,
+        admin1: None,
+        place: None,
+        place_distance_m: None,
+        thumbnails_generated: true,
+        duration_secs: None,
+        video_codec: None,
+        pixel_width: None,
+        pixel_height: None,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let pool = eidetic_db::connect(&config).await.unwrap();
+        let repo = eidetic_db::AssetsRepo::new(pool.clone());
+        let insert = |a| async {
+            match repo.insert_asset(a).await.unwrap() {
+                eidetic_db::InsertOutcome::Inserted(id) => id,
+                eidetic_db::InsertOutcome::Existing(_) => panic!("fixture hashes are unique"),
+            }
+        };
+        let legacy = insert(asset('a', "legacy.jpg", "image/jpeg")).await;
+        let pinned = insert(asset('b', "pinned.jpg", "image/jpeg")).await;
+        insert(asset('c', "clip.mp4", "video/mp4")).await;
+        let v = vec![0.0f32; 768];
+        repo.store_embedding(legacy, &v, LEGACY_BASE).await.unwrap();
+        repo.store_embedding(pinned, &v, PINNED_BASE).await.unwrap();
+        pool.close().await;
+    });
+}
+
+/// `SiglipEmbedder::load` creates the models dir before it downloads
+/// anything, so its absence proves no load was attempted.
+fn assert_no_model_touched(home: &Path) {
+    assert!(!home.join("models").exists(), "a model load was attempted");
+    assert!(
+        !home.join("cache").join("huggingface").exists(),
+        "something reached the HuggingFace cache"
+    );
+}
+
+#[test]
+fn stats_cli_reports_readiness_for_the_active_model_without_loading_it() {
+    let home = tempfile::tempdir().unwrap();
+    seed_mixed_library(home.path());
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
+    cmd.arg("stats");
+    hermetic(&mut cmd, home.path());
+    let out = cmd.output().expect("run eidetic stats");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let line = |label: &str| -> String {
+        stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("no {label:?} line in:\n{stdout}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(
+        line("Stored"),
+        "Stored 2 (assets with an embedding from any model)"
+    );
+    assert_eq!(line("Model"), format!("Model {PINNED_BASE}"));
+    assert_eq!(line("ready"), "ready 1");
+    assert_eq!(line("pending"), "pending 1 images, 1 videos");
+    assert!(stdout.contains("run `eidetic embed`"), "{stdout}");
+    assert_no_model_touched(home.path());
+}
+
+#[test]
+fn library_stats_reports_readiness_for_the_active_model_without_loading_it() {
+    let home = tempfile::tempdir().unwrap();
+    seed_mixed_library(home.path());
+
+    let mut mcp = Mcp::start(home.path());
+    let s = mcp.call("library_stats", json!({})).unwrap();
+    assert_eq!(s["assets"], json!(3));
+    assert_eq!(s["embedded"], json!(2), "stored vectors from any model");
+    assert_eq!(s["model"], json!(PINNED_BASE));
+    assert_eq!(s["ready"], json!(1));
+    assert_eq!(s["pending"], json!({"images": 1, "videos": 1}));
+    assert!(s.get("needs_embed").is_none(), "{s}");
+    drop(mcp);
+    assert_no_model_touched(home.path());
 }
 
 // ---------------------------------------------------------------------------
