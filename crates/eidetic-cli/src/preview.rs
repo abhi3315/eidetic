@@ -9,9 +9,8 @@
 //! reel will, sideways clips included.
 //!
 //! Everything is bounded because the input is an arbitrary project file:
-//! the project read is capped in size and time and refuses non-regular
-//! files, at most [`MAX_TILES`] slots per sheet, tiles at most
-//! [`TILE_EDGE`] px, sources over [`MAX_SOURCE_PIXELS`] refused by the
+//! the project read is bounded by `ReelProject::load_untrusted`, at most
+//! [`MAX_TILES`] slots per sheet, tiles at most [`TILE_EDGE`] px, sources over [`MAX_SOURCE_PIXELS`] refused by the
 //! decoder, every ffmpeg buffer capped by `-max_alloc` (the framing filters
 //! crop before they scale, so no intermediate outgrows its source or tile),
 //! and a timeout per ffmpeg run and for the whole sheet. Nothing is written outside a temp
@@ -41,10 +40,6 @@ const MAX_SOURCE_PIXELS: u64 = 50_000_000;
 /// downstream is larger. Anything that asks for more fails instead of
 /// taking the machine's memory.
 const MAX_ALLOC_BYTES: u64 = 256 << 20;
-/// Project files are a few KB to a few hundred; anything bigger is not one.
-const MAX_PROJECT_BYTES: u64 = 8 << 20;
-/// Reading a small local file; this only catches a hung network mount.
-const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// One ffmpeg frame grab. Seeking into a local file takes well under a
 /// second; this only catches a wedged decoder or a stalled disk.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
@@ -95,11 +90,12 @@ pub fn tile_size(width: u32, height: u32) -> Result<(u32, u32)> {
 
 /// Where in its source a slot's tile is taken: the midpoint of the span
 /// the reel plays, or 0 for a photo. Refuses spans no render could play
-/// rather than guessing at a frame.
+/// rather than guessing at a frame (`ReelProject::validate` refuses them
+/// first; this keeps the function safe on its own).
 pub fn tile_timestamp(n: usize, slot: &Slot) -> Result<f64> {
     ensure!(
         slot.duration.is_finite() && slot.duration > 0.0,
-        "slot {n} has an unusable duration ({}); retime it with edit_reel",
+        "slot {n} has an unusable duration ({})",
         slot.duration
     );
     match slot.kind {
@@ -107,7 +103,7 @@ pub fn tile_timestamp(n: usize, slot: &Slot) -> Result<f64> {
         SlotKind::Video => {
             ensure!(
                 slot.start.is_finite() && slot.start >= 0.0,
-                "slot {n} has an unusable start ({}); swap it with edit_reel",
+                "slot {n} has an unusable start ({})",
                 slot.start
             );
             let mid = slot.start + slot.duration / 2.0;
@@ -115,27 +111,6 @@ pub fn tile_timestamp(n: usize, slot: &Slot) -> Result<f64> {
             Ok(mid)
         }
     }
-}
-
-/// Load the project a preview names: a regular file of at most
-/// [`MAX_PROJECT_BYTES`], read off the async executor within
-/// [`LOAD_TIMEOUT`]. A read stuck in the kernel (a dead network mount)
-/// cannot be cancelled, but it no longer holds the server: the call fails
-/// and the blocked thread is abandoned.
-pub async fn load_project(path: &Path) -> Result<ReelProject> {
-    let owned = path.to_path_buf();
-    let load =
-        tokio::task::spawn_blocking(move || ReelProject::load_bounded(&owned, MAX_PROJECT_BYTES));
-    tokio::time::timeout(LOAD_TIMEOUT, load)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "reading {} took longer than {}s; is it on a reachable disk?",
-                path.display(),
-                LOAD_TIMEOUT.as_secs()
-            )
-        })?
-        .context("project reader panicked")?
 }
 
 /// Build the sheet for slots `first..` (1-based) of `proj`, at most
