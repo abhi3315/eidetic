@@ -2,6 +2,11 @@ use eidetic_core::Config;
 use eidetic_db::{AssetsRepo, InsertOutcome, NewAsset};
 use std::path::PathBuf;
 
+/// A SigLIP id as migration 009 backfilled it, before revisions were pinned.
+const LEGACY: &str = "siglip2-base-patch16-256";
+/// The same variant under its pinned identity (ADR-0013).
+const PINNED: &str = "siglip2-base-patch16-256@d1114256522a37ffa257a0a58017348ab0058db2";
+
 /// A throwaway SQLite database in its own temp dir.
 ///
 /// The returned `TempDir` guard must outlive the test body — dropping it
@@ -411,9 +416,6 @@ async fn legacy_rows_never_rank_under_a_pinned_model_id() {
     // names) have the same width as the pinned export's rows, so a width
     // check cannot tell them apart. Search, dupes input and the re-embed
     // queue must all go by exact id — and nothing is deleted to get there.
-    const LEGACY: &str = "siglip2-base-patch16-256";
-    const PINNED: &str = "siglip2-base-patch16-256@d1114256522a37ffa257a0a58017348ab0058db2";
-
     let (_tmp, config) = temp_db();
     let pool = eidetic_db::connect(&config).await.expect("connect");
     let repo = AssetsRepo::new(pool);
@@ -881,4 +883,252 @@ async fn transcript_round_trips_in_order() {
     assert_eq!(back[0].2, "first thing said");
     assert!((back[0].0 - 0.5).abs() < 1e-9);
     assert_eq!(back[1].2, "second thing said");
+}
+
+// ---------------------------------------------------------------------------
+// Stats readiness: the pending counts are the embed backlog, per model.
+// ---------------------------------------------------------------------------
+
+/// Fetch stats for `model` and check them against the backlog `eidetic embed`
+/// would process for it, then return them for fixture-specific checks.
+async fn assert_stats_match_backlog(repo: &AssetsRepo, model: &str) -> eidetic_db::LibraryStats {
+    let stats = repo.fetch_stats(model).await.expect("stats");
+    let images = repo.fetch_unembedded(model).await.expect("image backlog");
+    let videos = repo
+        .fetch_videos_unembedded(model)
+        .await
+        .expect("video backlog");
+    assert_eq!(stats.pending_images, images.len() as i64, "{model}");
+    assert_eq!(stats.pending_videos, videos.len() as i64, "{model}");
+    assert_eq!(
+        stats.ready(),
+        stats.images + stats.videos - stats.pending_images - stats.pending_videos,
+        "{model}"
+    );
+    stats
+}
+
+async fn insert(repo: &AssetsRepo, asset: NewAsset) -> eidetic_core::AssetId {
+    match repo.insert_asset(asset).await.expect("insert") {
+        InsertOutcome::Inserted(id) => id,
+        _ => panic!("expected Inserted"),
+    }
+}
+
+fn unit_vector() -> Vec<f32> {
+    let mut v = vec![0.0f32; 768];
+    v[0] = 1.0;
+    v
+}
+
+fn frame(ts_secs: f64) -> eidetic_db::NewFrame {
+    eidetic_db::NewFrame {
+        ts_secs,
+        vector: unit_vector(),
+        motion: None,
+    }
+}
+
+fn blob() -> Vec<u8> {
+    unit_vector().iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// A library embedded before model ids existed: migration 009 backfills the
+/// bare legacy id, so none of it is ready for the pinned model.
+#[tokio::test]
+async fn stats_pending_follow_the_backlog_after_the_model_id_backfill() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let (_tmp, config) = temp_db();
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&config.database_path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("open");
+    let mut before = sqlx::migrate!("../../migrations");
+    before.migrations = std::borrow::Cow::Owned(
+        before
+            .migrations
+            .iter()
+            .filter(|m| m.version <= 8)
+            .cloned()
+            .collect(),
+    );
+    before.run(&pool).await.expect("migrations 001-008");
+    let legacy_rows = [
+        (
+            'a',
+            "old.jpg",
+            "image/jpeg",
+            "INSERT INTO embeddings (asset_id, dim, vector) VALUES (?, 768, ?)",
+        ),
+        (
+            'b',
+            "old.mp4",
+            "video/mp4",
+            "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector) VALUES (?, 1.0, 768, ?)",
+        ),
+    ];
+    for (byte, name, mime, vector_row) in legacy_rows {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO assets (id, hash, original_filename, storage_path, file_size, mime_type) \
+             VALUES (?, ?, ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(byte.to_string().repeat(64))
+        .bind(name)
+        .bind(format!("/lib/{name}"))
+        .bind(mime)
+        .execute(&pool)
+        .await
+        .expect("legacy asset");
+        sqlx::query(vector_row)
+            .bind(&id)
+            .bind(blob())
+            .execute(&pool)
+            .await
+            .expect("legacy vector");
+    }
+    pool.close().await;
+
+    let repo = AssetsRepo::new(eidetic_db::connect(&config).await.expect("migrate"));
+
+    let pinned = assert_stats_match_backlog(&repo, PINNED).await;
+    assert_eq!(pinned.embedded, 2, "stored vectors are still counted");
+    assert_eq!((pinned.pending_images, pinned.pending_videos), (1, 1));
+    assert_eq!(pinned.ready(), 0, "nothing ranks under the pinned id");
+
+    let legacy = assert_stats_match_backlog(&repo, LEGACY).await;
+    assert_eq!((legacy.pending_images, legacy.pending_videos), (0, 0));
+    assert_eq!(legacy.ready(), 2);
+}
+
+#[tokio::test]
+async fn stats_pending_follow_the_backlog_on_a_mixed_model_library() {
+    let (_tmp, config) = temp_db();
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = AssetsRepo::new(pool.clone());
+
+    let a = insert(&repo, media('a', "a.jpg", "image/jpeg")).await;
+    let b = insert(&repo, media('b', "b.jpg", "image/jpeg")).await;
+    insert(&repo, media('c', "c.jpg", "image/jpeg")).await;
+    let v1 = insert(&repo, media('d', "v1.mp4", "video/mp4")).await;
+    let v2 = insert(&repo, media('e', "v2.mp4", "video/mp4")).await;
+    // Neither an image nor a video: never pending, never ready.
+    insert(
+        &repo,
+        NewAsset {
+            mime_type: None,
+            ..media('f', "f.bin", "unused")
+        },
+    )
+    .await;
+
+    repo.store_embedding(a, &unit_vector(), PINNED)
+        .await
+        .expect("a");
+    repo.store_embedding(b, &unit_vector(), LEGACY)
+        .await
+        .expect("b");
+    repo.store_frame_embeddings(v1, &[frame(1.0)], PINNED)
+        .await
+        .expect("v1");
+    repo.store_frame_embeddings(v2, &[frame(1.0)], PINNED)
+        .await
+        .expect("v2");
+    // A leftover legacy frame beside the pinned ones; storing frames
+    // replaces all of a video's rows, so it goes in directly.
+    sqlx::query(
+        "INSERT INTO frame_embeddings (asset_id, ts_secs, dim, vector, model_id) \
+         VALUES (?, 2.0, 768, ?, ?)",
+    )
+    .bind(v2.as_uuid().to_string())
+    .bind(blob())
+    .bind(LEGACY)
+    .execute(&pool)
+    .await
+    .expect("legacy frame");
+
+    let pinned = assert_stats_match_backlog(&repo, PINNED).await;
+    assert_eq!(pinned.total, 6);
+    assert_eq!(pinned.embedded, 4);
+    assert_eq!((pinned.pending_images, pinned.pending_videos), (2, 0));
+    assert_eq!(pinned.ready(), 3);
+
+    let legacy = assert_stats_match_backlog(&repo, LEGACY).await;
+    assert_eq!(legacy.embedded, 4);
+    assert_eq!((legacy.pending_images, legacy.pending_videos), (2, 1));
+    assert_eq!(legacy.ready(), 2);
+}
+
+#[tokio::test]
+async fn stats_pending_shrink_as_a_library_is_re_embedded() {
+    let (_tmp, config) = temp_db();
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = AssetsRepo::new(pool);
+
+    let photo = insert(&repo, media('a', "a.jpg", "image/jpeg")).await;
+    let video = insert(&repo, media('b', "b.mp4", "video/mp4")).await;
+    repo.store_embedding(photo, &unit_vector(), LEGACY)
+        .await
+        .expect("legacy photo");
+    repo.store_frame_embeddings(video, &[frame(1.0)], LEGACY)
+        .await
+        .expect("legacy video");
+
+    let s = assert_stats_match_backlog(&repo, PINNED).await;
+    assert_eq!(s.pending_images + s.pending_videos, 2);
+    assert_eq!(s.embedded, 2);
+    assert_stats_match_backlog(&repo, LEGACY).await;
+
+    repo.store_embedding(photo, &unit_vector(), PINNED)
+        .await
+        .expect("re-embed photo");
+    let s = assert_stats_match_backlog(&repo, PINNED).await;
+    assert_eq!((s.pending_images, s.pending_videos), (0, 1));
+    assert_eq!(s.embedded, 2, "re-embedding replaces, it does not add");
+    assert_stats_match_backlog(&repo, LEGACY).await;
+
+    repo.store_frame_embeddings(video, &[frame(1.0)], PINNED)
+        .await
+        .expect("re-embed video");
+    let s = assert_stats_match_backlog(&repo, PINNED).await;
+    assert_eq!((s.pending_images, s.pending_videos), (0, 0));
+    assert_eq!(s.ready(), 2);
+    let legacy = assert_stats_match_backlog(&repo, LEGACY).await;
+    assert_eq!(legacy.ready(), 0);
+}
+
+/// A row no model produced is pending under every model, in the backlog and
+/// in stats alike: search never ranks it.
+#[tokio::test]
+async fn embedding_without_a_model_id_is_pending_for_every_model() {
+    let (_tmp, config) = temp_db();
+    let pool = eidetic_db::connect(&config).await.expect("connect");
+    let repo = AssetsRepo::new(pool.clone());
+
+    let photo = insert(&repo, media('a', "a.jpg", "image/jpeg")).await;
+    repo.store_embedding(photo, &unit_vector(), PINNED)
+        .await
+        .expect("photo");
+    sqlx::query("UPDATE embeddings SET model_id = NULL")
+        .execute(&pool)
+        .await
+        .expect("clear model id");
+
+    for model in [PINNED, LEGACY] {
+        let backlog = repo.fetch_unembedded(model).await.expect("backlog");
+        assert_eq!(
+            backlog.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![photo],
+            "{model}"
+        );
+        let s = assert_stats_match_backlog(&repo, model).await;
+        assert_eq!((s.embedded, s.pending_images, s.ready()), (1, 1, 0));
+    }
 }

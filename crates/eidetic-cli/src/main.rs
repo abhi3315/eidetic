@@ -474,13 +474,30 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("failed to connect to database")?;
             let repo = eidetic_db::AssetsRepo::new(pool);
-            let s = repo.fetch_stats().await.context("failed to fetch stats")?;
+            // Read from EIDETIC_MODEL; stats never loads the model.
+            let (model_id, _dim) = eidetic_ml::active_model()
+                .context("failed to resolve the active embedding model")?;
+            let s = repo
+                .fetch_stats(model_id)
+                .await
+                .context("failed to fetch stats")?;
 
             println!("Assets     {:>8}", s.total);
             println!("  images   {:>8}", s.images);
             println!("  videos   {:>8}", s.videos);
-            println!("Embedded   {:>8}", s.embedded);
-            println!("Not yet    {:>8}", s.needs_embed);
+            println!(
+                "Stored     {:>8}   (assets with an embedding from any model)",
+                s.embedded
+            );
+            println!("Model      {model_id}");
+            println!("  ready    {:>8}", s.ready());
+            println!(
+                "  pending  {:>8} images, {} videos",
+                s.pending_images, s.pending_videos
+            );
+            if s.pending_images + s.pending_videos > 0 {
+                println!("           run `eidetic embed` to embed them for this model");
+            }
             println!("Thumbs pending {:>4}", s.thumbnails_pending);
             println!("Size       {:>8}", format_bytes(s.total_bytes as u64));
             if let Some(earliest) = s.earliest {

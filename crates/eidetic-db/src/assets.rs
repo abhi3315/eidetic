@@ -55,17 +55,50 @@ pub struct AssetsRepo {
     index: Box<dyn VectorIndex>,
 }
 
+/// Library totals, with embedding readiness measured against the model id
+/// passed to [`AssetsRepo::fetch_stats`].
 pub struct LibraryStats {
     pub total: i64,
     pub images: i64,
     pub videos: i64,
+    /// Assets with any stored embedding, whichever model produced it.
     pub embedded: i64,
-    pub needs_embed: i64,
+    /// Images `eidetic embed` would process for the model: exactly
+    /// [`AssetsRepo::fetch_unembedded`]'s backlog.
+    pub pending_images: i64,
+    /// Videos `eidetic embed` would process for the model: exactly
+    /// [`AssetsRepo::fetch_videos_unembedded`]'s backlog.
+    pub pending_videos: i64,
     pub thumbnails_pending: i64,
     pub total_bytes: i64,
     pub earliest: Option<DateTime<Utc>>,
     pub latest: Option<DateTime<Utc>>,
 }
+
+impl LibraryStats {
+    /// Assets search can rank under the model the stats were fetched for.
+    pub fn ready(&self) -> i64 {
+        (self.images - self.pending_images) + (self.videos - self.pending_videos)
+    }
+}
+
+/// The embed backlog for images, as a `FROM … WHERE …` tail over `assets a`.
+/// `fetch_unembedded` selects rows from it and `fetch_stats` counts it, so the
+/// two can never disagree. Exactly one placeholder: the model id.
+///
+/// `IS NOT` rather than `!=`: a row with a NULL `model_id` belongs to no
+/// model, so it is pending work, not a finished asset.
+const PENDING_IMAGES: &str = "FROM assets a \
+     LEFT JOIN embeddings e ON e.asset_id = a.id \
+     WHERE (e.asset_id IS NULL OR e.model_id IS NOT ?) AND a.mime_type LIKE 'image/%'";
+
+/// The embed backlog for videos: no sampled frame from the model. Read by
+/// `fetch_videos_unembedded` and `fetch_stats`, like [`PENDING_IMAGES`].
+/// Exactly one placeholder: the model id.
+const PENDING_VIDEOS: &str = "FROM assets a \
+     LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings WHERE model_id = ?) fe \
+            ON fe.asset_id = a.id \
+     WHERE fe.asset_id IS NULL AND a.mime_type LIKE 'video/%'";
 
 #[derive(Clone)]
 pub struct SearchResult {
@@ -294,20 +327,22 @@ impl AssetsRepo {
         Self { pool, index }
     }
 
-    pub async fn fetch_stats(&self) -> crate::Result<LibraryStats> {
+    /// Library totals plus readiness for `model_id`. All counts come from one
+    /// read snapshot, so they add up even while `eidetic embed` is writing.
+    pub async fn fetch_stats(&self, model_id: &str) -> crate::Result<LibraryStats> {
         #[derive(sqlx::FromRow)]
         struct StatsRow {
             total: i64,
             images: i64,
             videos: i64,
             embedded: i64,
-            needs_embed: i64,
             thumbnails_pending: i64,
             total_bytes: i64,
             earliest: Option<DateTime<Utc>>,
             latest: Option<DateTime<Utc>>,
         }
 
+        let mut tx = self.pool.begin().await.map_err(crate::Error::Query)?;
         let row: StatsRow = sqlx::query_as(
             "SELECT \
                COUNT(*)                                                     AS total, \
@@ -315,10 +350,6 @@ impl AssetsRepo {
                COUNT(*) FILTER (WHERE a.mime_type LIKE 'video/%')           AS videos, \
                COUNT(*) FILTER (WHERE e.asset_id IS NOT NULL \
                                    OR fe.asset_id IS NOT NULL)              AS embedded, \
-               COUNT(*) FILTER (WHERE e.asset_id IS NULL \
-                                  AND a.mime_type LIKE 'image/%' \
-                                   OR fe.asset_id IS NULL \
-                                  AND a.mime_type LIKE 'video/%')           AS needs_embed, \
                COUNT(*) FILTER (WHERE a.thumbnails_generated = 0 \
                                   AND (a.mime_type LIKE 'image/%' \
                                        OR a.mime_type LIKE 'video/%'))      AS thumbnails_pending, \
@@ -330,16 +361,32 @@ impl AssetsRepo {
              LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings) fe \
                     ON fe.asset_id = a.id",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(crate::Error::Query)?;
+        let (pending_images,): (i64,) =
+            // Only the PENDING_* constants are interpolated; the model id is bound.
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {PENDING_IMAGES}")))
+                .bind(model_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(crate::Error::Query)?;
+        let (pending_videos,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) {PENDING_VIDEOS}"
+        )))
+        .bind(model_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(crate::Error::Query)?;
+        tx.commit().await.map_err(crate::Error::Query)?;
 
         Ok(LibraryStats {
             total: row.total,
             images: row.images,
             videos: row.videos,
             embedded: row.embedded,
-            needs_embed: row.needs_embed,
+            pending_images,
+            pending_videos,
             thumbnails_pending: row.thumbnails_pending,
             total_bytes: row.total_bytes,
             earliest: row.earliest,
@@ -353,16 +400,12 @@ impl AssetsRepo {
     /// on existence is what let an `EIDETIC_MODEL` change look like an empty
     /// queue while search silently skipped the whole library.
     pub async fn fetch_unembedded(&self, model_id: &str) -> crate::Result<Vec<(AssetId, PathBuf)>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT a.id, a.storage_path FROM assets a \
-             LEFT JOIN embeddings e ON e.asset_id = a.id \
-             WHERE (e.asset_id IS NULL OR e.model_id != ?) AND a.mime_type LIKE 'image/%' \
-             ORDER BY a.id",
-        )
-        .bind(model_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
+        let sql = format!("SELECT a.id, a.storage_path {PENDING_IMAGES} ORDER BY a.id");
+        let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(model_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
 
         Ok(rows
             .into_iter()
@@ -381,17 +424,13 @@ impl AssetsRepo {
         &self,
         model_id: &str,
     ) -> crate::Result<Vec<(AssetId, PathBuf, Option<f64>)>> {
-        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(
-            "SELECT a.id, a.storage_path, a.duration_secs FROM assets a \
-             LEFT JOIN (SELECT DISTINCT asset_id FROM frame_embeddings WHERE model_id = ?) fe \
-                    ON fe.asset_id = a.id \
-             WHERE fe.asset_id IS NULL AND a.mime_type LIKE 'video/%' \
-             ORDER BY a.id",
-        )
-        .bind(model_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::Error::Query)?;
+        let sql =
+            format!("SELECT a.id, a.storage_path, a.duration_secs {PENDING_VIDEOS} ORDER BY a.id");
+        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(model_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::Error::Query)?;
 
         Ok(rows
             .into_iter()
