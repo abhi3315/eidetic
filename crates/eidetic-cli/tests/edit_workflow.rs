@@ -778,7 +778,8 @@ fn library(home: &Path) -> PathBuf {
     lib
 }
 
-/// A stand-in for ffmpeg and ffprobe, and the marker any run of it leaves.
+/// A stand-in for ffmpeg and ffprobe, and the marker any run of it leaves:
+/// every run appends its arguments to it, one per line.
 #[cfg(unix)]
 fn fake_ffmpeg(home: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
@@ -786,7 +787,10 @@ fn fake_ffmpeg(home: &Path) -> (PathBuf, PathBuf) {
     let fake = home.join("fake-ffmpeg.sh");
     std::fs::write(
         &fake,
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 1\n",
+            marker.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1187,8 +1191,11 @@ fn preview_sheet_refuses_sources_outside_the_library() {
     long.push(photo(&secret, 1.0));
     refuse(&mut mcp, &long, "slot 30's source is outside the library");
 
-    // The marker is live: an all-library project does reach ffmpeg.
-    let project = write_project(dir, (320, 180), "auto", &[photo(&ok, 1.0)]);
+    // The marker is live: an all-library project does reach ffmpeg, which
+    // opens the resolved file, not the link the project names.
+    let alias = lib.join("alias.png");
+    symlink(&ok, &alias).unwrap();
+    let project = write_project(dir, (320, 180), "auto", &[photo(&alias, 1.0)]);
     let err = mcp
         .call(
             "preview_sheet",
@@ -1196,7 +1203,11 @@ fn preview_sheet_refuses_sources_outside_the_library() {
         )
         .unwrap_err();
     assert!(err.contains("ffmpeg could not decode slot 1"), "{err}");
-    assert!(marker.exists(), "the fake ffmpeg never ran");
+    let args = std::fs::read_to_string(&marker).expect("the fake ffmpeg never ran");
+    let args: Vec<&str> = args.lines().collect();
+    let input = args.iter().position(|a| *a == "-i").map(|i| args[i + 1]);
+    let real = std::fs::canonicalize(&ok).unwrap();
+    assert_eq!(input, Some(real.to_str().unwrap()), "{args:?}");
 }
 
 #[cfg(unix)]

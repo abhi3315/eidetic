@@ -1,7 +1,7 @@
 # ADR-0012: Agent pairing = stdio MCP server, metadata-only tools
 
 Date: 2026-09-01
-Status: accepted
+Status: accepted; amended 2026-11-26 (see Amendment: `preview_sheet`)
 
 ## Context
 
@@ -36,6 +36,14 @@ The design question is how eidetic exposes itself: what protocol, what process m
 - **Own agent loop over a raw LLM API** — rejected in goals-v0.8.md: loses the entire MCP client ecosystem for free.
 - **HTTP/SSE transport** — nothing needs a network hop; stdio is simpler, spawn-scoped, and what every target client speaks natively.
 - **Tools returning thumbnails/frames** (so the agent could "see") — rejected permanently; the human judges pixels via preview renders, the agent judges metadata. That division is the product design, not a limitation.
+
+## Amendment: `preview_sheet` (2026-11-26)
+
+goals-v0.9.md phase 1 makes one exception to "metadata only": `preview_sheet`, which returns a JPEG contact sheet of a reel project to the model so a shell-less vision client can judge the cut.
+
+- **Off by default.** The tool is listed and callable only when the operator starts the server with `eidetic mcp --allow-previews`; without the flag a call is refused before any file is read. The metadata-only rule above stays the default, and the rejected alternative above still holds for every other tool. A default-on version was rejected for the reason the hard rule exists.
+- **Library only.** Every slot source must resolve (symlinks and `..` followed) to a regular file inside the library directory, or the whole project is refused before ffmpeg runs. Projects `create_reel` plans against the current library pass.
+- **Accepted limit.** The rule bounds the paths a project names, not where a library file came from: `render` and `export_otio` read any source a project names, so `render` can write an `.mp4` cut from outside files into the library directory, and `preview_sheet` then accepts it. Output ownership for loaded projects is tracked in #46.
 
 ## References
 

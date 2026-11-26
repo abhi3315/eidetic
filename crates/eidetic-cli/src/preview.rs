@@ -42,10 +42,12 @@ const MAX_SOURCE_PIXELS: u64 = 50_000_000;
 /// downstream is larger. Anything that asks for more fails instead of
 /// taking the machine's memory.
 const MAX_ALLOC_BYTES: u64 = 256 << 20;
-/// One ffmpeg frame grab. Seeking into a local file takes well under a
-/// second; this only catches a wedged decoder or a stalled disk.
+/// One ffmpeg frame grab, and separately the check that resolves every
+/// slot's source before any grab. Seeking into a local file takes well
+/// under a second; this only catches a wedged decoder or a stalled disk.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
-/// The whole sheet, so a project of slow slots cannot hold the server.
+/// Every frame grab of the sheet, so a project of slow slots cannot hold
+/// the server. The source check runs before it, outside this budget.
 const SHEET_TIMEOUT: Duration = Duration::from_secs(90);
 const JPEG_QUALITY: u8 = 80;
 
@@ -135,11 +137,16 @@ fn library_sources(slots: &[Slot], library_dir: &Path) -> Result<Vec<PathBuf>> {
         .enumerate()
         .map(|(i, slot)| {
             let n = i + 1;
-            let Ok(real) = std::fs::canonicalize(&slot.source) else {
-                bail!(
+            let real = match std::fs::canonicalize(&slot.source) {
+                Ok(real) => real,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
                     "slot {n}'s source is missing: {} — swap or drop the slot",
                     slot.source.display()
-                );
+                ),
+                Err(e) => bail!(
+                    "slot {n}'s source cannot be resolved ({e}): {}",
+                    slot.source.display()
+                ),
             };
             ensure!(
                 real.starts_with(&root),
@@ -611,6 +618,9 @@ mod tests {
         refused(lib.join("album"), "not a regular file");
         refused(lib.join("gone.png"), "is missing");
         refused(outside.join("gone.png"), "is missing");
+        // Any failure other than "not found" is not reported as missing.
+        #[cfg(unix)]
+        refused(ok.join("x.png"), "cannot be resolved");
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
