@@ -430,13 +430,17 @@ impl EideticMcp {
                 use anyhow::Context;
                 let path = PathBuf::from(&p.project);
                 let mut proj = ReelProject::load_untrusted(&path).await?;
+                let loaded = serde_json::to_value(&proj).context("serialize the project")?;
                 // Checked before the ops (a swap can load the embedder) and
                 // again just before the save replaces the file.
                 let check = {
-                    let (path, lib, id) =
-                        (path.clone(), self.config.paths.library_dir.clone(), proj.id);
+                    let (path, lib) = (path.clone(), self.config.paths.library_dir.clone());
                     move || {
-                        project::check_destination(&path, &lib, project::Claim::ProjectFile { id })
+                        project::check_destination(
+                            &path,
+                            &lib,
+                            project::Claim::ProjectFile { loaded: &loaded },
+                        )
                     }
                 };
                 blocking(check.clone()).await?;
@@ -521,7 +525,7 @@ impl EideticMcp {
                 let path = PathBuf::from(&p.project);
                 let proj = ReelProject::load_untrusted(&path).await?;
                 let id = proj.require_id(&path, "export_otio")?;
-                let otio_path = proj.output.with_extension("otio");
+                let otio_path = otio::path_for(&proj.output);
                 let target = otio_path.clone();
                 let lib = self.config.paths.library_dir.clone();
                 // Checked before any ffprobe run, and again once the
@@ -740,22 +744,29 @@ impl EideticMcp {
         };
         // Claimed before planning, so a refusal costs no model load, and
         // again before saving, in case a path was taken meanwhile.
-        for output in spec.outputs() {
-            claim_new(&output, &self.config.paths.library_dir)?;
-        }
+        let lib = self.config.paths.library_dir.clone();
+        let outputs = spec.outputs();
+        blocking({
+            let lib = lib.clone();
+            move || outputs.iter().try_for_each(|o| claim_new(o, &lib))
+        })
+        .await?;
         let projects = project::plan_projects(&spec, &self.config).await?;
-        for proj in &projects {
-            // Every other tool refuses a project out of range; never save one.
-            proj.validate()?;
-            claim_new(&proj.output, &self.config.paths.library_dir)?;
-        }
-        let mut out = Vec::new();
-        for proj in &projects {
-            let path = ReelProject::path_for(&proj.output);
-            proj.save(&path)?;
-            out.push(cut_list_json(proj, &path));
-        }
-        Ok(json!({ "projects": out }))
+        blocking(move || {
+            for proj in &projects {
+                // Every other tool refuses a project out of range; never save one.
+                proj.validate()?;
+                claim_new(&proj.output, &lib)?;
+            }
+            let mut out = Vec::new();
+            for proj in &projects {
+                let path = ReelProject::path_for(&proj.output);
+                proj.save(&path)?;
+                out.push(cut_list_json(proj, &path));
+            }
+            Ok(json!({ "projects": out }))
+        })
+        .await
     }
 }
 
@@ -773,7 +784,7 @@ fn claim_new(output: &Path, library_dir: &Path) -> anyhow::Result<()> {
     for path in [
         output.to_path_buf(),
         project::preview_path(output),
-        output.with_extension("otio"),
+        otio::path_for(output),
     ] {
         project::check_destination(&path, library_dir, pick)?;
     }

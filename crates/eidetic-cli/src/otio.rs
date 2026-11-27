@@ -11,18 +11,35 @@
 //! are precisely the polish the user will do in the editor (Kdenlive
 //! 25.04+, Resolve 18.5+ both open this natively).
 
-use crate::project::ReelProject;
+use crate::project::{ProjectId, ReelProject};
 use crate::reel::{Slot, SlotKind};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Photos and audio have no intrinsic rate; the reel's own 30fps applies.
 const TIMELINE_FPS: f64 = 30.0;
 
 /// The timeline metadata key holding the id of the project it was exported
 /// from, which lets a later export prove the file is its own.
-pub const PROJECT_KEY: &str = "eidetic_project";
+const PROJECT_KEY: &str = "eidetic_project";
+
+/// An OTIO export big enough to need more is not one this pipeline wrote.
+const MAX_BYTES: u64 = 32 << 20;
+
+/// Where the export of a render at `output` goes: `reel.mp4` → `reel.otio`.
+pub fn path_for(output: &Path) -> PathBuf {
+    output.with_extension("otio")
+}
+
+/// Whether the file at `path` is an OTIO timeline whose metadata carries
+/// `id`. Anything unreadable or unparseable is not.
+pub(crate) fn carries(path: &Path, id: ProjectId) -> bool {
+    crate::project::read_bounded(path, MAX_BYTES, "OTIO timeline")
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|v| v["metadata"][PROJECT_KEY] == id.to_string().as_str())
+}
 
 /// Write `project` as a `.otio` file at `path`.
 pub fn export(project: &ReelProject, path: &Path) -> Result<()> {

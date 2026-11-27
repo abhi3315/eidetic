@@ -312,7 +312,7 @@ enum ReelAction {
 fn export_path(format: Option<&str>, output: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
     match format {
         None => Ok(None),
-        Some("otio") => Ok(Some(output.with_extension("otio"))),
+        Some("otio") => Ok(Some(otio::path_for(output))),
         Some(other) => anyhow::bail!("unknown --export format {other:?}; supported: otio"),
     }
 }

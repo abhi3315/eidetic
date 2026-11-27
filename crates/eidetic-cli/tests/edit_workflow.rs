@@ -1864,35 +1864,137 @@ fn edit_reel_never_saves_over_a_file_that_replaced_its_project() {
             transition_in: json!("cut"),
         }],
     );
-    let replacement = dir.join("someone-elses.json");
-    std::fs::write(&replacement, br#"{"not": "this project"}"#).unwrap();
-    // Retiming a video probes it, which is when the file gets replaced.
-    let fake = replacing_ffprobe(dir, &project, &replacement);
+    // Loaded without an id, so this edit also adopts it. Its replacement is
+    // either another id-less project or not a project at all.
+    let mut legacy = saved(&project);
+    legacy.as_object_mut().unwrap().remove("id");
+    let loaded = serde_json::to_vec_pretty(&legacy).unwrap();
+    let mut other = legacy.clone();
+    other["prompt"] = json!("someone else's reel");
+    let replacements = [
+        (
+            "other-project.json",
+            serde_json::to_vec_pretty(&other).unwrap(),
+        ),
+        ("not-a-project.json", br#"{"not": "this project"}"#.to_vec()),
+    ];
+    for (name, bytes) in replacements {
+        std::fs::write(&project, &loaded).unwrap();
+        let replacement = dir.join(name);
+        std::fs::write(&replacement, &bytes).unwrap();
+        // Retiming a video probes it, which is when the file gets replaced.
+        let fake = replacing_ffprobe(dir, &project, &replacement);
+        let mut mcp = Mcp::start_env(dir, &[], &[("EIDETIC_FFPROBE_PATH", fake.as_path())]);
+        let err = mcp
+            .call(
+                "edit_reel",
+                json!({"project": project.to_str().unwrap(),
+                       "ops": [{"op": "retime", "slot": 1, "secs": 0.8}]}),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("no longer the project this call loaded"),
+            "{name}: {err}"
+        );
+        assert!(err.contains("nothing was saved"), "{name}: {err}");
+        assert!(
+            err.contains(&project.display().to_string()),
+            "{name}: {err}"
+        );
+        assert_eq!(std::fs::read(&project).unwrap(), bytes, "{name}");
+        assert!(
+            !listing(dir)
+                .iter()
+                .any(|n| n.starts_with(".eidetic-project-")),
+            "{name}: {:?}",
+            listing(dir)
+        );
+    }
+}
+
+/// A stand-in ffmpeg that puts a foreign file at `victim` when it is not
+/// there yet, as if someone else created it mid-render, then runs the real
+/// ffmpeg.
+#[cfg(unix)]
+fn intruding_ffmpeg(home: &Path, victim: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = eidetic_ingest::video::ffmpeg().expect("the caller checked for ffmpeg");
+    let fake = home.join("intruding-ffmpeg.sh");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n[ -e '{v}' ] || printf 'someone else' > '{v}'\nexec '{}' \"$@\"\n",
+            real.display(),
+            v = victim.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+#[cfg(unix)]
+#[test]
+fn render_never_replaces_a_file_that_appeared_while_it_ran() {
+    if eidetic_ingest::video::ffmpeg().is_none() || eidetic_ingest::video::ffprobe().is_none() {
+        eprintln!("skipping: ffmpeg or ffprobe not installed");
+        return;
+    }
+    let home = scratch();
+    let dir = home.path();
+    let project = two_photo_project(dir);
+    for (preview, name) in [(false, "reel.mp4"), (true, "reel.preview.mp4")] {
+        let victim = dir.join(name);
+        let fake = intruding_ffmpeg(dir, &victim);
+        let mut mcp = Mcp::start_env(dir, &[], &[("EIDETIC_FFMPEG_PATH", fake.as_path())]);
+        let err = mcp
+            .call(
+                "render",
+                json!({"project": project.to_str().unwrap(), "preview": preview}),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("was not written by Eidetic for this project"),
+            "{name}: {err}"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"someone else", "{name}");
+        assert_eq!(write_litter(dir), Vec::<String>::new(), "{name}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn export_otio_never_replaces_a_file_that_appeared_while_it_probed() {
+    let home = scratch();
+    let dir = home.path();
+    let project = write_project(
+        dir,
+        (320, 180),
+        "auto",
+        &[SlotSpec {
+            source: dir.join("clip.mp4"),
+            kind: "video",
+            start: 0.0,
+            duration: 1.0,
+            transition_in: json!("cut"),
+        }],
+    );
+    let victim = dir.join("reel.otio");
+    let foreign = dir.join("foreign.otio");
+    std::fs::write(&foreign, b"someone else's timeline").unwrap();
+    // Building the timeline probes the video slot, which is when the file
+    // appears.
+    let fake = replacing_ffprobe(dir, &victim, &foreign);
     let mut mcp = Mcp::start_env(dir, &[], &[("EIDETIC_FFPROBE_PATH", fake.as_path())]);
     let err = mcp
-        .call(
-            "edit_reel",
-            json!({"project": project.to_str().unwrap(),
-                   "ops": [{"op": "retime", "slot": 1, "secs": 0.8}]}),
-        )
+        .call("export_otio", json!({"project": project.to_str().unwrap()}))
         .unwrap_err();
     assert!(
-        err.contains("no longer the project this call loaded"),
+        err.contains("was not written by Eidetic for this project"),
         "{err}"
     );
-    assert!(err.contains("nothing was saved"), "{err}");
-    assert!(err.contains(&project.display().to_string()), "{err}");
-    assert_eq!(
-        std::fs::read(&project).unwrap(),
-        std::fs::read(&replacement).unwrap()
-    );
-    assert!(
-        !listing(dir)
-            .iter()
-            .any(|n| n.starts_with(".eidetic-project-")),
-        "{:?}",
-        listing(dir)
-    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"someone else's timeline");
+    assert_eq!(write_litter(dir), Vec::<String>::new());
 }
 
 #[cfg(unix)]
@@ -2192,20 +2294,39 @@ fn legacy_outputs_are_reclaimed_by_adoption_and_a_cli_re_render() {
     assert_eq!(std::fs::read(&output).unwrap(), old_render);
 
     // The operator's CLI re-renders it as before, and marks it.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
-    cmd.args(["reel", "edit"]).arg(&project);
-    hermetic(&mut cmd, dir);
-    let cli = cmd.output().expect("run eidetic reel edit");
-    assert!(
-        cli.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cli.stderr)
-    );
+    let reel_edit = |extra: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
+        cmd.args(["reel", "edit"]).arg(&project).args(extra);
+        hermetic(&mut cmd, dir);
+        let cli = cmd.output().expect("run eidetic reel edit");
+        assert!(
+            cli.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+    };
+    reel_edit(&[]);
     assert_eq!(comment_tag(&output), format!("eidetic-project:{id}"));
 
     // From here on the agent re-renders it like any planned project.
     render(&mut mcp).unwrap();
     assert_eq!(comment_tag(&output), format!("eidetic-project:{id}"));
+
+    // An export from before exports were marked: refused, until the
+    // re-export the refusal names marks it as this project's.
+    let otio = dir.join("reel.otio");
+    let old_export = json!({"OTIO_SCHEMA": "Timeline.1", "metadata": {}}).to_string();
+    std::fs::write(&otio, &old_export).unwrap();
+    let export = |mcp: &mut Mcp| mcp.call("export_otio", json!({"project": arg}));
+    let err = export(&mut mcp).unwrap_err();
+    let remedy = format!("eidetic reel edit {arg} --export otio --dry-run");
+    assert!(err.contains(&remedy), "{err}");
+    assert_eq!(std::fs::read_to_string(&otio).unwrap(), old_export);
+    reel_edit(&["--export", "otio", "--dry-run"]);
+    let exported: Value = serde_json::from_slice(&std::fs::read(&otio).unwrap()).unwrap();
+    assert_eq!(exported["metadata"]["eidetic_project"], json!(id));
+    assert_eq!(saved(&project)["id"], json!(id));
+    export(&mut mcp).unwrap();
 }
 
 #[test]

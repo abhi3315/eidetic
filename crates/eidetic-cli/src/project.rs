@@ -416,13 +416,11 @@ pub(crate) enum Claim<'a> {
     /// The OTIO export of the project at `project`: an existing timeline
     /// must carry `id` in its metadata.
     Otio { id: ProjectId, project: &'a Path },
-    /// The project file, saved back where it was loaded: it must still be
-    /// the project (same id, or still none) that was loaded.
-    ProjectFile { id: Option<ProjectId> },
+    /// The project file, saved back where it was loaded: it must still hold
+    /// `loaded` (the project as the call read it, as a JSON value), so an
+    /// edit never saves over another project or over someone else's save.
+    ProjectFile { loaded: &'a serde_json::Value },
 }
-
-/// An OTIO export big enough to need more is not one this pipeline wrote.
-const MAX_OTIO_BYTES: u64 = 32 << 20;
 
 /// Whether an MCP tool may write `dest`. Refused, without following or
 /// touching anything:
@@ -553,7 +551,7 @@ pub(crate) fn check_destination(dest: &Path, library_dir: &Path, claim: Claim<'_
             }
         }
         Claim::Otio { id, project } => {
-            if !otio_carries(&dest, id) {
+            if !crate::otio::carries(&dest, id) {
                 return Err(not_ours(
                     id,
                     format!(
@@ -565,10 +563,11 @@ pub(crate) fn check_destination(dest: &Path, library_dir: &Path, claim: Claim<'_
                 ));
             }
         }
-        Claim::ProjectFile { id } => {
+        Claim::ProjectFile { loaded } => {
             let same = read_bounded(&dest, MAX_PROJECT_BYTES, "reel project file")
                 .and_then(|bytes| ReelProject::parse(&dest, &bytes))
-                .is_ok_and(|p| p.id == id);
+                .and_then(|p| serde_json::to_value(p).context("serialize the project"))
+                .is_ok_and(|p| p == *loaded);
             anyhow::ensure!(
                 same,
                 "{shown} is no longer the project this call loaded; nothing was saved. Call \
@@ -601,15 +600,6 @@ fn render_carries(path: &Path, id: ProjectId) -> Result<bool> {
         .output()
         .with_context(|| format!("failed to run ffprobe on {}", path.display()))?;
     Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == id.render_tag())
-}
-
-/// Whether the file at `path` is an OTIO timeline whose metadata carries
-/// `id`. Anything unreadable or unparseable is not.
-fn otio_carries(path: &Path, id: ProjectId) -> bool {
-    read_bounded(path, MAX_OTIO_BYTES, "OTIO timeline")
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|v| v["metadata"][crate::otio::PROJECT_KEY] == id.to_string().as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -3103,21 +3093,34 @@ mod tests {
         let (_guard, root) = real_tempdir();
         let lib = root.join("library");
         let path = root.join("reel.eidetic.json");
-        let p = project("x", &root.join("reel.mp4"));
-        p.save(&path).unwrap();
-        check_destination(&path, &lib, Claim::ProjectFile { id: p.id }).unwrap();
-        let err = refusal(
-            &path,
-            &lib,
-            Claim::ProjectFile {
-                id: Some(ProjectId::generate()),
-            },
-        );
-        assert!(
-            err.contains("no longer the project this call loaded"),
-            "{err}"
-        );
-        let err = refusal(&path, &lib, Claim::ProjectFile { id: None });
+        let save = |p: &ReelProject| p.save(&path).unwrap();
+        let load = || serde_json::to_value(ReelProject::load_bounded(&path).unwrap()).unwrap();
+        let output = root.join("reel.mp4");
+
+        let mut p = project("x", &output);
+        let mut legacy = project("old", &output);
+        legacy.id = None;
+        let mut other_legacy = project("someone else's", &output);
+        other_legacy.id = None;
+        for (loaded, replacement) in [(&p, &project("y", &output)), (&legacy, &other_legacy)] {
+            save(loaded);
+            let as_loaded = load();
+            let claim = Claim::ProjectFile { loaded: &as_loaded };
+            check_destination(&path, &lib, claim).unwrap();
+            save(replacement);
+            let err = refusal(&path, &lib, claim);
+            assert!(
+                err.contains("no longer the project this call loaded"),
+                "{err}"
+            );
+        }
+
+        // The same project, saved meanwhile by someone else.
+        save(&p);
+        let as_loaded = load();
+        p.prompt = "edited elsewhere".into();
+        save(&p);
+        let err = refusal(&path, &lib, Claim::ProjectFile { loaded: &as_loaded });
         assert!(err.contains("no longer the project"), "{err}");
     }
 }
