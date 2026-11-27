@@ -20,8 +20,24 @@ use std::path::Path;
 /// Photos and audio have no intrinsic rate; the reel's own 30fps applies.
 const TIMELINE_FPS: f64 = 30.0;
 
+/// The timeline metadata key holding the id of the project it was exported
+/// from, which lets a later export prove the file is its own.
+pub const PROJECT_KEY: &str = "eidetic_project";
+
 /// Write `project` as a `.otio` file at `path`.
 pub fn export(project: &ReelProject, path: &Path) -> Result<()> {
+    write(path, &timeline(project)?)
+}
+
+/// Replace `path` with an exported timeline, atomically: a failed write
+/// leaves any earlier file whole, and a link at `path` is replaced, not
+/// written through.
+pub fn write(path: &Path, timeline: &[u8]) -> Result<()> {
+    crate::project::write_atomically(path, timeline, ".eidetic-otio-", "OTIO timeline", true)
+}
+
+/// `project` as OTIO JSON. Probes every video slot with ffprobe.
+pub fn timeline(project: &ReelProject) -> Result<Vec<u8>> {
     let clips: Vec<Value> = project.slots.iter().map(clip).collect();
     let mut tracks = vec![track("Video", "V1", clips)];
     if let Some(audio) = &project.audio {
@@ -41,9 +57,13 @@ pub fn export(project: &ReelProject, path: &Path) -> Result<()> {
         tracks.push(track("Audio", "A1", vec![music]));
     }
 
+    let mut metadata = json!({ "generator": concat!("eidetic ", env!("CARGO_PKG_VERSION")) });
+    if let Some(id) = project.id {
+        metadata[PROJECT_KEY] = json!(id);
+    }
     let timeline = json!({
         "OTIO_SCHEMA": "Timeline.1",
-        "metadata": { "generator": concat!("eidetic ", env!("CARGO_PKG_VERSION")) },
+        "metadata": metadata,
         "name": project.prompt,
         "global_start_time": null,
         "tracks": {
@@ -58,9 +78,7 @@ pub fn export(project: &ReelProject, path: &Path) -> Result<()> {
         },
     });
 
-    let bytes = serde_json::to_vec_pretty(&timeline).context("serialize OTIO timeline")?;
-    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    serde_json::to_vec_pretty(&timeline).context("serialize OTIO timeline")
 }
 
 fn clip(slot: &Slot) -> Value {
@@ -238,5 +256,58 @@ mod tests {
             music["media_references"]["DEFAULT_MEDIA"]["target_url"],
             "file:///music/my%20track.m4a"
         );
+    }
+
+    #[test]
+    fn the_timeline_names_its_project() {
+        let p = project();
+        let v: Value = serde_json::from_slice(&timeline(&p).unwrap()).unwrap();
+        assert_eq!(v["metadata"][PROJECT_KEY], json!(p.id.unwrap().to_string()));
+        assert!(v["metadata"]["generator"].is_string());
+
+        let legacy = ReelProject {
+            id: None,
+            ..project()
+        };
+        let v: Value = serde_json::from_slice(&timeline(&legacy).unwrap()).unwrap();
+        assert!(v["metadata"].get(PROJECT_KEY).is_none(), "{v}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_replaces_links_and_files_like_a_plain_write_would_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let path = dir.path().join("reel.otio");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        export(&project(), &path).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
+
+        // Same mode as a file std::fs::write creates under this umask.
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), mode(&plain));
+    }
+
+    /// A directory at the destination makes the final rename fail after the
+    /// temp file was fully written: nothing is left beside it.
+    #[test]
+    fn a_failed_export_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("reel.otio");
+        std::fs::create_dir(&blocked).unwrap();
+        let err = export(&project(), &blocked).unwrap_err();
+        assert!(format!("{err:#}").contains("reel.otio"), "{err:#}");
+        assert!(blocked.is_dir());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("reel.otio")]);
     }
 }

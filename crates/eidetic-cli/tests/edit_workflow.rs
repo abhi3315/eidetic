@@ -13,6 +13,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+/// A per-test home under the resolved temp dir. MCP tools refuse to write
+/// below a symbolic link, which the temp root itself is on some hosts
+/// (macOS's /var), so every test works in real directories.
+fn scratch() -> tempfile::TempDir {
+    let root = std::fs::canonicalize(std::env::temp_dir()).expect("the temp dir resolves");
+    tempfile::tempdir_in(root).expect("create a test home")
+}
+
 /// Point every path the binary could touch into `home` — its temp dir
 /// included, so tests can see what it leaves behind.
 fn hermetic(cmd: &mut Command, home: &Path) {
@@ -144,7 +152,7 @@ fn photo(source: &Path, duration: f64) -> SlotSpec {
 }
 
 /// Write a project file by hand — what `reel` / `create_reel` would have
-/// planned — and return its path.
+/// planned, project id included — and return its path.
 fn write_project(dir: &Path, (w, h): (u32, u32), frame: &str, slots: &[SlotSpec]) -> PathBuf {
     let slots: Vec<Value> = slots
         .iter()
@@ -164,6 +172,7 @@ fn write_project(dir: &Path, (w, h): (u32, u32), frame: &str, slots: &[SlotSpec]
     let now = chrono::Utc::now();
     let project = json!({
         "version": 1,
+        "id": uuid::Uuid::new_v4().to_string(),
         "created": now,
         "modified": now,
         "prompt": "synthetic",
@@ -200,7 +209,7 @@ fn assets(slots: &Value) -> Vec<String> {
 
 #[test]
 fn edit_reel_descriptions_state_the_contract_the_tests_check() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let mut mcp = Mcp::start(home.path());
     let tools = mcp.request("tools/list", json!({}));
     let describe = |name: &str| -> String {
@@ -226,11 +235,20 @@ fn edit_reel_descriptions_state_the_contract_the_tests_check() {
         assert!(edit.contains(claim), "edit_reel description lost {claim:?}");
     }
     assert!(describe("render").contains("reel.mp4 → reel.preview.mp4"));
+    // Every tool that writes for a project states the write rule.
+    for tool in ["create_reel", "edit_reel", "render", "export_otio"] {
+        let d = describe(tool);
+        assert!(d.contains("symbolic link"), "{tool}: {d}");
+        assert!(d.contains("library directory"), "{tool}: {d}");
+    }
+    for tool in ["render", "export_otio"] {
+        assert!(describe(tool).contains("ops: [] adopts"), "{tool}");
+    }
 }
 
 #[test]
 fn edit_reel_applies_batches_against_the_original_numbering_and_persists() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let project = four_photos(dir);
     let a = assets(&saved(&project)["slots"]);
@@ -320,7 +338,7 @@ fn edit_reel_applies_batches_against_the_original_numbering_and_persists() {
 
 #[test]
 fn reel_edit_cli_shares_the_numbering_and_refuses_without_writing() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let project = four_photos(dir);
     let a = assets(&saved(&project)["slots"]);
@@ -352,7 +370,7 @@ fn reel_edit_cli_shares_the_numbering_and_refuses_without_writing() {
 
 #[test]
 fn reel_edit_cli_repairs_a_project_the_mcp_tools_refuse() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let project = four_photos(dir);
     let mut broken = saved(&project);
@@ -473,7 +491,7 @@ fn assert_no_model_touched(home: &Path) {
 
 #[test]
 fn stats_cli_reports_readiness_for_the_active_model_without_loading_it() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     seed_mixed_library(home.path());
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
@@ -509,7 +527,7 @@ fn stats_cli_reports_readiness_for_the_active_model_without_loading_it() {
 
 #[test]
 fn library_stats_reports_readiness_for_the_active_model_without_loading_it() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     seed_mixed_library(home.path());
 
     let mut mcp = Mcp::start(home.path());
@@ -560,7 +578,7 @@ fn previews_and_failed_renders_leave_the_full_render_alone() {
         eprintln!("skipping: ffmpeg not installed");
         return;
     }
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let clip = dir.join("clip.mp4");
     let still = dir.join("still.png");
@@ -685,7 +703,7 @@ fn listing(dir: &Path) -> Vec<String> {
 
 #[test]
 fn preview_sheet_is_hidden_and_refused_without_the_opt_in() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let project = four_photos(dir);
     let before = std::fs::read(&project).unwrap();
@@ -808,7 +826,7 @@ fn preview_sheet_shows_each_slot_as_the_render_frames_it() {
         eprintln!("skipping: ffmpeg not installed");
         return;
     }
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let arg = |p: &Path| p.to_str().unwrap().to_string();
     let lib = library(dir);
@@ -960,7 +978,7 @@ fn preview_sheet_pages_long_reels_and_explains_bad_media() {
         eprintln!("skipping: ffmpeg not installed");
         return;
     }
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let lib = library(dir);
     let still = lib.join("still.png");
@@ -1055,7 +1073,7 @@ fn preview_sheet_frames_extreme_aspects_within_its_memory_budget() {
         eprintln!("skipping: ffmpeg not installed");
         return;
     }
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let arg = |p: &Path| p.to_str().unwrap().to_string();
     let lib = library(dir);
@@ -1127,7 +1145,7 @@ fn preview_sheet_frames_extreme_aspects_within_its_memory_budget() {
 #[test]
 fn preview_sheet_refuses_sources_outside_the_library() {
     use std::os::unix::fs::symlink;
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let (fake, marker) = fake_ffmpeg(dir);
     let mut mcp = Mcp::start_env(
@@ -1218,7 +1236,7 @@ fn preview_sheet_shows_library_media_reached_through_a_symlink() {
         eprintln!("skipping: ffmpeg not installed");
         return;
     }
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let real = dir.join("real-library");
     let link = dir.join("library-link");
@@ -1300,7 +1318,7 @@ fn preview_sheet_shows_library_media_reached_through_a_symlink() {
 
 #[test]
 fn preview_sheet_refuses_project_paths_it_cannot_read_boundedly() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let mut mcp = Mcp::start_with(dir, &["--allow-previews"]);
     let mut refuse = |path: &Path, want: &str| {
@@ -1381,7 +1399,7 @@ fn write_sentinels(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 #[cfg(unix)]
 #[test]
 fn every_project_tool_refuses_unreadable_projects_without_writing() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path().join("work");
     std::fs::create_dir(&dir).unwrap();
     let sentinels = write_sentinels(&dir);
@@ -1437,7 +1455,7 @@ fn every_project_tool_refuses_unreadable_projects_without_writing() {
 #[cfg(unix)]
 #[test]
 fn every_project_tool_refuses_out_of_range_projects_before_any_subprocess() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path().join("work");
     std::fs::create_dir(&dir).unwrap();
     let (fake, marker) = fake_ffmpeg(home.path());
@@ -1549,6 +1567,8 @@ fn every_project_tool_refuses_out_of_range_projects_before_any_subprocess() {
     assert!(!marker.exists());
 
     // The marker is live: a valid project's export does probe its video.
+    // The sentinel is no export of this project, so it would be refused.
+    std::fs::remove_file(dir.join("reel.otio")).unwrap();
     let (path, _) = valid();
     mcp.call("export_otio", json!({"project": path.to_str().unwrap()}))
         .unwrap();
@@ -1557,7 +1577,7 @@ fn every_project_tool_refuses_out_of_range_projects_before_any_subprocess() {
 
 #[test]
 fn legacy_projects_still_load_and_edit_through_mcp() {
-    let home = tempfile::tempdir().unwrap();
+    let home = scratch();
     let dir = home.path();
     let (p0, p1) = (dir.join("p0.png"), dir.join("p1.png"));
     let track = dir.join("track.wav");
@@ -1586,6 +1606,19 @@ fn legacy_projects_still_load_and_edit_through_mcp() {
     let arg = project.to_str().unwrap();
     let mut mcp = Mcp::start(dir);
 
+    // No id yet: writing tools say how to adopt it, and write nothing.
+    let before = listing(dir);
+    for (tool, args) in [
+        ("render", json!({"project": arg, "preview": true})),
+        ("export_otio", json!({"project": arg})),
+    ] {
+        let err = mcp.call(tool, args).unwrap_err();
+        assert!(err.contains("has no project id"), "{tool}: {err}");
+        assert!(err.contains(r#""ops":[]"#), "{tool}: {err}");
+        assert!(err.contains(&format!("call {tool} again")), "{tool}: {err}");
+        assert_eq!(listing(dir), before, "{tool} wrote");
+    }
+
     let ops = json!([
         {"op": "pin", "slot": 1},
         {"op": "transition", "slot": 2, "style": "crossfade:0.4"},
@@ -1594,7 +1627,9 @@ fn legacy_projects_still_load_and_edit_through_mcp() {
         .call("edit_reel", json!({"project": arg, "ops": ops}))
         .unwrap();
     assert_eq!(out["slots"][0]["pinned"], json!(true));
+    assert_eq!(out["adopted"], json!(true));
     let disk = saved(&project);
+    assert!(disk["id"].is_string(), "edit_reel adopted it: {disk}");
     assert_eq!(disk["slots"][0]["pinned"], json!(true));
     assert_eq!(
         disk["slots"][1]["transition_in"]["crossfade"]["secs"],
@@ -1633,4 +1668,568 @@ fn legacy_projects_still_load_and_edit_through_mcp() {
         .unwrap();
     assert_eq!(out["output"], json!(dir.join("reel.preview.mp4")));
     assert_eq!(size_of(&dir.join("reel.preview.mp4")), (160, 90));
+}
+
+// ---------------------------------------------------------------------------
+// Output ownership: what MCP tools may replace
+// ---------------------------------------------------------------------------
+
+/// The three writes a loaded project asks for, by the path each targets.
+fn write_calls(project: &Path) -> Vec<(&'static str, Value, &'static str)> {
+    let p = project.to_str().unwrap();
+    vec![
+        (
+            "render",
+            json!({"project": p, "preview": false}),
+            "reel.mp4",
+        ),
+        (
+            "render",
+            json!({"project": p, "preview": true}),
+            "reel.preview.mp4",
+        ),
+        ("export_otio", json!({"project": p}), "reel.otio"),
+    ]
+}
+
+/// Staging leftovers of a render or an export.
+fn write_litter(dir: &Path) -> Vec<String> {
+    listing(dir)
+        .into_iter()
+        .filter(|n| n.starts_with(".eidetic-render-") || n.starts_with(".eidetic-otio-"))
+        .collect()
+}
+
+/// The comment tag of a video, as ffprobe reads it.
+fn comment_tag(video: &Path) -> String {
+    let ffprobe = eidetic_ingest::video::ffprobe().expect("ffprobe ships with ffmpeg");
+    let out = Command::new(ffprobe)
+        .args(["-v", "error", "-show_entries", "format_tags=comment"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(video)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Two synthetic stills and a project cutting them, output `dir/reel.mp4`.
+fn two_photo_project(dir: &Path) -> PathBuf {
+    let (p0, p1) = (dir.join("p0.png"), dir.join("p1.png"));
+    for (path, colour) in [(&p0, "red"), (&p1, "blue")] {
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c={colour}:s=160x90"),
+            "-frames:v",
+            "1",
+            path.to_str().unwrap(),
+        ]);
+    }
+    write_project(dir, (160, 90), "auto", &[photo(&p0, 0.6), photo(&p1, 0.6)])
+}
+
+/// A short real mp4 at `path`, with `comment` as its tag when given.
+fn video_at(path: &Path, comment: Option<&str>) {
+    let tag = comment.map(|c| format!("comment={c}"));
+    let mut args = vec![
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=64x36:rate=30",
+        "-t",
+        "0.5",
+        "-pix_fmt",
+        "yuv420p",
+    ];
+    if let Some(tag) = &tag {
+        args.extend(["-metadata", tag.as_str()]);
+    }
+    args.push(path.to_str().unwrap());
+    ffmpeg(&args);
+}
+
+#[test]
+fn foreign_files_at_every_destination_are_refused_byte_identical() {
+    let home = scratch();
+    let dir = home.path();
+    let project = four_photos(dir);
+    let sentinels = write_sentinels(dir);
+    let mut mcp = Mcp::start(dir);
+
+    for (tool, args, name) in write_calls(&project) {
+        let err = mcp.call(tool, args.clone()).unwrap_err();
+        let dest = dir.join(name);
+        assert!(
+            err.contains(&dest.display().to_string()),
+            "{tool} {args}: {err}"
+        );
+        assert!(err.contains("nothing was written"), "{tool} {args}: {err}");
+        if eidetic_ingest::video::ffprobe().is_some() {
+            assert!(
+                err.contains("was not written by Eidetic for this project"),
+                "{tool} {args}: {err}"
+            );
+            assert!(err.contains("move or delete it"), "{tool} {args}: {err}");
+        }
+        for (path, bytes) in &sentinels {
+            assert_eq!(
+                &std::fs::read(path).unwrap(),
+                bytes,
+                "{tool} wrote {path:?}"
+            );
+        }
+        assert_eq!(write_litter(dir), Vec::<String>::new(), "{tool}");
+    }
+
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        eprintln!("skipping the real-media cases: ffmpeg not installed");
+        return;
+    }
+    // Real media that is not this project's: an untagged video, a video
+    // tagged for another project, an export of another project.
+    let other = uuid::Uuid::new_v4();
+    video_at(&dir.join("reel.mp4"), None);
+    video_at(
+        &dir.join("reel.preview.mp4"),
+        Some(&format!("eidetic-project:{other}")),
+    );
+    let mut foreign_otio =
+        json!({"OTIO_SCHEMA": "Timeline.1", "metadata": {"eidetic_project": other}});
+    std::fs::write(dir.join("reel.otio"), foreign_otio.to_string()).unwrap();
+    let before: Vec<Vec<u8>> = ["reel.mp4", "reel.preview.mp4", "reel.otio"]
+        .iter()
+        .map(|n| std::fs::read(dir.join(n)).unwrap())
+        .collect();
+    for (tool, args, _) in write_calls(&project) {
+        let err = mcp.call(tool, args.clone()).unwrap_err();
+        assert!(
+            err.contains("was not written by Eidetic for this project"),
+            "{tool} {args}: {err}"
+        );
+    }
+    for (name, bytes) in ["reel.mp4", "reel.preview.mp4", "reel.otio"]
+        .iter()
+        .zip(&before)
+    {
+        assert_eq!(
+            &std::fs::read(dir.join(name)).unwrap(),
+            bytes,
+            "{name} changed"
+        );
+    }
+    assert_eq!(write_litter(dir), Vec::<String>::new());
+    // The id alone, with no "metadata" around it, proves nothing either.
+    foreign_otio = json!({"eidetic_project": saved(&project)["id"]});
+    std::fs::write(dir.join("reel.otio"), foreign_otio.to_string()).unwrap();
+    let err = mcp
+        .call("export_otio", json!({"project": project.to_str().unwrap()}))
+        .unwrap_err();
+    assert!(err.contains("was not written by Eidetic"), "{err}");
+}
+
+/// A stand-in ffprobe that replaces `victim` with `replacement` when run,
+/// as if someone else rewrote the file mid-call, then fails.
+#[cfg(unix)]
+fn replacing_ffprobe(home: &Path, victim: &Path, replacement: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = home.join("replacing-ffprobe.sh");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ncp '{}' '{}'\nexit 1\n",
+            replacement.display(),
+            victim.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_reel_never_saves_over_a_file_that_replaced_its_project() {
+    let home = scratch();
+    let dir = home.path();
+    let project = write_project(
+        dir,
+        (320, 180),
+        "auto",
+        &[SlotSpec {
+            source: dir.join("clip.mp4"),
+            kind: "video",
+            start: 0.0,
+            duration: 1.0,
+            transition_in: json!("cut"),
+        }],
+    );
+    let replacement = dir.join("someone-elses.json");
+    std::fs::write(&replacement, br#"{"not": "this project"}"#).unwrap();
+    // Retiming a video probes it, which is when the file gets replaced.
+    let fake = replacing_ffprobe(dir, &project, &replacement);
+    let mut mcp = Mcp::start_env(dir, &[], &[("EIDETIC_FFPROBE_PATH", fake.as_path())]);
+    let err = mcp
+        .call(
+            "edit_reel",
+            json!({"project": project.to_str().unwrap(),
+                   "ops": [{"op": "retime", "slot": 1, "secs": 0.8}]}),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("no longer the project this call loaded"),
+        "{err}"
+    );
+    assert!(err.contains("nothing was saved"), "{err}");
+    assert!(err.contains(&project.display().to_string()), "{err}");
+    assert_eq!(
+        std::fs::read(&project).unwrap(),
+        std::fs::read(&replacement).unwrap()
+    );
+    assert!(
+        !listing(dir)
+            .iter()
+            .any(|n| n.starts_with(".eidetic-project-")),
+        "{:?}",
+        listing(dir)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_destinations_are_refused_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+    let home = scratch();
+    let work = home.path().join("work");
+    let victims = home.path().join("victims");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&victims).unwrap();
+    let project = four_photos(&work);
+    let mut mcp = Mcp::start(home.path());
+
+    // Each destination is a link: two to files that must not change, one
+    // dangling into a directory where nothing may appear.
+    for name in ["reel.mp4", "reel.preview.mp4"] {
+        let victim = victims.join(name);
+        std::fs::write(&victim, format!("victim {name}")).unwrap();
+        symlink(&victim, work.join(name)).unwrap();
+    }
+    symlink(victims.join("new.otio"), work.join("reel.otio")).unwrap();
+    let victims_before = listing(&victims);
+    let check_untouched = |what: &str| {
+        assert_eq!(listing(&victims), victims_before, "{what}");
+        for name in ["reel.mp4", "reel.preview.mp4"] {
+            assert_eq!(
+                std::fs::read(victims.join(name)).unwrap(),
+                format!("victim {name}").into_bytes(),
+                "{what}"
+            );
+        }
+    };
+    for (tool, args, name) in write_calls(&project) {
+        let err = mcp.call(tool, args.clone()).unwrap_err();
+        let link = work.join(name);
+        assert!(
+            err.contains(&format!("{} is a symbolic link", link.display())),
+            "{tool} {args}: {err}"
+        );
+        assert!(err.contains("nothing was written"), "{tool} {args}: {err}");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        check_untouched(tool);
+    }
+    assert_eq!(write_litter(&work), Vec::<String>::new());
+
+    // The output's directory is reached through a link.
+    let linked_dir = home.path().join("linked");
+    symlink(&victims, &linked_dir).unwrap();
+    let mut through = saved(&project);
+    through["output"] = json!(linked_dir.join("other.mp4"));
+    let through_path = work.join("through.eidetic.json");
+    std::fs::write(&through_path, through.to_string()).unwrap();
+    for (tool, args, _) in write_calls(&through_path) {
+        let err = mcp.call(tool, args.clone()).unwrap_err();
+        assert!(
+            err.contains(&format!("{} is a symbolic link", linked_dir.display())),
+            "{tool} {args}: {err}"
+        );
+        assert!(
+            err.contains(&format!("resolves to {}", victims.display())),
+            "{err}"
+        );
+        check_untouched(tool);
+    }
+
+    // The project file itself is a link: edit_reel will not save through it.
+    let real_project = victims.join("real.eidetic.json");
+    std::fs::copy(&project, &real_project).unwrap();
+    let link = work.join("link.eidetic.json");
+    symlink(&real_project, &link).unwrap();
+    let before = std::fs::read(&real_project).unwrap();
+    let err = mcp
+        .call(
+            "edit_reel",
+            json!({"project": link.to_str().unwrap(), "ops": [{"op": "pin", "slot": 1}]}),
+        )
+        .unwrap_err();
+    assert!(err.contains("is a symbolic link"), "{err}");
+    assert_eq!(std::fs::read(&real_project).unwrap(), before);
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+}
+
+#[test]
+fn nothing_is_written_into_the_library_directory() {
+    let home = scratch();
+    let dir = home.path();
+    let lib = library(dir);
+    let project = four_photos(dir);
+    let mut inside = saved(&project);
+    inside["output"] = json!(lib.join("reel.mp4"));
+    let inside_path = dir.join("inside.eidetic.json");
+    std::fs::write(&inside_path, inside.to_string()).unwrap();
+    // An export carrying this very project's id is still not replaced
+    // there: an imported file keeps its tag, so a tag proves nothing about
+    // a library file.
+    let owned_otio =
+        json!({"OTIO_SCHEMA": "Timeline.1", "metadata": {"eidetic_project": inside["id"]}});
+    std::fs::write(lib.join("reel.otio"), owned_otio.to_string()).unwrap();
+    let lib_before = listing(&lib);
+    let mut mcp = Mcp::start(dir);
+    for (tool, args, _) in write_calls(&inside_path) {
+        let err = mcp.call(tool, args.clone()).unwrap_err();
+        assert!(
+            err.contains("inside the library directory"),
+            "{tool} {args}: {err}"
+        );
+        assert!(err.contains("nothing was written"), "{tool} {args}: {err}");
+        assert_eq!(listing(&lib), lib_before, "{tool}");
+    }
+    assert_eq!(
+        std::fs::read(lib.join("reel.otio")).unwrap(),
+        owned_otio.to_string().into_bytes()
+    );
+
+    // A project file inside the library is not saved back either.
+    let lib_project = lib.join("reel.eidetic.json");
+    std::fs::copy(&project, &lib_project).unwrap();
+    let before = std::fs::read(&lib_project).unwrap();
+    let err = mcp
+        .call(
+            "edit_reel",
+            json!({"project": lib_project.to_str().unwrap(), "ops": [{"op": "pin", "slot": 1}]}),
+        )
+        .unwrap_err();
+    assert!(err.contains("inside the library directory"), "{err}");
+    assert_eq!(std::fs::read(&lib_project).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_library_is_recognised_through_a_symlinked_library_setting() {
+    let home = scratch();
+    let dir = home.path();
+    let real = dir.join("real-library");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.join("library-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let project = four_photos(dir);
+    let mut inside = saved(&project);
+    inside["output"] = json!(real.join("reel.mp4"));
+    std::fs::write(&project, inside.to_string()).unwrap();
+    let mut mcp = Mcp::start_env(dir, &[], &[("EIDETIC_LIBRARY_DIR", link.as_path())]);
+    for (tool, args, _) in write_calls(&project) {
+        let err = mcp.call(tool, args.clone()).unwrap_err();
+        assert!(
+            err.contains("inside the library directory"),
+            "{tool} {args}: {err}"
+        );
+        assert!(listing(&real).is_empty(), "{tool}");
+    }
+}
+
+#[test]
+fn create_reel_refuses_unwritable_outputs_before_planning() {
+    let home = scratch();
+    let dir = home.path();
+    let lib = library(dir);
+    std::fs::write(dir.join("taken.mp4"), b"someone's video").unwrap();
+    std::fs::write(dir.join("kept.eidetic.json"), b"{}").unwrap();
+    std::fs::write(dir.join("many.v2.mp4"), b"someone's video").unwrap();
+    let mut cases = vec![
+        (
+            lib.join("reel.mp4"),
+            None,
+            "inside the library directory".to_string(),
+        ),
+        (
+            dir.join("taken.mp4"),
+            None,
+            format!(
+                "{} already exists; pick a different output",
+                dir.join("taken.mp4").display()
+            ),
+        ),
+        (
+            dir.join("kept.mp4"),
+            None,
+            "kept.eidetic.json already exists; edit it with edit_reel".to_string(),
+        ),
+        (
+            dir.join("many.mp4"),
+            Some(2),
+            "many.v2.mp4 already exists".to_string(),
+        ),
+        (
+            dir.join("sub").join("..").join("up.mp4"),
+            None,
+            "contains `..`".to_string(),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        let linked = dir.join("linked");
+        std::os::unix::fs::symlink(dir.join("tmp"), &linked).unwrap();
+        cases.push((
+            linked.join("reel.mp4"),
+            None,
+            format!("{} is a symbolic link", linked.display()),
+        ));
+    }
+    let mut mcp = Mcp::start(dir);
+    let files_before = listing(dir);
+    for (output, variations, want) in cases {
+        let mut args = json!({"prompt": "anything", "output": output});
+        if let Some(n) = variations {
+            args["variations"] = json!(n);
+        }
+        let err = mcp.call("create_reel", args).unwrap_err();
+        assert!(err.contains(&want), "{output:?}: want {want:?}: {err}");
+        assert_eq!(listing(dir), files_before, "{output:?}");
+    }
+    assert!(listing(&lib).is_empty());
+    drop(mcp);
+    assert_no_model_touched(dir);
+}
+
+#[test]
+fn owned_outputs_rerender_and_reexport_repeatedly() {
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let home = scratch();
+    let dir = home.path();
+    let project = two_photo_project(dir);
+    let id = saved(&project)["id"].as_str().unwrap().to_string();
+    let tag = format!("eidetic-project:{id}");
+    let mut mcp = Mcp::start(dir);
+    let round = |mcp: &mut Mcp| {
+        for (tool, args, name) in write_calls(&project) {
+            mcp.call(tool, args.clone())
+                .unwrap_or_else(|e| panic!("{tool} {args}: {e}"));
+            assert!(dir.join(name).is_file(), "{name}");
+        }
+        assert_eq!(comment_tag(&dir.join("reel.mp4")), tag);
+        assert_eq!(comment_tag(&dir.join("reel.preview.mp4")), tag);
+        let otio: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reel.otio")).unwrap()).unwrap();
+        assert_eq!(otio["metadata"]["eidetic_project"], json!(id));
+        assert_eq!(write_litter(dir), Vec::<String>::new());
+    };
+    round(&mut mcp);
+    round(&mut mcp);
+    let out = mcp
+        .call(
+            "edit_reel",
+            json!({"project": project.to_str().unwrap(),
+                   "ops": [{"op": "retime", "slot": 1, "secs": 0.9}]}),
+        )
+        .unwrap();
+    assert!(out.get("adopted").is_none(), "{out}");
+    assert_eq!(saved(&project)["id"], json!(id), "an edit keeps the id");
+    round(&mut mcp);
+}
+
+#[test]
+fn legacy_outputs_are_reclaimed_by_adoption_and_a_cli_re_render() {
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let home = scratch();
+    let dir = home.path();
+    let project = two_photo_project(dir);
+    let arg = project.to_str().unwrap();
+    // As an earlier version left it: no id in the project, and an untagged
+    // render beside it.
+    let mut legacy = saved(&project);
+    legacy.as_object_mut().unwrap().remove("id");
+    std::fs::write(&project, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    let output = dir.join("reel.mp4");
+    video_at(&output, None);
+    let old_render = std::fs::read(&output).unwrap();
+    let mut mcp = Mcp::start(dir);
+    let render = |mcp: &mut Mcp| mcp.call("render", json!({"project": arg, "preview": false}));
+
+    let err = render(&mut mcp).unwrap_err();
+    assert!(err.contains("has no project id"), "{err}");
+    assert!(err.contains("edit_reel"), "{err}");
+
+    // Adoption: an empty batch records an id and changes nothing else.
+    let out = mcp
+        .call("edit_reel", json!({"project": arg, "ops": []}))
+        .unwrap();
+    assert_eq!(out["adopted"], json!(true));
+    let id = saved(&project)["id"].as_str().unwrap().to_string();
+    assert_eq!(assets(&saved(&project)["slots"]), assets(&legacy["slots"]));
+
+    // The old render still cannot be proved to be this project's.
+    let err = render(&mut mcp).unwrap_err();
+    assert!(
+        err.contains("was not written by Eidetic for this project"),
+        "{err}"
+    );
+    assert!(err.contains(&format!("eidetic reel edit {arg}")), "{err}");
+    assert_eq!(std::fs::read(&output).unwrap(), old_render);
+
+    // The operator's CLI re-renders it as before, and marks it.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
+    cmd.args(["reel", "edit"]).arg(&project);
+    hermetic(&mut cmd, dir);
+    let cli = cmd.output().expect("run eidetic reel edit");
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert_eq!(comment_tag(&output), format!("eidetic-project:{id}"));
+
+    // From here on the agent re-renders it like any planned project.
+    render(&mut mcp).unwrap();
+    assert_eq!(comment_tag(&output), format!("eidetic-project:{id}"));
+}
+
+#[test]
+fn reel_edit_cli_still_overwrites_its_own_untagged_output() {
+    if eidetic_ingest::video::ffmpeg().is_none() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let home = scratch();
+    let dir = home.path();
+    let project = two_photo_project(dir);
+    let output = dir.join("reel.mp4");
+    std::fs::write(&output, b"an earlier render").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_eidetic"));
+    cmd.args(["reel", "edit"])
+        .arg(&project)
+        .args(["--export", "otio"]);
+    hermetic(&mut cmd, dir);
+    let out = cmd.output().expect("run eidetic reel edit");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(size_of(&output), (160, 90));
+    assert!(dir.join("reel.otio").is_file());
 }

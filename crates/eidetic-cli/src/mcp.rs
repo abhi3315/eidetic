@@ -19,7 +19,7 @@
 //! stdout belongs to the protocol. Anything human-facing goes to stderr
 //! (tracing already does).
 
-use crate::project::{self, EditOp, ReelProject, ReelSpec};
+use crate::project::{self, EditOp, ProjectId, ReelProject, ReelSpec};
 use crate::{otio, preview, reel};
 use eidetic_core::Config;
 use eidetic_db::{AssetsRepo, FacesRepo, SearchFilters};
@@ -92,6 +92,16 @@ fn reply(r: anyhow::Result<Value>) -> Result<CallToolResult, ErrorData> {
             "{e:#}"
         ))])),
     }
+}
+
+/// Run filesystem or subprocess work off the async executor.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    use anyhow::Context;
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("worker thread panicked")?
 }
 
 fn round2(x: f64) -> f64 {
@@ -388,7 +398,8 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Plan a reel from a prompt: search, quality-gate, beat-sync (with audio), assign shots (high-energy spans prefer measured motion; near-duplicate scenes are held back). Writes a project file per plan and returns the cut list(s) — nothing is rendered yet; each slot carries motion, similar_to and geometry fields explained in the cut list's signals note. Iterate with edit_reel, then call render."
+        description = "Plan a reel from a prompt: search, quality-gate, beat-sync (with audio), assign shots (high-energy spans prefer measured motion; near-duplicate scenes are held back). Writes a project file per plan and returns the cut list(s) — nothing is rendered yet; each slot carries motion, similar_to and geometry fields explained in the cut list's signals note. Iterate with edit_reel, then call render. \
+            The output, its preview, its .otio and the project file must not exist yet, must not be reached through a symbolic link, and must lie outside the library directory; each project gets an id that its renders and exports carry, so later calls can replace those files and nothing else."
     )]
     async fn create_reel(
         &self,
@@ -406,7 +417,9 @@ impl EideticMcp {
             A transition belongs to its shot and moves with it on reorder; the shot that ends up first has no joint, so its transition is ignored. \
             To put a transition into a NEW position, use two calls: first {\"op\":\"reorder\",\"order\":[3,1,2]}, then, against the returned numbering, {\"op\":\"transition\",\"slot\":2,\"style\":\"crossfade:0.8\"} (the joint between the new 1st and 2nd shots). \
             All-or-nothing: an invalid op (bad slot number, pinned slot, bad reorder) changes nothing on disk. \
-            On success saves the project and returns the new cut list. Render separately."
+            On success saves the project and returns the new cut list. Render separately. \
+            The project file is saved back where it was loaded, never through a symbolic link or into the library directory. \
+            A project planned before Eidetic recorded project ids gets one on save (adopted: true); ops: [] adopts without changing the cut."
     )]
     async fn edit_reel(
         &self,
@@ -417,19 +430,41 @@ impl EideticMcp {
                 use anyhow::Context;
                 let path = PathBuf::from(&p.project);
                 let mut proj = ReelProject::load_untrusted(&path).await?;
+                // Checked before the ops (a swap can load the embedder) and
+                // again just before the save replaces the file.
+                let check = {
+                    let (path, lib, id) =
+                        (path.clone(), self.config.paths.library_dir.clone(), proj.id);
+                    move || {
+                        project::check_destination(&path, &lib, project::Claim::ProjectFile { id })
+                    }
+                };
+                blocking(check.clone()).await?;
                 project::apply_ops(&mut proj, &p.ops, &self.config).await?;
                 // An edit must not save what the next load would refuse.
                 proj.validate()
                     .context("the edit would leave the project out of range; nothing was saved")?;
-                proj.save(&path)?;
-                Ok(cut_list_json(&proj, &path))
+                let adopted = proj.id.is_none();
+                proj.id.get_or_insert_with(ProjectId::generate);
+                let mut out = cut_list_json(&proj, &path);
+                if adopted {
+                    out["adopted"] = json!(true);
+                }
+                blocking(move || {
+                    check()?;
+                    proj.save(&path)
+                })
+                .await?;
+                Ok(out)
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Render a reel project with ffmpeg (H.264 + the audio track) and return the path written. Full renders replace the project's output; preview=true renders half-resolution to a separate file whose extension is replaced by .preview.mp4 (output reel.mp4 → reel.preview.mp4), leaving the full-res output and the project file untouched. A failed render leaves any earlier file in place."
+        description = "Render a reel project with ffmpeg (H.264 + the audio track) and return the path written. Full renders replace the project's output; preview=true renders half-resolution to a separate file whose extension is replaced by .preview.mp4 (output reel.mp4 → reel.preview.mp4), leaving the full-res output and the project file untouched. A failed render leaves any earlier file in place. \
+            Replaces an existing file only if it is a render of this same project (renders carry the project id); never writes through a symbolic link or into the library directory. \
+            A project without an id is refused until edit_reel with ops: [] adopts it."
     )]
     async fn render(
         &self,
@@ -439,8 +474,27 @@ impl EideticMcp {
             async {
                 let path = PathBuf::from(&p.project);
                 let proj = ReelProject::load_untrusted(&path).await?;
+                let id = proj.require_id(&path, "render")?;
                 let preview = p.preview.unwrap_or(false);
-                let target = proj.render_target(preview);
+                let mut target = proj.render_target(preview);
+                // Checked before any ffmpeg run, and again just before the
+                // finished render replaces the destination.
+                let check = {
+                    let (dest, lib) = (target.path.clone(), self.config.paths.library_dir.clone());
+                    move || {
+                        project::check_destination(
+                            &dest,
+                            &lib,
+                            project::Claim::Render {
+                                id,
+                                project: &path,
+                                preview,
+                            },
+                        )
+                    }
+                };
+                blocking(check.clone()).await?;
+                target.before_publish = Some(std::sync::Arc::new(check));
                 project::render_project(&proj, &target).await?;
                 Ok(json!({
                     "output": target.path,
@@ -454,7 +508,9 @@ impl EideticMcp {
     }
 
     #[tool(
-        description = "Export a reel project as OpenTimelineIO (.otio) for hand-polish in Kdenlive 25.04+ or DaVinci Resolve 18.5+. Cuts only; transitions are re-added in the editor."
+        description = "Export a reel project as OpenTimelineIO (.otio) for hand-polish in Kdenlive 25.04+ or DaVinci Resolve 18.5+. Cuts only; transitions are re-added in the editor. \
+            Writes beside the output (reel.mp4 → reel.otio), replacing an existing file only if it is an export of this same project (exports carry the project id in their metadata); never writes through a symbolic link or into the library directory. \
+            A project without an id is refused until edit_reel with ops: [] adopts it."
     )]
     async fn export_otio(
         &self,
@@ -462,16 +518,28 @@ impl EideticMcp {
     ) -> Result<CallToolResult, ErrorData> {
         reply(
             async {
-                use anyhow::Context;
                 let path = PathBuf::from(&p.project);
                 let proj = ReelProject::load_untrusted(&path).await?;
+                let id = proj.require_id(&path, "export_otio")?;
                 let otio_path = proj.output.with_extension("otio");
                 let target = otio_path.clone();
-                // The export probes every video slot with ffprobe, which
-                // blocks, so it runs off the async executor.
-                tokio::task::spawn_blocking(move || otio::export(&proj, &target))
-                    .await
-                    .context("OTIO export thread panicked")??;
+                let lib = self.config.paths.library_dir.clone();
+                // Checked before any ffprobe run, and again once the
+                // timeline is built, just before it replaces the file.
+                blocking(move || {
+                    let check = || {
+                        project::check_destination(
+                            &target,
+                            &lib,
+                            project::Claim::Otio { id, project: &path },
+                        )
+                    };
+                    check()?;
+                    let timeline = otio::timeline(&proj)?;
+                    check()?;
+                    otio::write(&target, &timeline)
+                })
+                .await?;
                 Ok(json!({ "otio": otio_path }))
             }
             .await,
@@ -651,14 +719,13 @@ impl EideticMcp {
                 chrono::Utc::now().format("%Y%m%d-%H%M%S")
             )),
         };
-        // The output name is LLM-controlled and the render pipeline passes it
-        // to ffmpeg -y, so on this boundary it must not be able to name a
-        // file the user cares about. Requiring .mp4 stops it from *creating*
-        // meaningful non-video files (~/.bashrc), and refusing existing paths
-        // stops it from *destroying* anything: after create, the only path
-        // render ever overwrites is one this project brought into existence.
-        // The CLI keeps full freedom — the operator is trusted; the agent is
-        // not.
+        // The output name is LLM-controlled, so on this boundary it must not
+        // be able to name a file the user cares about. Requiring .mp4 stops
+        // it from *creating* meaningful non-video files (~/.bashrc), and
+        // claiming only free paths (see `claim_new`) stops it from
+        // *destroying* anything at plan time; later writes prove ownership
+        // through the project id. The CLI keeps full freedom — the operator
+        // is trusted; the agent is not.
         project::ensure_mp4(&output)?;
         let spec = ReelSpec {
             prompt: p.prompt,
@@ -671,37 +738,16 @@ impl EideticMcp {
             min_sharpness: reel::MIN_SHARPNESS,
             variations: p.variations.unwrap_or(1).clamp(1, 9),
         };
+        // Claimed before planning, so a refusal costs no model load, and
+        // again before saving, in case a path was taken meanwhile.
+        for output in spec.outputs() {
+            claim_new(&output, &self.config.paths.library_dir)?;
+        }
         let projects = project::plan_projects(&spec, &self.config).await?;
-        // Never clobber an existing project — it may hold edits. The agent
-        // should edit it, or pick another output name. The render target
-        // itself gets the same rule (see the boundary note above): a path
-        // that already exists belongs to someone, and it is not this reel.
         for proj in &projects {
             // Every other tool refuses a project out of range; never save one.
             proj.validate()?;
-            // Everything this project will ever write: the render target,
-            // its preview, and the .otio sibling export_otio derives from
-            // it. Claiming them now means every later overwrite hits a file
-            // this project created.
-            for claimed in [
-                proj.output.clone(),
-                proj.render_target(true).path,
-                proj.output.with_extension("otio"),
-            ] {
-                anyhow::ensure!(
-                    !claimed.exists(),
-                    "{} already exists; pick a different output (this \
-                     pipeline only overwrites files it created)",
-                    claimed.display()
-                );
-            }
-            let path = ReelProject::path_for(&proj.output);
-            anyhow::ensure!(
-                !path.exists(),
-                "{} already exists; edit it with edit_reel, or pass a \
-                 different output",
-                path.display()
-            );
+            claim_new(&proj.output, &self.config.paths.library_dir)?;
         }
         let mut out = Vec::new();
         for proj in &projects {
@@ -711,6 +757,33 @@ impl EideticMcp {
         }
         Ok(json!({ "projects": out }))
     }
+}
+
+/// Refuse to plan a reel at `output` unless every path its project will
+/// write is free: the render, its preview, the .otio export_otio derives
+/// from it, and the project file. Never clobber an existing project, which
+/// may hold edits, or any other file: a path that already exists belongs to
+/// someone, and it is not this reel.
+fn claim_new(output: &Path, library_dir: &Path) -> anyhow::Result<()> {
+    use project::Claim;
+    let pick = Claim::New {
+        remedy: "pick a different output (MCP tools only overwrite files they wrote for \
+                 the same project)",
+    };
+    for path in [
+        output.to_path_buf(),
+        project::preview_path(output),
+        output.with_extension("otio"),
+    ] {
+        project::check_destination(&path, library_dir, pick)?;
+    }
+    project::check_destination(
+        &ReelProject::path_for(output),
+        library_dir,
+        Claim::New {
+            remedy: "edit it with edit_reel, or pass a different output",
+        },
+    )
 }
 
 /// The compact cut-list shape every edit-loop tool returns.

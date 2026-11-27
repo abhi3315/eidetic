@@ -48,9 +48,46 @@ const MAX_REEL_SECS: f64 = 3600.0;
 const REPAIR_HINT: &str = "fix the project file by hand (`eidetic reel edit` can retime, \
     drop or re-transition its slots), or plan the reel again with create_reel";
 
+/// Identifies one reel project in everything the pipeline writes for it: the
+/// project file, the mp4 `comment` tag of its renders and the metadata of
+/// its OTIO export. MCP tools replace an existing file only when it carries
+/// the id of the project they were handed (see [`check_destination`]).
+///
+/// An identity, not a secret: anyone who can read a render can copy it.
+/// Lives here rather than beside the entity ids in `eidetic-core` because
+/// nothing outside the reel pipeline names a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(uuid::Uuid);
+
+/// What precedes the id in a render's `comment` tag.
+const RENDER_TAG_PREFIX: &str = "eidetic-project:";
+
+impl ProjectId {
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// The mp4 `comment` tag a render of this project carries.
+    pub fn render_tag(self) -> String {
+        format!("{RENDER_TAG_PREFIX}{self}")
+    }
+}
+
+impl std::fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReelProject {
     pub version: u32,
+    /// Missing from projects planned before outputs were tagged. The CLI
+    /// fills it in on load; MCP tools ask for an adoption first (see
+    /// [`require_id`](Self::require_id)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<ProjectId>,
     pub created: DateTime<Utc>,
     pub modified: DateTime<Utc>,
     /// The prompt the reel was generated from (context for follow-ups; a
@@ -83,11 +120,33 @@ impl ReelProject {
         reel::total_secs(&self.slots)
     }
 
-    /// Load a project from a path the operator chose (the CLI).
+    /// Load a project from a path the operator chose (the CLI). A project
+    /// without an id gets a fresh one, which the next save records and the
+    /// next render or export carries.
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read project file {}", path.display()))?;
-        Self::parse(path, &bytes)
+        let mut project = Self::parse(path, &bytes)?;
+        project.id.get_or_insert_with(ProjectId::generate);
+        Ok(project)
+    }
+
+    /// The project's id, or how to adopt a project that has none. `tool`
+    /// is the MCP tool that needs it, named in the refusal.
+    pub fn require_id(&self, project_path: &Path, tool: &str) -> Result<ProjectId> {
+        self.id.ok_or_else(|| {
+            let p = project_path.display();
+            let adopt = serde_json::json!({ "project": project_path, "ops": [] });
+            anyhow::anyhow!(
+                "{p} has no project id (it was planned before Eidetic tracked which files \
+                 it wrote); nothing was written. Adopt it by calling edit_reel with {adopt}, \
+                 then call {tool} again. Files an earlier version already rendered or \
+                 exported for it cannot be proved to be its own and stay protected: ask the \
+                 user to move them aside, or to re-render the full reel with \
+                 `eidetic reel edit {p}` (add `--export otio` for the .otio), which marks \
+                 them as this project's"
+            )
+        })
     }
 
     /// Load a project from a path nobody vetted (an MCP agent's): a regular
@@ -124,31 +183,7 @@ impl ReelProject {
     /// [`MAX_PROJECT_BYTES`], so a hostile or mistaken path costs a bounded
     /// allocation.
     fn load_bounded(path: &Path) -> Result<Self> {
-        use std::io::Read;
-        let not_a_file = || {
-            anyhow::anyhow!(
-                "{} is not a regular file; pass a reel project file",
-                path.display()
-            )
-        };
-        // Checked before opening: opening a FIFO for reading blocks until a
-        // writer appears. Re-checked on the handle in case the path was
-        // swapped in between.
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("failed to read project file {}", path.display()))?;
-        anyhow::ensure!(meta.is_file(), not_a_file());
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("failed to read project file {}", path.display()))?;
-        anyhow::ensure!(file.metadata()?.is_file(), not_a_file());
-        let mut bytes = Vec::new();
-        file.take(MAX_PROJECT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read project file {}", path.display()))?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= MAX_PROJECT_BYTES,
-            "{} is larger than {MAX_PROJECT_BYTES} bytes; that is not a reel project file",
-            path.display()
-        );
+        let bytes = read_bounded(path, MAX_PROJECT_BYTES, "reel project file")?;
         Self::parse(path, &bytes)
     }
 
@@ -223,25 +258,8 @@ impl ReelProject {
     /// The parent directory is not synced: this protects against interrupted
     /// writes, but does not guarantee persistence of the rename after power loss.
     pub fn save(&self, path: &Path) -> Result<()> {
-        use std::io::Write;
-
         let json = serde_json::to_vec_pretty(self).context("serialize project")?;
-        let dir = parent_dir(path);
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".eidetic-project-")
-            .suffix(".json.tmp")
-            .tempfile_in(dir)
-            .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
-        // NamedTempFile removes itself on drop, so every early return below
-        // leaves the destination alone and no litter in the directory.
-        tmp.write_all(&json)
-            .and_then(|()| tmp.flush())
-            .and_then(|()| tmp.as_file().sync_all())
-            .with_context(|| format!("failed to write project file {}", path.display()))?;
-        tmp.persist(path)
-            .map_err(|e| e.error)
-            .with_context(|| format!("failed to replace project file {}", path.display()))?;
-        Ok(())
+        write_atomically(path, &json, ".eidetic-project-", "project file", false)
     }
 
     /// A fresh project for a just-planned reel. Relative paths are made
@@ -258,6 +276,7 @@ impl ReelProject {
         let now = Utc::now();
         ReelProject {
             version: VERSION,
+            id: Some(ProjectId::generate()),
             created: now,
             modified: now,
             prompt,
@@ -306,6 +325,291 @@ pub(crate) fn parent_dir(path: &Path) -> &Path {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     }
+}
+
+/// Replace `path` with `bytes` through a complete, synced sibling temp file
+/// named `<prefix>…`, renamed into place: a failure before the rename leaves
+/// the old file intact and no temp file behind, and a link at `path` is
+/// replaced rather than written through. `what` names the file in errors.
+///
+/// The temp file is created owner-only; `shared` creates it with the
+/// permissions a plain write would give it (0666 less the umask) instead,
+/// for files other programs open.
+pub(crate) fn write_atomically(
+    path: &Path,
+    bytes: &[u8],
+    prefix: &str,
+    what: &str,
+    shared: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix).suffix(".tmp");
+    #[cfg(unix)]
+    if shared {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    #[cfg(not(unix))]
+    let _ = shared;
+    let mut tmp = builder
+        .tempfile_in(parent_dir(path))
+        .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
+    // NamedTempFile removes itself on drop, so every early return below
+    // leaves the destination alone and no litter in the directory.
+    tmp.write_all(bytes)
+        .and_then(|()| tmp.flush())
+        .and_then(|()| tmp.as_file().sync_all())
+        .with_context(|| format!("failed to write {what} {}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("failed to replace {what} {}", path.display()))?;
+    Ok(())
+}
+
+/// Read a regular file of at most `max` bytes. Anything else is refused
+/// before it is opened (a FIFO would block the read forever, a device would
+/// never end), so a hostile or mistaken path costs a bounded allocation.
+/// `what` names the expected file in errors.
+pub(crate) fn read_bounded(path: &Path, max: u64, what: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let not_a_file = || anyhow::anyhow!("{} is not a regular file; pass a {what}", path.display());
+    // Checked before opening: opening a FIFO for reading blocks until a
+    // writer appears. Re-checked on the handle in case the path was swapped
+    // in between.
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("failed to read {what} {}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), not_a_file());
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read {what} {}", path.display()))?;
+    anyhow::ensure!(file.metadata()?.is_file(), not_a_file());
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {what} {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= max,
+        "{} is larger than {max} bytes; that is not a {what}",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Output ownership at MCP write boundaries (ADR-0012, output ownership).
+// ---------------------------------------------------------------------------
+
+/// What a write may find at its destination and still go ahead.
+#[derive(Clone, Copy)]
+pub(crate) enum Claim<'a> {
+    /// create_reel's claims: nothing may exist there yet. `remedy` finishes
+    /// the refusal when something does.
+    New { remedy: &'a str },
+    /// A full render (`preview: false`) or preview of the project file at
+    /// `project`: an existing mp4 must carry `id` as its comment tag.
+    Render {
+        id: ProjectId,
+        project: &'a Path,
+        preview: bool,
+    },
+    /// The OTIO export of the project at `project`: an existing timeline
+    /// must carry `id` in its metadata.
+    Otio { id: ProjectId, project: &'a Path },
+    /// The project file, saved back where it was loaded: it must still be
+    /// the project (same id, or still none) that was loaded.
+    ProjectFile { id: Option<ProjectId> },
+}
+
+/// An OTIO export big enough to need more is not one this pipeline wrote.
+const MAX_OTIO_BYTES: u64 = 32 << 20;
+
+/// Whether an MCP tool may write `dest`. Refused, without following or
+/// touching anything:
+///
+/// - a path with a `..` component;
+/// - a destination that is a symbolic link, or under a directory that is
+///   one, or whose directory does not exist;
+/// - anything whose directory resolves inside `library_dir`: MCP tools
+///   never write into the library, even over a file they could prove;
+/// - an existing non-regular file, and an existing regular file `claim`
+///   does not prove is this project's.
+///
+/// Blocking (filesystem calls, and ffprobe for an existing render), so
+/// async callers run it on a blocking thread. Every refusal names the path
+/// and what the agent can do. This keeps a project's write manifest off
+/// unrelated files; it does not confine the server.
+pub(crate) fn check_destination(dest: &Path, library_dir: &Path, claim: Claim<'_>) -> Result<()> {
+    use std::io::ErrorKind::NotFound;
+    let dest = std::path::absolute(dest)
+        .with_context(|| format!("cannot resolve {}; nothing was written", dest.display()))?;
+    let shown = dest.display();
+    anyhow::ensure!(
+        !dest
+            .components()
+            .any(|c| c == std::path::Component::ParentDir),
+        "{shown} contains `..`; MCP tools write only to paths without it; nothing was \
+         written. Pass the path without `..`"
+    );
+    let parent = dest
+        .parent()
+        .with_context(|| format!("{shown} is not a file path; nothing was written"))?;
+
+    // The destination and every directory above it, nearest first, each
+    // inspected without following it.
+    let mut existing = None;
+    for (depth, at) in dest.ancestors().enumerate() {
+        match std::fs::symlink_metadata(at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let real = std::fs::canonicalize(&dest)
+                    .or_else(|_| std::fs::canonicalize(parent))
+                    .map(|p| format!(" (it resolves to {})", p.display()))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "{shown}: {} is a symbolic link{real}; MCP tools never write through \
+                     links, nothing was written. Use a path in a real directory, or ask the \
+                     user",
+                    at.display()
+                );
+            }
+            Ok(meta) if depth == 0 => existing = Some(meta),
+            Ok(_) => {}
+            Err(e) if e.kind() == NotFound && depth == 0 => {}
+            Err(e) if e.kind() == NotFound && depth == 1 => anyhow::bail!(
+                "{shown}: the directory {} does not exist; nothing was written. Use an \
+                 output in an existing directory",
+                at.display()
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot inspect {}; nothing was written to {shown}",
+                        at.display()
+                    )
+                });
+            }
+        }
+    }
+
+    // A library that does not exist yet cannot contain an existing parent.
+    match std::fs::canonicalize(library_dir) {
+        Ok(lib) => {
+            let real_parent = std::fs::canonicalize(parent).with_context(|| {
+                format!("cannot resolve {}; nothing was written", parent.display())
+            })?;
+            anyhow::ensure!(
+                !real_parent.starts_with(&lib),
+                "{shown} is inside the library directory {}; MCP tools never write into \
+                 the library, nothing was written. Plan the reel with create_reel and an \
+                 output outside the library, or ask the user to render it with `eidetic \
+                 reel`",
+                lib.display()
+            );
+        }
+        Err(e) if e.kind() == NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "cannot resolve the library directory {}; nothing was written to {shown}",
+                    library_dir.display()
+                )
+            });
+        }
+    }
+
+    let Some(meta) = existing else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        meta.is_file(),
+        "{shown} exists and is not a regular file; nothing was written. Use another output, \
+         or ask the user"
+    );
+    let not_ours = |id: ProjectId, hint: String| {
+        anyhow::anyhow!(
+            "{shown} already exists and was not written by Eidetic for this project ({id}); \
+             nothing was written. Ask the user to move or delete it, or plan a new reel with \
+             create_reel and a different output.{hint}"
+        )
+    };
+    match claim {
+        Claim::New { remedy } => anyhow::bail!("{shown} already exists; {remedy}"),
+        Claim::Render {
+            id,
+            project,
+            preview,
+        } => {
+            if !render_carries(&dest, id)? {
+                let hint = if preview {
+                    " If it is an older preview of this project, it is safe to delete.".into()
+                } else {
+                    format!(
+                        " If it is this project's render from before Eidetic marked its \
+                         renders, the user can re-render it with `eidetic reel edit {}`.",
+                        project.display()
+                    )
+                };
+                return Err(not_ours(id, hint));
+            }
+        }
+        Claim::Otio { id, project } => {
+            if !otio_carries(&dest, id) {
+                return Err(not_ours(
+                    id,
+                    format!(
+                        " If it is this project's export from before Eidetic marked its \
+                         exports, the user can re-export it with `eidetic reel edit {} \
+                         --export otio --dry-run`.",
+                        project.display()
+                    ),
+                ));
+            }
+        }
+        Claim::ProjectFile { id } => {
+            let same = read_bounded(&dest, MAX_PROJECT_BYTES, "reel project file")
+                .and_then(|bytes| ReelProject::parse(&dest, &bytes))
+                .is_ok_and(|p| p.id == id);
+            anyhow::ensure!(
+                same,
+                "{shown} is no longer the project this call loaded; nothing was saved. Call \
+                 edit_reel again on the file as it is now"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether the mp4 at `path` carries `id` as its comment tag. The mov
+/// demuxer is forced so that a playlist or concat list disguised as an mp4
+/// cannot make ffprobe open other files or URLs.
+fn render_carries(path: &Path, id: ProjectId) -> Result<bool> {
+    let ffprobe = eidetic_ingest::video::ffprobe().with_context(|| {
+        format!(
+            "{} already exists, and proving it is this project's render needs ffprobe; \
+             nothing was written. Install ffprobe (it ships with ffmpeg) or set \
+             EIDETIC_FFPROBE_PATH, or ask the user to move the file aside",
+            path.display()
+        )
+    })?;
+    let out = std::process::Command::new(ffprobe)
+        .args(["-v", "error", "-f", "mov"])
+        .args(["-show_entries", "format_tags=comment"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run ffprobe on {}", path.display()))?;
+    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == id.render_tag())
+}
+
+/// Whether the file at `path` is an OTIO timeline whose metadata carries
+/// `id`. Anything unreadable or unparseable is not.
+fn otio_carries(path: &Path, id: ProjectId) -> bool {
+    read_bounded(path, MAX_OTIO_BYTES, "OTIO timeline")
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|v| v["metadata"][crate::otio::PROJECT_KEY] == id.to_string().as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +736,19 @@ pub struct ReelSpec {
     pub audio: Option<PathBuf>,
     pub min_sharpness: f64,
     pub variations: u32,
+}
+
+impl ReelSpec {
+    /// The render output of every project [`plan_projects`] makes for this
+    /// spec: the output itself, or `<output>.vN.mp4` per variation.
+    pub fn outputs(&self) -> Vec<PathBuf> {
+        if self.variations <= 1 {
+            return vec![self.output.clone()];
+        }
+        (1..=self.variations)
+            .map(|v| self.output.with_extension(format!("v{v}.mp4")))
+            .collect()
+    }
 }
 
 /// Plan project(s) for a spec — search, gate, beat/voiceover analysis, shot
@@ -646,7 +963,7 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         );
         let strong = reel::strong_prefix(&results).to_vec();
         let mut projects = Vec::new();
-        for v in 1..=spec.variations as usize {
+        for (v, output) in (1..).zip(spec.outputs()) {
             let mut pool = strong.clone();
             if !pool.is_empty() {
                 let k = (v - 1) % pool.len();
@@ -677,7 +994,7 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
                 spec.frame.clone(),
                 spec.audio.clone(),
                 grid.clone(),
-                &spec.output.with_extension(format!("v{v}.mp4")),
+                &output,
                 slots,
             ));
         }
@@ -732,11 +1049,18 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
     )])
 }
 
+/// Re-checks a render's destination; an error stops the render from
+/// replacing it.
+pub type PublishCheck = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Where a render lands and at what size.
 pub struct RenderTarget {
     pub path: PathBuf,
     pub width: u32,
     pub height: u32,
+    /// Run just before the finished render replaces `path` (see
+    /// [`reel::Publish`]). Unset for the operator's own CLI renders.
+    pub before_publish: Option<PublishCheck>,
 }
 
 impl ReelProject {
@@ -751,22 +1075,29 @@ impl ReelProject {
                 path: self.output.clone(),
                 width: self.width,
                 height: self.height,
+                before_publish: None,
             };
         }
-        let ext = self
-            .output
-            .extension()
-            .map_or_else(|| "mp4".into(), |e| e.to_string_lossy().into_owned());
         RenderTarget {
-            path: self.output.with_extension(format!("preview.{ext}")),
+            path: preview_path(&self.output),
             width: (self.width / 2) & !1,
             height: (self.height / 2) & !1,
+            before_publish: None,
         }
     }
 }
 
+/// Where the preview of a render at `output` goes: `reel.mp4` →
+/// `reel.preview.mp4`.
+pub fn preview_path(output: &Path) -> PathBuf {
+    let ext = output
+        .extension()
+        .map_or_else(|| "mp4".into(), |e| e.to_string_lossy().into_owned());
+    output.with_extension(format!("preview.{ext}"))
+}
+
 /// Render a project's cut list to `target` (see
-/// [`ReelProject::render_target`]).
+/// [`ReelProject::render_target`]), tagged with the project's id.
 pub async fn render_project(proj: &ReelProject, target: &RenderTarget) -> Result<()> {
     let (w, h) = (target.width, target.height);
     let fit = reel::Fit::parse(&proj.frame, proj.height > proj.width)?;
@@ -780,9 +1111,17 @@ pub async fn render_project(proj: &ReelProject, target: &RenderTarget) -> Result
     let slots = proj.slots.clone();
     let output = target.path.clone();
     let audio = proj.audio.clone();
-    tokio::task::spawn_blocking(move || reel::render(&slots, &output, w, h, fit, audio.as_deref()))
-        .await
-        .context("render thread panicked")?
+    let tag = proj.id.map(ProjectId::render_tag);
+    let check = target.before_publish.clone();
+    tokio::task::spawn_blocking(move || {
+        let publish = reel::Publish {
+            tag: tag.as_deref(),
+            check: check.as_deref(),
+        };
+        reel::render(&slots, &output, w, h, fit, audio.as_deref(), &publish)
+    })
+    .await
+    .context("render thread panicked")?
 }
 
 /// Scene boundaries per video hit, so cuts snap to shots. Missing detection
@@ -2586,5 +2925,199 @@ mod tests {
             err.contains("cannot be rendered through MCP: output must be an .mp4 path"),
             "{err}"
         );
+    }
+
+    // -- output ownership ----------------------------------------------------
+
+    #[tokio::test]
+    async fn new_projects_carry_an_id_and_only_the_cli_fills_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reel.eidetic.json");
+        let p = project("x", &dir.path().join("reel.mp4"));
+        let id = p.id.expect("a planned project has an id");
+        p.save(&path).unwrap();
+        assert_eq!(ReelProject::load(&path).unwrap().id, Some(id));
+        assert_eq!(
+            ReelProject::load_untrusted(&path).await.unwrap().id,
+            Some(id)
+        );
+        assert_eq!(p.require_id(&path, "render").unwrap(), id);
+
+        ReelProject {
+            id: None,
+            ..project("legacy", &dir.path().join("reel.mp4"))
+        }
+        .save(&path)
+        .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw.get("id").is_none(),
+            "an absent id is not written as null"
+        );
+        assert!(ReelProject::load(&path).unwrap().id.is_some());
+        let legacy = ReelProject::load_untrusted(&path).await.unwrap();
+        assert_eq!(legacy.id, None);
+        let err = format!("{:#}", legacy.require_id(&path, "render").unwrap_err());
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(err.contains("edit_reel"), "{err}");
+        assert!(err.contains(r#""ops":[]"#), "{err}");
+        assert!(err.contains("call render again"), "{err}");
+    }
+
+    /// A real (symlink-free) scratch root: a temp dir under a symlinked
+    /// `/tmp` would be refused as a link, as it should.
+    fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    fn refusal(dest: &Path, lib: &Path, claim: Claim<'_>) -> String {
+        format!("{:#}", check_destination(dest, lib, claim).unwrap_err())
+    }
+
+    const NEW: Claim<'static> = Claim::New {
+        remedy: "pick another",
+    };
+
+    #[test]
+    fn free_paths_outside_the_library_are_writable() {
+        let (_guard, root) = real_tempdir();
+        let lib = root.join("library");
+        // A library that does not exist yet contains nothing.
+        check_destination(&root.join("reel.mp4"), &lib, NEW).unwrap();
+        std::fs::create_dir(&lib).unwrap();
+        check_destination(&root.join("reel.mp4"), &lib, NEW).unwrap();
+        // A sibling whose name merely starts like the library is outside it.
+        std::fs::create_dir(root.join("library2")).unwrap();
+        check_destination(&root.join("library2").join("reel.mp4"), &lib, NEW).unwrap();
+    }
+
+    #[test]
+    fn dotdot_missing_parents_and_non_files_are_refused() {
+        let (_guard, root) = real_tempdir();
+        let lib = root.join("library");
+        std::fs::create_dir(root.join("a")).unwrap();
+        let err = refusal(&root.join("a").join("..").join("reel.mp4"), &lib, NEW);
+        assert!(err.contains("contains `..`"), "{err}");
+        let err = refusal(&root.join("missing").join("reel.mp4"), &lib, NEW);
+        assert!(err.contains("does not exist"), "{err}");
+
+        let id = ProjectId::generate();
+        let render = Claim::Render {
+            id,
+            project: Path::new("/p.eidetic.json"),
+            preview: false,
+        };
+        let err = refusal(&root.join("a"), &lib, render);
+        assert!(err.contains("is not a regular file"), "{err}");
+        #[cfg(unix)]
+        {
+            let fifo = root.join("fifo.mp4");
+            if std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                let err = refusal(&fifo, &lib, render);
+                assert!(err.contains("is not a regular file"), "{err}");
+            }
+        }
+
+        std::fs::write(root.join("taken.mp4"), b"x").unwrap();
+        let err = refusal(&root.join("taken.mp4"), &lib, NEW);
+        assert!(err.ends_with("already exists; pick another"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_at_or_above_the_destination_are_refused() {
+        use std::os::unix::fs::symlink;
+        let (_guard, root) = real_tempdir();
+        let lib = root.join("library");
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, root.join("via")).unwrap();
+        symlink(root.join("gone"), root.join("dangling.mp4")).unwrap();
+        let err = refusal(&root.join("via").join("reel.mp4"), &lib, NEW);
+        assert!(
+            err.contains(&format!(
+                "{} is a symbolic link",
+                root.join("via").display()
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("resolves to {}", real.display())),
+            "{err}"
+        );
+        let err = refusal(&root.join("dangling.mp4"), &lib, NEW);
+        assert!(err.contains("is a symbolic link"), "{err}");
+        assert!(!root.join("gone").exists());
+    }
+
+    #[test]
+    fn nothing_new_goes_into_the_library_even_through_a_link_to_it() {
+        let (_guard, root) = real_tempdir();
+        let lib = root.join("library");
+        std::fs::create_dir_all(lib.join("ab")).unwrap();
+        for dest in [lib.join("reel.mp4"), lib.join("ab").join("reel.otio")] {
+            let err = refusal(&dest, &lib, NEW);
+            assert!(err.contains("inside the library directory"), "{err}");
+        }
+        #[cfg(unix)]
+        {
+            let link = root.join("library-link");
+            std::os::unix::fs::symlink(&lib, &link).unwrap();
+            let err = refusal(&lib.join("reel.mp4"), &link, NEW);
+            assert!(err.contains("inside the library directory"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_existing_otio_is_replaceable_only_with_this_projects_id() {
+        let (_guard, root) = real_tempdir();
+        let lib = root.join("library");
+        let path = root.join("reel.otio");
+        let p = project("x", &root.join("reel.mp4"));
+        let id = p.id.unwrap();
+        let claim = Claim::Otio { id, project: &root };
+        std::fs::write(&path, crate::otio::timeline(&p).unwrap()).unwrap();
+        check_destination(&path, &lib, claim).unwrap();
+
+        let other = project("y", &root.join("reel.mp4"));
+        std::fs::write(&path, crate::otio::timeline(&other).unwrap()).unwrap();
+        let err = refusal(&path, &lib, claim);
+        assert!(
+            err.contains("was not written by Eidetic for this project"),
+            "{err}"
+        );
+        assert!(err.contains("--export otio"), "{err}");
+        std::fs::write(&path, b"not json").unwrap();
+        refusal(&path, &lib, claim);
+    }
+
+    #[test]
+    fn a_project_file_is_saved_back_only_while_it_is_the_one_loaded() {
+        let (_guard, root) = real_tempdir();
+        let lib = root.join("library");
+        let path = root.join("reel.eidetic.json");
+        let p = project("x", &root.join("reel.mp4"));
+        p.save(&path).unwrap();
+        check_destination(&path, &lib, Claim::ProjectFile { id: p.id }).unwrap();
+        let err = refusal(
+            &path,
+            &lib,
+            Claim::ProjectFile {
+                id: Some(ProjectId::generate()),
+            },
+        );
+        assert!(
+            err.contains("no longer the project this call loaded"),
+            "{err}"
+        );
+        let err = refusal(&path, &lib, Claim::ProjectFile { id: None });
+        assert!(err.contains("no longer the project"), "{err}");
     }
 }
