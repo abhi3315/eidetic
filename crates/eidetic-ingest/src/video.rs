@@ -134,12 +134,12 @@ fn probe_json(path: &Path, stdout: &[u8]) -> Result<serde_json::Value> {
     })
 }
 
-/// The duration that sizes a full-decode deadline for `path`: `None` when
-/// it can't be read, so the budget assumes a long file. A probe that timed
-/// out is returned as the error: a file whose header won't parse in that
-/// time is wedged, and decoding it would wedge too.
-fn deadline_duration(path: &Path) -> Result<Option<f64>> {
-    match probe(path) {
+/// The duration that sizes a full-decode deadline, from a [`probe`] of the
+/// file: `None` when it can't be read, so the budget assumes a long file. A
+/// probe that timed out is returned as the error: a file whose header won't
+/// parse in that time is wedged, and decoding it would wedge too.
+fn deadline_duration(probed: Result<Option<VideoProbe>>) -> Result<Option<f64>> {
+    match probed {
         Ok(p) => Ok(p.and_then(|p| p.duration_secs)),
         Err(e @ Error::SubprocessTimeout { .. }) => Err(e),
         Err(_) => Ok(None),
@@ -254,7 +254,9 @@ fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
 ///
 /// ffmpeg applies the display rotation during decode, so the frame comes out
 /// upright — the same convention `load_oriented_image` gives photos.
-/// `Ok(None)` when ffmpeg is not installed.
+/// `Ok(None)` when ffmpeg is not installed. A run past its deadline is
+/// [`Error::SubprocessTimeout`], so a caller sampling many frames of one
+/// file can stop instead of waiting out the deadline again per frame.
 pub fn extract_frame(path: &Path, ts_secs: f64) -> Result<Option<DynamicImage>> {
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
@@ -275,9 +277,7 @@ pub fn extract_frame(path: &Path, ts_secs: f64) -> Result<Option<DynamicImage>> 
     )
     // Keep the timestamp in the message: callers log it per frame.
     .map_err(|e| match e {
-        Error::SubprocessFailed { .. } | Error::SubprocessTimeout { .. } => {
-            frame_err(e.to_string())
-        }
+        Error::SubprocessFailed { .. } => frame_err(e.to_string()),
         other => other,
     })?;
     if out.stdout.is_empty() {
@@ -310,7 +310,7 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
-    let duration = deadline_duration(src)?;
+    let duration = deadline_duration(probe(src))?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|source| Error::Io {
             path: parent.to_path_buf(),
@@ -497,7 +497,7 @@ pub fn detect_scenes(path: &Path) -> Result<Option<Vec<f64>>> {
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
-    let duration = deadline_duration(path)?;
+    let duration = deadline_duration(probe(path))?;
     let out = subprocess::run(
         Command::new(ffmpeg)
             .args(["-v", "info", "-i"])
@@ -512,6 +512,17 @@ pub fn detect_scenes(path: &Path) -> Result<Option<Vec<f64>>> {
         path,
         SCENES.deadline(duration),
     )?;
+    // The result is stored for good, so a log the runner had to cut must
+    // fail rather than save a partial cut list.
+    if out.stderr_truncated {
+        return Err(Error::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other(format!(
+                "ffmpeg's scene log outgrew {} MiB, so its cut list would be incomplete",
+                subprocess::STDERR_CAP_BYTES >> 20
+            )),
+        });
+    }
     // showinfo logs one line per selected frame; pts_time is the timestamp.
     // The runner only returns once stderr reached EOF, so this is complete.
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -664,6 +675,108 @@ mod tests {
         let bad = dir.path().join("bad.mp4");
         std::fs::write(&bad, b"not a video").unwrap();
         assert!(extract_audio_pcm(&bad).is_err(), "corrupt is not silent");
+
+        // An audio stream ffprobe can see but no decoder exists for: the
+        // failure comes from the decode itself, not from the probe.
+        let undecodable = dir.path().join("undecodable.wav");
+        std::fs::write(&undecodable, wav_with_format_tag(0xBEEF)).unwrap();
+        let (has_audio, _) = probe_audio(&undecodable)
+            .expect("ffprobe reads the WAV header")
+            .expect("ffprobe present");
+        assert!(has_audio, "the header declares an audio stream");
+        let err = extract_audio_pcm(&undecodable).unwrap_err();
+        assert!(
+            matches!(&err, Error::SubprocessFailed { program, .. } if program == "ffmpeg"),
+            "{err}"
+        );
+    }
+
+    /// A mono 16 kHz WAV whose `fmt ` chunk names codec `tag`, with a
+    /// little sample data.
+    fn wav_with_format_tag(tag: u16) -> Vec<u8> {
+        let data = [0u8; 3200];
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&tag.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // channels
+        wav.extend_from_slice(&16_000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&32_000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        wav
+    }
+
+    #[test]
+    fn only_a_timed_out_probe_stops_a_full_decode() {
+        let path = PathBuf::from("/media/clip.mp4");
+        let timeout = Error::SubprocessTimeout {
+            program: "ffprobe".into(),
+            subject: path.clone(),
+            elapsed: PROBE_DEADLINE,
+            deadline: PROBE_DEADLINE,
+            stderr_tail: String::new(),
+        };
+        assert!(matches!(
+            deadline_duration(Err(timeout)),
+            Err(Error::SubprocessTimeout { .. })
+        ));
+
+        let unreadable = Error::VideoProbe {
+            path,
+            detail: "unparseable ffprobe JSON".into(),
+        };
+        assert_eq!(deadline_duration(Err(unreadable)).unwrap(), None);
+        assert_eq!(deadline_duration(Ok(None)).unwrap(), None);
+        let probed = VideoProbe {
+            duration_secs: Some(12.5),
+            ..VideoProbe::default()
+        };
+        assert_eq!(deadline_duration(Ok(Some(probed))).unwrap(), Some(12.5));
+    }
+
+    /// Scene detection finds a hard cut and nothing in a single shot. Its
+    /// result is stored for good, so a lost or cut scene log would silently
+    /// degrade every video. Skips without ffmpeg.
+    #[test]
+    fn detect_scenes_finds_a_hard_cut_and_nothing_in_one_shot() {
+        let Some(ffmpeg_bin) = ffmpeg() else {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let synth = |name: &str, source: &str| {
+            let path = dir.path().join(name);
+            subprocess::run(
+                Command::new(ffmpeg_bin)
+                    .args(["-v", "error", "-f", "lavfi", "-i", source])
+                    .args(["-pix_fmt", "yuv420p"])
+                    .arg(&path),
+                &path,
+                FIXTURE_DEADLINE,
+            )
+            .expect("ffmpeg synthesises the fixture");
+            path
+        };
+
+        let cut = synth(
+            "cut.mp4",
+            "color=c=black:s=64x48:d=1:r=10[a];\
+             color=c=white:s=64x48:d=1:r=10[b];\
+             [a][b]concat=n=2:v=1:a=0",
+        );
+        let scenes = detect_scenes(&cut).unwrap().expect("ffmpeg present");
+        assert_eq!(scenes.len(), 1, "{scenes:?}");
+        assert!((scenes[0] - 1.0).abs() < 0.15, "cut at ~1s: {scenes:?}");
+
+        let still = synth("still.mp4", "color=c=gray:s=64x48:d=2:r=10");
+        let scenes = detect_scenes(&still).unwrap().expect("ffmpeg present");
+        assert!(scenes.is_empty(), "{scenes:?}");
     }
 
     #[test]

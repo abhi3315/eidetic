@@ -19,8 +19,13 @@ use std::time::{Duration, Instant};
 /// How much of stderr an error message carries.
 pub const STDERR_TAIL_BYTES: usize = 1024;
 
-/// How long the output pipes may stay open once the child has exited (or
-/// been killed). Longer means something other than the child holds them.
+/// Most of stderr a run keeps. Past it only the latest bytes survive, so a
+/// decoder that keeps logging errors cannot grow memory without bound.
+pub const STDERR_CAP_BYTES: usize = 8 << 20;
+
+/// How long stderr may stay open once the child has exited (or been
+/// killed). Longer means something other than the child holds it. Stdout
+/// has no such grace: a descendant holding it runs into the deadline.
 pub const STDERR_GRACE: Duration = Duration::from_secs(1);
 
 /// Media length assumed when the real one is unknown (no container duration,
@@ -30,11 +35,14 @@ pub const ASSUMED_MEDIA_SECS: f64 = 3600.0;
 /// Longest media length a [`Budget`] scales to.
 const MAX_MEDIA_SECS: f64 = 24.0 * 3600.0;
 
-/// A completed run: whatever stdout became, plus all of stderr.
+/// A completed run: whatever stdout became, plus its stderr.
 #[derive(Debug)]
 pub struct Finished<T> {
     pub stdout: T,
+    /// All of stderr, or only its last [`STDERR_CAP_BYTES`] when
+    /// `stderr_truncated` is set.
     pub stderr: Vec<u8>,
+    pub stderr_truncated: bool,
 }
 
 /// A deadline that grows with the length of the media being processed:
@@ -110,7 +118,7 @@ where
         })?;
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let mut child = Reaped(child);
-    let (Some(stdout), Some(mut stderr)) = (stdout, stderr) else {
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
         return Err(io_err(io::Error::other(
             "child output pipes were not captured",
         )));
@@ -129,17 +137,15 @@ where
     thread::Builder::new()
         .name(format!("{program}-stderr"))
         .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            let _ = err_tx.send(buf);
+            let _ = err_tx.send(read_capped(stderr));
         })
         .map_err(io_err)?;
 
     let remaining = || deadline.saturating_sub(start.elapsed());
-    let timed_out = |child: Reaped, err_rx: &Receiver<Vec<u8>>| {
+    let timed_out = |child: Reaped, err_rx: &Receiver<(Vec<u8>, bool)>| {
         drop(child);
         let elapsed = start.elapsed();
-        let stderr = err_rx.recv_timeout(STDERR_GRACE).unwrap_or_default();
+        let (stderr, _) = err_rx.recv_timeout(STDERR_GRACE).unwrap_or_default();
         Error::SubprocessTimeout {
             program: program.clone(),
             subject: subject.to_path_buf(),
@@ -176,12 +182,12 @@ where
     // The child is gone, so its stderr must reach EOF almost at once. If
     // something else still holds the pipe, stderr may be incomplete, and a
     // caller parsing it must not see a truncated success.
-    let stderr = match err_rx.recv_timeout(STDERR_GRACE) {
-        Ok(stderr) => stderr,
+    let (stderr, stderr_truncated) = match err_rx.recv_timeout(STDERR_GRACE) {
+        Ok(read) => read,
         Err(RecvTimeoutError::Timeout) => {
             return Err(io_err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("{program} exited but its output pipes stayed open"),
+                format!("{program} exited but its stderr stayed open"),
             )));
         }
         Err(RecvTimeoutError::Disconnected) => {
@@ -198,7 +204,39 @@ where
             stderr_tail: stderr_tail(&stderr),
         });
     }
-    Ok(Finished { stdout, stderr })
+    Ok(Finished {
+        stdout,
+        stderr,
+        stderr_truncated,
+    })
+}
+
+/// Read `r` to EOF, keeping at most the last [`STDERR_CAP_BYTES`]; the flag
+/// says whether anything was dropped. The buffer may reach twice the cap
+/// before its front is dropped, so the trimming copy stays rare.
+fn read_capped(mut r: impl Read) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 2 * STDERR_CAP_BYTES {
+                    buf.drain(..buf.len() - STDERR_CAP_BYTES);
+                    truncated = true;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if buf.len() > STDERR_CAP_BYTES {
+        buf.drain(..buf.len() - STDERR_CAP_BYTES);
+        truncated = true;
+    }
+    (buf, truncated)
 }
 
 /// The last [`STDERR_TAIL_BYTES`] of `stderr`, trimmed, lossily decoded and
@@ -246,6 +284,19 @@ mod tests {
     fn stderr_tail_keeps_short_output_whole() {
         assert_eq!(stderr_tail(b"  boom\n"), "boom");
         assert_eq!(stderr_tail(b""), "");
+    }
+
+    #[test]
+    fn read_capped_keeps_short_stderr_whole_and_long_stderr_by_its_end() {
+        assert_eq!(read_capped(&b"note\n"[..]), (b"note\n".to_vec(), false));
+
+        let long = io::repeat(b'x')
+            .take(2 * STDERR_CAP_BYTES as u64 + 5)
+            .chain(&b"END"[..]);
+        let (kept, truncated) = read_capped(long);
+        assert!(truncated);
+        assert_eq!(kept.len(), STDERR_CAP_BYTES);
+        assert!(kept.ends_with(b"xEND"));
     }
 
     #[test]
