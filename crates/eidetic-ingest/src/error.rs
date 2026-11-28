@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::process::ExitStatus;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -33,8 +35,39 @@ pub enum Error {
         ts_secs: f64,
         detail: String,
     },
-    #[error("transcode failed for {path}: {detail}")]
-    Transcode { path: PathBuf, detail: String },
+    #[error(
+        "{program} on {} was killed after {elapsed:.1?} (deadline {deadline:?}){}",
+        .subject.display(),
+        tail(.stderr_tail)
+    )]
+    SubprocessTimeout {
+        program: String,
+        subject: PathBuf,
+        elapsed: Duration,
+        deadline: Duration,
+        stderr_tail: String,
+    },
+    #[error(
+        "{program} failed on {} ({status}) after {elapsed:.1?}{}",
+        .subject.display(),
+        tail(.stderr_tail)
+    )]
+    SubprocessFailed {
+        program: String,
+        subject: PathBuf,
+        status: ExitStatus,
+        elapsed: Duration,
+        stderr_tail: String,
+    },
+}
+
+/// `": <stderr tail>"`, or nothing when the subprocess printed nothing.
+fn tail(stderr_tail: &str) -> String {
+    if stderr_tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr_tail}")
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

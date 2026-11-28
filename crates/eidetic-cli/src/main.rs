@@ -622,7 +622,17 @@ async fn main() -> anyhow::Result<()> {
                             let mut frames = Vec::with_capacity(timestamps.len());
                             let mut first_err = None;
                             for ts in timestamps {
-                                let result = eidetic_ingest::video::extract_frame(&path, ts)
+                                let frame = match eidetic_ingest::video::extract_frame(&path, ts) {
+                                    // The file wedges the decoder: every
+                                    // remaining timestamp would wait out the
+                                    // same deadline.
+                                    Err(e @ eidetic_ingest::Error::SubprocessTimeout { .. }) => {
+                                        first_err = first_err.or(Some(e.to_string()));
+                                        break;
+                                    }
+                                    other => other,
+                                };
+                                let result = frame
                                     .map_err(|e| e.to_string())
                                     .and_then(|f| {
                                         f.ok_or_else(|| "ffmpeg disappeared mid-run".to_string())
@@ -1007,19 +1017,30 @@ async fn main() -> anyhow::Result<()> {
                                     let mut per_ts = Vec::new();
                                     let mut first_err = None;
                                     for ts in timestamps {
-                                        let result =
-                                            eidetic_ingest::video::extract_frame(&path, ts)
-                                                .map_err(|e| e.to_string())
-                                                .and_then(|f| {
-                                                    f.ok_or_else(|| {
-                                                        "ffmpeg disappeared mid-run".to_string()
-                                                    })
+                                        let frame =
+                                            match eidetic_ingest::video::extract_frame(&path, ts) {
+                                                // A wedged decoder: the rest would
+                                                // wait out the same deadline.
+                                                Err(
+                                                    e @ eidetic_ingest::Error::SubprocessTimeout {
+                                                        ..
+                                                    },
+                                                ) => {
+                                                    first_err = first_err.or(Some(e.to_string()));
+                                                    break;
+                                                }
+                                                other => other,
+                                            };
+                                        let result = frame
+                                            .map_err(|e| e.to_string())
+                                            .and_then(|f| {
+                                                f.ok_or_else(|| {
+                                                    "ffmpeg disappeared mid-run".to_string()
                                                 })
-                                                .and_then(|frame| {
-                                                    analyzer
-                                                        .analyze(&frame)
-                                                        .map_err(|e| e.to_string())
-                                                });
+                                            })
+                                            .and_then(|frame| {
+                                                analyzer.analyze(&frame).map_err(|e| e.to_string())
+                                            });
                                         match result {
                                             Ok(faces) => per_ts.push((ts, faces)),
                                             Err(e) => first_err = first_err.or(Some(e)),

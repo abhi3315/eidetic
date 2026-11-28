@@ -9,12 +9,32 @@
 //! and per-frame SigLIP embeddings, and the frame timestamps are the cut
 //! points reel generation uses later.
 
+use crate::subprocess::{self, Budget};
 use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+// Deadlines for every ffmpeg/ffprobe run here. They exist to catch wedged
+// decoders and stalled disks, not as performance targets, so they sit far
+// past plausible real speeds. Budgets scale with the media's duration.
+const VERSION_DEADLINE: Duration = Duration::from_secs(30);
+const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+const FRAME_DEADLINE: Duration = Duration::from_secs(30);
+/// Audio decode at as slow as 0.5x realtime.
+const AUDIO: Budget = Budget::new(Duration::from_secs(120), 2.0);
+/// A software H.264 transcode at as slow as ~0.033x realtime.
+const PLAYBACK: Budget = Budget::new(Duration::from_secs(600), 30.0);
+/// A full decode through the scene filter.
+const SCENES: Budget = Budget::new(Duration::from_secs(300), 20.0);
+
+/// Most samples reserved up front for an audio decode (128 MiB of f32), so
+/// a lying duration header can't force a huge allocation.
+const RESERVE_CAP_SAMPLES: usize = 1 << 25;
 
 /// Everything worth keeping from one `ffprobe` run.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -50,14 +70,22 @@ fn resolve(env_var: &str, name: &str) -> Option<PathBuf> {
         let p = PathBuf::from(v);
         return p.exists().then_some(p);
     }
-    let ok = Command::new(name)
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    ok.then(|| PathBuf::from(name))
+    match subprocess::run(
+        Command::new(name).arg("-version"),
+        Path::new(name),
+        VERSION_DEADLINE,
+    ) {
+        Ok(_) => Some(PathBuf::from(name)),
+        Err(e @ Error::SubprocessTimeout { .. }) => {
+            // The answer is cached for the process, so say why it is absent.
+            tracing::warn!(
+                "{name} -version took over {VERSION_DEADLINE:?}; treating {name} as \
+                 unavailable for this process: {e}"
+            );
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Path to ffprobe, or `None` if unavailable. Resolved once per process.
@@ -82,33 +110,40 @@ pub fn probe(path: &Path) -> Result<Option<VideoProbe>> {
     let Some(ffprobe) = ffprobe() else {
         return Ok(None);
     };
-    let output = Command::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(Error::VideoProbe {
-            path: path.to_path_buf(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    let out = subprocess::run(
+        Command::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+            ])
+            .arg(path),
+        path,
+        PROBE_DEADLINE,
+    )?;
+    Ok(Some(parse_probe(&probe_json(path, &out.stdout)?)))
+}
+
+fn probe_json(path: &Path, stdout: &[u8]) -> Result<serde_json::Value> {
+    serde_json::from_slice(stdout).map_err(|e| Error::VideoProbe {
+        path: path.to_path_buf(),
+        detail: format!("unparseable ffprobe JSON: {e}"),
+    })
+}
+
+/// The duration that sizes a full-decode deadline, from a [`probe`] of the
+/// file: `None` when it can't be read, so the budget assumes a long file. A
+/// probe that timed out is returned as the error: a file whose header won't
+/// parse in that time is wedged, and decoding it would wedge too.
+fn deadline_duration(probed: Result<Option<VideoProbe>>) -> Result<Option<f64>> {
+    match probed {
+        Ok(p) => Ok(p.and_then(|p| p.duration_secs)),
+        Err(e @ Error::SubprocessTimeout { .. }) => Err(e),
+        Err(_) => Ok(None),
     }
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| Error::VideoProbe {
-            path: path.to_path_buf(),
-            detail: format!("unparseable ffprobe JSON: {e}"),
-        })?;
-    Ok(Some(parse_probe(&json)))
 }
 
 /// Pull the fields we keep out of ffprobe's JSON. Split from [`probe`] so it
@@ -117,7 +152,7 @@ fn parse_probe(json: &serde_json::Value) -> VideoProbe {
     let format = &json["format"];
     let tags = &format["tags"];
 
-    let duration_secs = format["duration"].as_str().and_then(|s| s.parse().ok());
+    let duration_secs = parse_duration(json);
 
     // First stream whose codec_type is "video" — audio-only containers have
     // none, and then codec/width/height stay None.
@@ -219,29 +254,36 @@ fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
 ///
 /// ffmpeg applies the display rotation during decode, so the frame comes out
 /// upright — the same convention `load_oriented_image` gives photos.
-/// `Ok(None)` when ffmpeg is not installed.
+/// `Ok(None)` when ffmpeg is not installed. A run past its deadline is
+/// [`Error::SubprocessTimeout`], so a caller sampling many frames of one
+/// file can stop instead of waiting out the deadline again per frame.
 pub fn extract_frame(path: &Path, ts_secs: f64) -> Result<Option<DynamicImage>> {
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
-    let output = Command::new(ffmpeg)
-        .args(["-v", "error", "-ss", &format!("{ts_secs:.3}")])
-        .arg("-i")
-        .arg(path)
-        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
-        .output()
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(Error::FrameExtract {
-            path: path.to_path_buf(),
-            ts_secs,
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    let frame_err = |detail: String| Error::FrameExtract {
+        path: path.to_path_buf(),
+        ts_secs,
+        detail,
+    };
+    let out = subprocess::run(
+        Command::new(ffmpeg)
+            .args(["-v", "error", "-ss", &format!("{ts_secs:.3}")])
+            .arg("-i")
+            .arg(path)
+            .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]),
+        path,
+        FRAME_DEADLINE,
+    )
+    // Keep the timestamp in the message: callers log it per frame.
+    .map_err(|e| match e {
+        Error::SubprocessFailed { .. } => frame_err(e.to_string()),
+        other => other,
+    })?;
+    if out.stdout.is_empty() {
+        return Err(frame_err(subprocess::stderr_tail(&out.stderr)));
     }
-    let img = image::load_from_memory(&output.stdout).map_err(|source| Error::ImageDecode {
+    let img = image::load_from_memory(&out.stdout).map_err(|source| Error::ImageDecode {
         path: path.to_path_buf(),
         source,
     })?;
@@ -268,6 +310,7 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
+    let duration = deadline_duration(probe(src))?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|source| Error::Io {
             path: parent.to_path_buf(),
@@ -297,16 +340,9 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
         "-f",
         "mp4",
     ]);
-    let output = cmd.arg(&tmp).output().map_err(|source| Error::Io {
-        path: src.to_path_buf(),
-        source,
-    })?;
-    if !output.status.success() {
+    if let Err(e) = subprocess::run(cmd.arg(&tmp), src, PLAYBACK.deadline(duration)) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Error::Transcode {
-            path: src.to_path_buf(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+        return Err(e);
     }
     std::fs::rename(&tmp, dest).map_err(|source| Error::Io {
         path: dest.to_path_buf(),
@@ -315,49 +351,45 @@ pub fn transcode_to_playback(src: &Path, dest: &Path, codec_is_safe: bool) -> Re
     Ok(Some(()))
 }
 
-/// Does this file carry an audio stream at all?
+/// Does this file carry an audio stream at all, and how long is it?
 ///
 /// Header-only ffprobe, so it costs nothing next to a decode. Split out
 /// because "no audio" and "audio we failed to decode" need opposite
-/// treatment and ffmpeg's exit status alone cannot tell them apart.
-/// `Ok(None)` when ffprobe is missing.
-fn has_audio_stream(path: &Path) -> Result<Option<bool>> {
+/// treatment and ffmpeg's exit status alone cannot tell them apart. The
+/// duration sizes the decode's deadline. `Ok(None)` when ffprobe is missing.
+fn probe_audio(path: &Path) -> Result<Option<(bool, Option<f64>)>> {
     let Some(ffprobe) = ffprobe() else {
         return Ok(None);
     };
-    let output = Command::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_entries",
-            "stream=codec_type",
-            "-print_format",
-            "json",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(Error::VideoProbe {
-            path: path.to_path_buf(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| Error::VideoProbe {
-            path: path.to_path_buf(),
-            detail: format!("unparseable ffprobe JSON: {e}"),
-        })?;
-    Ok(Some(parse_has_audio(&json)))
+    let out = subprocess::run(
+        Command::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type:format=duration",
+                "-print_format",
+                "json",
+            ])
+            .arg(path),
+        path,
+        PROBE_DEADLINE,
+    )?;
+    let json = probe_json(path, &out.stdout)?;
+    Ok(Some((parse_has_audio(&json), parse_duration(&json))))
+}
+
+/// ffprobe prints `format.duration` as a decimal string.
+fn parse_duration(json: &serde_json::Value) -> Option<f64> {
+    json["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
 }
 
 /// Pull the audio-stream verdict out of ffprobe's JSON. Split from
-/// [`has_audio_stream`] so it is testable without running ffprobe.
+/// [`probe_audio`] so it is testable without running ffprobe.
 fn parse_has_audio(json: &serde_json::Value) -> bool {
     json["streams"]
         .as_array()
@@ -386,35 +418,58 @@ pub fn extract_audio_pcm_at(path: &Path, sample_rate: u32) -> Result<Option<Vec<
     // Without ffprobe there is no way to make that distinction, so fall
     // through and let a no-audio file fail: it stays pending and retries,
     // which is the recoverable direction to be wrong in.
-    if has_audio_stream(path)? == Some(false) {
-        return Ok(Some(Vec::new()));
-    }
+    let duration = match probe_audio(path)? {
+        Some((false, _)) => return Ok(Some(Vec::new())),
+        Some((true, duration)) => duration,
+        None => None,
+    };
 
-    let output = Command::new(ffmpeg)
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-vn", "-f", "f32le", "-ac", "1", "-ar"])
-        .arg(sample_rate.to_string())
-        .arg("-")
-        .output()
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    // Saturating casts: NaN or negative durations reserve nothing.
+    let reserve = duration.map_or(0, |d| (d * f64::from(sample_rate)).ceil() as usize);
+    let reserve = reserve.min(RESERVE_CAP_SAMPLES);
     // Past the probe, any non-zero exit is a real decode failure: it must
     // surface so the asset stays pending and a later run can retry it.
-    if !output.status.success() {
-        return Err(Error::VideoProbe {
-            path: path.to_path_buf(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    let out = subprocess::run_with(
+        Command::new(ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-vn", "-f", "f32le", "-ac", "1", "-ar"])
+            .arg(sample_rate.to_string())
+            .arg("-"),
+        path,
+        AUDIO.deadline(duration),
+        move |stdout| read_f32le(stdout, reserve),
+    )?;
+    Ok(Some(out.stdout))
+}
+
+/// Decode a little-endian f32 stream straight into one sample buffer, never
+/// holding the bytes as well. A trailing partial sample is dropped.
+fn read_f32le(mut r: impl Read, reserve: usize) -> io::Result<Vec<f32>> {
+    let mut pcm = Vec::new();
+    // Only a size hint: a failed reservation just means the Vec grows.
+    let _ = pcm.try_reserve_exact(reserve);
+    let mut buf = vec![0u8; 64 * 1024];
+    // Bytes of a sample split across two reads, kept at the buffer's front.
+    let mut carry = 0;
+    loop {
+        let n = match r.read(&mut buf[carry..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let filled = carry + n;
+        let whole = filled - filled % 4;
+        pcm.extend(
+            buf[..whole]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
+        buf.copy_within(whole..filled, 0);
+        carry = filled - whole;
     }
-    let pcm = output
-        .stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    Ok(Some(pcm))
+    Ok(pcm)
 }
 
 /// Cheap voice-activity proxy: is there enough energy to be worth running
@@ -442,29 +497,35 @@ pub fn detect_scenes(path: &Path) -> Result<Option<Vec<f64>>> {
     let Some(ffmpeg) = ffmpeg() else {
         return Ok(None);
     };
-    let output = Command::new(ffmpeg)
-        .args(["-v", "info", "-i"])
-        .arg(path)
-        .args([
-            "-vf",
-            &format!("select='gt(scene,{SCENE_THRESHOLD})',showinfo"),
-            "-f",
-            "null",
-            "-",
-        ])
-        .output()
-        .map_err(|source| Error::Io {
+    let duration = deadline_duration(probe(path))?;
+    let out = subprocess::run(
+        Command::new(ffmpeg)
+            .args(["-v", "info", "-i"])
+            .arg(path)
+            .args([
+                "-vf",
+                &format!("select='gt(scene,{SCENE_THRESHOLD})',showinfo"),
+                "-f",
+                "null",
+                "-",
+            ]),
+        path,
+        SCENES.deadline(duration),
+    )?;
+    // The result is stored for good, so a log the runner had to cut must
+    // fail rather than save a partial cut list.
+    if out.stderr_truncated {
+        return Err(Error::Io {
             path: path.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(Error::VideoProbe {
-            path: path.to_path_buf(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            source: io::Error::other(format!(
+                "ffmpeg's scene log outgrew {} MiB, so its cut list would be incomplete",
+                subprocess::STDERR_CAP_BYTES >> 20
+            )),
         });
     }
     // showinfo logs one line per selected frame; pts_time is the timestamp.
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The runner only returns once stderr reached EOF, so this is complete.
+    let stderr = String::from_utf8_lossy(&out.stderr);
     let mut scenes: Vec<f64> = stderr
         .lines()
         .filter_map(|line| {
@@ -552,6 +613,171 @@ pub fn sample_timestamps(duration_secs: Option<f64>) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FIXTURE_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// Yields its bytes a few at a time, so samples straddle reads.
+    struct Trickle(Vec<u8>, usize);
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(3).min(self.0.len() - self.1);
+            buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+            self.1 += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_f32le_reassembles_samples_split_across_reads() {
+        let samples = [0.5f32, -1.25, 3.0, f32::MIN_POSITIVE, 7.75];
+        let mut bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        bytes.push(0xAB); // a trailing partial sample is dropped
+        let pcm = read_f32le(Trickle(bytes, 0), 2).unwrap();
+        assert_eq!(pcm, samples);
+    }
+
+    /// Audio extraction keeps "no audio stream" (empty) apart from "decode
+    /// failed" (error), and decodes a real track. Skips without ffmpeg.
+    #[test]
+    fn audio_extraction_separates_silence_from_failure() {
+        let (Some(_), Some(ffmpeg_bin)) = (ffprobe(), ffmpeg()) else {
+            eprintln!("skipping: ffmpeg/ffprobe not installed");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let synth = |name: &str, source: &str| {
+            let path = dir.path().join(name);
+            subprocess::run(
+                Command::new(ffmpeg_bin)
+                    .args(["-v", "error", "-f", "lavfi", "-i", source])
+                    .arg(&path),
+                &path,
+                FIXTURE_DEADLINE,
+            )
+            .expect("ffmpeg synthesises the fixture");
+            path
+        };
+
+        let silent = synth("silent.mp4", "testsrc=duration=1:size=64x48:rate=10");
+        let pcm = extract_audio_pcm(&silent).unwrap().expect("ffmpeg present");
+        assert!(pcm.is_empty(), "no audio stream decodes to nothing");
+
+        let sine = synth("sine.wav", "sine=frequency=440:duration=1");
+        let (has_audio, duration) = probe_audio(&sine).unwrap().expect("ffprobe present");
+        assert!(has_audio);
+        let d = duration.expect("ffprobe reports the duration");
+        assert!((d - 1.0).abs() < 0.05, "duration ~1s, got {d}");
+        let pcm = extract_audio_pcm(&sine).unwrap().expect("ffmpeg present");
+        assert!(pcm.len().abs_diff(16_000) < 200, "{} samples", pcm.len());
+        assert!(has_audible_content(&pcm));
+
+        let bad = dir.path().join("bad.mp4");
+        std::fs::write(&bad, b"not a video").unwrap();
+        assert!(extract_audio_pcm(&bad).is_err(), "corrupt is not silent");
+
+        // An audio stream ffprobe can see but no decoder exists for: the
+        // failure comes from the decode itself, not from the probe.
+        let undecodable = dir.path().join("undecodable.wav");
+        std::fs::write(&undecodable, wav_with_format_tag(0xBEEF)).unwrap();
+        let (has_audio, _) = probe_audio(&undecodable)
+            .expect("ffprobe reads the WAV header")
+            .expect("ffprobe present");
+        assert!(has_audio, "the header declares an audio stream");
+        let err = extract_audio_pcm(&undecodable).unwrap_err();
+        assert!(
+            matches!(&err, Error::SubprocessFailed { program, .. } if program == "ffmpeg"),
+            "{err}"
+        );
+    }
+
+    /// A mono 16 kHz WAV whose `fmt ` chunk names codec `tag`, with a
+    /// little sample data.
+    fn wav_with_format_tag(tag: u16) -> Vec<u8> {
+        let data = [0u8; 3200];
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&tag.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // channels
+        wav.extend_from_slice(&16_000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&32_000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        wav
+    }
+
+    #[test]
+    fn only_a_timed_out_probe_stops_a_full_decode() {
+        let path = PathBuf::from("/media/clip.mp4");
+        let timeout = Error::SubprocessTimeout {
+            program: "ffprobe".into(),
+            subject: path.clone(),
+            elapsed: PROBE_DEADLINE,
+            deadline: PROBE_DEADLINE,
+            stderr_tail: String::new(),
+        };
+        assert!(matches!(
+            deadline_duration(Err(timeout)),
+            Err(Error::SubprocessTimeout { .. })
+        ));
+
+        let unreadable = Error::VideoProbe {
+            path,
+            detail: "unparseable ffprobe JSON".into(),
+        };
+        assert_eq!(deadline_duration(Err(unreadable)).unwrap(), None);
+        assert_eq!(deadline_duration(Ok(None)).unwrap(), None);
+        let probed = VideoProbe {
+            duration_secs: Some(12.5),
+            ..VideoProbe::default()
+        };
+        assert_eq!(deadline_duration(Ok(Some(probed))).unwrap(), Some(12.5));
+    }
+
+    /// Scene detection finds a hard cut and nothing in a single shot. Its
+    /// result is stored for good, so a lost or cut scene log would silently
+    /// degrade every video. Skips without ffmpeg.
+    #[test]
+    fn detect_scenes_finds_a_hard_cut_and_nothing_in_one_shot() {
+        let Some(ffmpeg_bin) = ffmpeg() else {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let synth = |name: &str, source: &str| {
+            let path = dir.path().join(name);
+            subprocess::run(
+                Command::new(ffmpeg_bin)
+                    .args(["-v", "error", "-f", "lavfi", "-i", source])
+                    .args(["-pix_fmt", "yuv420p"])
+                    .arg(&path),
+                &path,
+                FIXTURE_DEADLINE,
+            )
+            .expect("ffmpeg synthesises the fixture");
+            path
+        };
+
+        let cut = synth(
+            "cut.mp4",
+            "color=c=black:s=64x48:d=1:r=10[a];\
+             color=c=white:s=64x48:d=1:r=10[b];\
+             [a][b]concat=n=2:v=1:a=0",
+        );
+        let scenes = detect_scenes(&cut).unwrap().expect("ffmpeg present");
+        assert_eq!(scenes.len(), 1, "{scenes:?}");
+        assert!((scenes[0] - 1.0).abs() < 0.15, "cut at ~1s: {scenes:?}");
+
+        let still = synth("still.mp4", "color=c=gray:s=64x48:d=2:r=10");
+        let scenes = detect_scenes(&still).unwrap().expect("ffmpeg present");
+        assert!(scenes.is_empty(), "{scenes:?}");
+    }
 
     #[test]
     fn iso6709_parses_iphone_location_tag() {
@@ -685,20 +911,22 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let clip = dir.path().join("test.mp4");
-        let status = Command::new(ffmpeg_bin)
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=2:size=64x48:rate=10",
-            ])
-            .args(["-pix_fmt", "yuv420p"])
-            .arg(&clip)
-            .status()
-            .expect("run ffmpeg");
-        assert!(status.success(), "ffmpeg failed to synthesise the clip");
+        subprocess::run(
+            Command::new(ffmpeg_bin)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=2:size=64x48:rate=10",
+                ])
+                .args(["-pix_fmt", "yuv420p"])
+                .arg(&clip),
+            &clip,
+            FIXTURE_DEADLINE,
+        )
+        .expect("ffmpeg synthesises the clip");
 
         let p = probe(&clip).expect("probe").expect("ffprobe present");
         assert_eq!(p.video_codec.as_deref(), Some("h264"));
@@ -774,20 +1002,22 @@ mod tests {
 
         // HEVC source (skip quietly if this ffmpeg lacks libx265).
         let hevc = dir.path().join("clip_hevc.mp4");
-        let made_hevc = Command::new(ffmpeg_bin)
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=1:size=64x48:rate=10",
-            ])
-            .args(["-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p"])
-            .arg(&hevc)
-            .status()
-            .expect("run ffmpeg")
-            .success();
+        let made_hevc = subprocess::run(
+            Command::new(ffmpeg_bin)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=1:size=64x48:rate=10",
+                ])
+                .args(["-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p"])
+                .arg(&hevc),
+            &hevc,
+            FIXTURE_DEADLINE,
+        )
+        .is_ok();
         if made_hevc {
             let out = dir.path().join("play_hevc.mp4");
             transcode_to_playback(&hevc, &out, false)
@@ -805,7 +1035,7 @@ mod tests {
 
         // H.264 in MKV: container is the only problem, so remux.
         let h264 = dir.path().join("clip.mp4");
-        assert!(
+        subprocess::run(
             Command::new(ffmpeg_bin)
                 .args([
                     "-v",
@@ -813,26 +1043,26 @@ mod tests {
                     "-f",
                     "lavfi",
                     "-i",
-                    "testsrc=duration=1:size=64x48:rate=10"
+                    "testsrc=duration=1:size=64x48:rate=10",
                 ])
                 .args(["-pix_fmt", "yuv420p"])
-                .arg(&h264)
-                .status()
-                .expect("run ffmpeg")
-                .success()
-        );
+                .arg(&h264),
+            &h264,
+            FIXTURE_DEADLINE,
+        )
+        .expect("ffmpeg synthesises the H.264 clip");
         let mkv = dir.path().join("clip.mkv");
-        assert!(
+        subprocess::run(
             Command::new(ffmpeg_bin)
                 .args(["-v", "error"])
                 .arg("-i")
                 .arg(&h264)
                 .args(["-c", "copy"])
-                .arg(&mkv)
-                .status()
-                .expect("run ffmpeg")
-                .success()
-        );
+                .arg(&mkv),
+            &h264,
+            FIXTURE_DEADLINE,
+        )
+        .expect("ffmpeg remuxes to MKV");
         let out = dir.path().join("play_mkv.mp4");
         transcode_to_playback(&mkv, &out, true)
             .expect("remux")

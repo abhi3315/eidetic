@@ -152,20 +152,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let make = |name: &str, x_expr: &str| {
             let path = dir.path().join(name);
-            let ok = std::process::Command::new(ffmpeg)
-                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
-                // overlay re-evaluates x per frame (drawbox does not).
-                .arg(format!(
-                    "color=c=black:s=160x90:d=2:r=30[bg];\
-                     color=c=white:s=30x30:d=2:r=30[fg];\
-                     [bg][fg]overlay=x='{x_expr}':y=30"
-                ))
-                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
-                .arg(&path)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "ffmpeg could not synthesise {name}");
+            crate::subprocess::run(
+                std::process::Command::new(ffmpeg)
+                    .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                    // overlay re-evaluates x per frame (drawbox does not).
+                    .arg(format!(
+                        "color=c=black:s=160x90:d=2:r=30[bg];\
+                         color=c=white:s=30x30:d=2:r=30[fg];\
+                         [bg][fg]overlay=x='{x_expr}':y=30"
+                    ))
+                    .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                    .arg(&path),
+                &path,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap_or_else(|e| panic!("ffmpeg could not synthesise {name}: {e}"));
             path
         };
         let still = make("still.mp4", "20");

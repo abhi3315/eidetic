@@ -21,6 +21,7 @@ The decode options:
 - **Thumbnail = one frame at 10% of duration** (clamped to ≥0.5s in), piped out of ffmpeg as PNG on stdout and fed through the existing 256/1024 JPEG thumbnail path — videos and photos share the `.thumbs/` layout and the grid code.
 - **Search = frames as moments.** `eidetic embed` samples up to 5 frames per video, evenly spaced across the middle 80% of the duration, embeds each with SigLIP, and stores them in a `frame_embeddings` table: `(asset_id, ts_secs, vector)`. A video's search score is the **max over its frames** (best matching moment), so one match inside a long video is enough to surface it. The matching timestamp rides along in results — that timestamp is the reel generator's cut point.
 - **Reels reuse the same data.** `eidetic reel` is a consumer of frame_embeddings + duration metadata, not a new pipeline: search picks moments, ffmpeg cuts and concatenates.
+- **Every ffmpeg/ffprobe run has a deadline**, through `eidetic_ingest::subprocess::run`/`run_with`: short fixed deadlines for probes and single frames, budgets that grow with the media's duration for audio decodes, playback copies, scene detection and reel renders. On expiry only the direct child is killed and reaped, and the error names the program, the file, the elapsed time and the end of stderr. Preview sheets keep their own per-frame and per-sheet bounds.
 
 ## Consequences
 
@@ -37,6 +38,9 @@ The decode options:
 - 5 frames per video under-samples long multi-scene footage. Accepted: even coverage of the middle 80% catches the dominant scenes, and the sample count is a constant that can grow later without schema changes.
 - Parsing ffprobe JSON couples us to its output format. Accepted: it has been stable for a decade and is versioned by the user's ffmpeg install.
 - No hardware-accelerated decode. Irrelevant at this scale; ffmpeg flags could add it later.
+- Deadlines have no override, and a file that times out times out again on every re-run. They sit far past plausible real speeds, so only a wedged decoder or a stalled disk should reach them.
+- A timed-out scene detection stores nothing: the video falls back to even sampling and the next pass spends the scene budget on it again.
+- If `EIDETIC_FFMPEG_PATH` points at a wrapper script, a timeout kills the wrapper, not the ffmpeg it started.
 
 ## Alternatives considered
 

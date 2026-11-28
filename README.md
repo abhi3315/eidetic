@@ -91,7 +91,7 @@ All settings have sensible defaults (`~/.cache/eidetic/`). Override with environ
 | `EIDETIC_SPEECH_MODEL` | `small` | Whisper model for `eidetic transcribe` (speech builds): `base`, `small`, or `large-v3-turbo`. Transcript runs are keyed by model, so switching re-transcribes. |
 | `EIDETIC_BEAT_TRACKER` | `auto` | Beat tracker for music reels: `auto` (Beat This if built with `downbeats` and its model is already cached and verified, else Ellis; never downloads), `ellis`, or `beat-this` (downloads the pinned ~11 MB model on first use, verifies SHA-256, and errors rather than substituting Ellis). Unknown values are rejected. See [docs/beat-tracking.md](docs/beat-tracking.md). |
 | `EIDETIC_BIND` | `127.0.0.1:8080` | `eidetic serve` bind address (same as `--bind`). Non-loopback values are refused without `--expose` — the server has no authentication. |
-| `EIDETIC_FFMPEG_PATH` / `EIDETIC_FFPROBE_PATH` | found on `PATH` | Explicit ffmpeg/ffprobe binaries when they aren't on PATH. |
+| `EIDETIC_FFMPEG_PATH` / `EIDETIC_FFPROBE_PATH` | found on `PATH` | Explicit ffmpeg/ffprobe binaries when they aren't on PATH. Point them at the binaries themselves: if a run times out, only the process Eidetic started is killed, so a wrapper script would leave its ffmpeg running. |
 | `ORT_DYLIB_PATH` | _unset_ | CUDA builds only: path to an ONNX Runtime ≥ 1.27 CUDA `libonnxruntime.so` loaded at runtime ([ADR-0006](docs/adr/0006-gpu-execution-provider.md)). |
 
 Copy `.env.example` to `.env` and adjust as needed. There is no config file; env vars are the only configuration layer for now.

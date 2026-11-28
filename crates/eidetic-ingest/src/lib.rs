@@ -6,6 +6,7 @@ mod meta;
 pub mod motion;
 pub mod sharpness;
 mod store;
+pub mod subprocess;
 pub mod thumbnail;
 pub mod video;
 

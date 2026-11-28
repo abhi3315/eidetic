@@ -548,13 +548,13 @@ fn library_stats_reports_readiness_for_the_active_model_without_loading_it() {
 
 fn ffmpeg(args: &[&str]) {
     let ffmpeg = eidetic_ingest::video::ffmpeg().expect("caller checked for ffmpeg");
-    let ok = Command::new(ffmpeg)
-        .args(["-y", "-v", "error"])
-        .args(args)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "ffmpeg {args:?} failed");
+    let output = Path::new(args.last().expect("ffmpeg args end with the output"));
+    eidetic_ingest::subprocess::run(
+        Command::new(ffmpeg).args(["-y", "-v", "error"]).args(args),
+        output,
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap_or_else(|e| panic!("ffmpeg {args:?} failed: {e}"));
 }
 
 fn size_of(video: &Path) -> (i64, i64) {

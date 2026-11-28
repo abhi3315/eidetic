@@ -590,17 +590,32 @@ fn render_carries(path: &Path, id: ProjectId) -> Result<bool> {
             path.display()
         )
     })?;
-    let out = std::process::Command::new(ffprobe)
-        .args(["-v", "error", "-f", "mov"])
-        .args(["-show_entries", "format_tags=comment"])
-        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run ffprobe on {}", path.display()))?;
-    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == id.render_tag())
+    let probe = eidetic_ingest::subprocess::run(
+        std::process::Command::new(ffprobe)
+            .args(["-v", "error", "-f", "mov"])
+            .args(["-show_entries", "format_tags=comment"])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(path),
+        path,
+        OWNERSHIP_PROBE_DEADLINE,
+    );
+    match probe {
+        Ok(out) => Ok(String::from_utf8_lossy(&out.stdout).trim() == id.render_tag()),
+        // Not an mp4 ffprobe can read: not one of this project's renders.
+        Err(eidetic_ingest::Error::SubprocessFailed { .. }) => Ok(false),
+        // A probe that hangs or cannot run proves nothing; refuse the write.
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "{} already exists and could not be checked as this project's render; \
+                 nothing was written",
+                path.display()
+            )
+        }),
+    }
 }
+
+/// Reading one tag from a local file; far past any real probe.
+const OWNERSHIP_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Beat tracking backend selection (docs/beat-tracking.md).
@@ -823,7 +838,9 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         .ok_or_else(|| anyhow::anyhow!("ffmpeg is required for audio-driven reels"))?;
         let audio_len = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
         total = spec.duration.min(audio_len);
-        let pcm_for_beats = pcm.clone();
+        // Beat tracking and transcription read the same samples; share them.
+        let pcm = std::sync::Arc::new(pcm);
+        let pcm_for_beats = std::sync::Arc::clone(&pcm);
         let (track_for_beats, models_dir) = (track.clone(), config.paths.models_cache.clone());
         grid = tokio::task::spawn_blocking(move || {
             detect_beats(

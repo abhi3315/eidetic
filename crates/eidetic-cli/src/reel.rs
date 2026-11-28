@@ -19,10 +19,12 @@ use anyhow::{Context, Result, bail};
 use eidetic_core::AssetId;
 use eidetic_db::SearchResult;
 use eidetic_ingest::beats::BeatGrid;
+use eidetic_ingest::subprocess::{self, Budget};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// How much of a video is cut around the best-matching frame: 1.5s of lead-in
 /// so the moment doesn't open the clip cold, 4s total.
@@ -750,6 +752,15 @@ impl Fit {
     }
 }
 
+// Deadlines for the render passes, scaled by the seconds of video each one
+// produces. They exist to catch a wedged decoder, not as performance
+// targets, so they sit far past plausible real speeds.
+/// One segment: a large still under `-loop 1` is decoded for every frame.
+const SEGMENT_BUDGET: Budget = Budget::new(Duration::from_secs(300), 60.0);
+/// The join of all segments (a full re-encode when there are transitions).
+const JOIN_BUDGET: Budget = Budget::new(Duration::from_secs(300), 30.0);
+/// Laying the track under the joined video (video stream copied).
+const MUX_BUDGET: Budget = Budget::new(Duration::from_secs(120), 5.0);
 /// What a render stamps into its output, and what must still hold before
 /// the output is replaced.
 #[derive(Default)]
@@ -804,7 +815,7 @@ pub fn render(
         // `fade` secs past its out-point — the media the joint consumes.
         // Clamped to what exists there; near-zero falls back to a hard cut.
         let fade = match slots.get(i + 1).map(|n| n.transition_in.secs()) {
-            Some(secs) if secs > 0.0 => extendable_secs(ffmpeg, slot, secs),
+            Some(secs) if secs > 0.0 => extendable_secs(slot, secs),
             _ => 0.0,
         };
         let seg_path = workdir.path().join(format!("seg_{i:03}.mp4"));
@@ -840,18 +851,19 @@ pub fn render(
                 cmd.args(["-loop", "1"]);
             }
         }
-        let status = cmd
-            .arg("-i")
+        cmd.arg("-i")
             .arg(&slot.source)
             .args(["-t", &format!("{rendered:.3}")])
             .args(["-vf", &vf])
             .args(["-an", "-c:v", "libx264", "-preset", "veryfast"])
-            .arg(&seg_path)
-            .status()
-            .context("run ffmpeg for a segment")?;
-        if !status.success() {
-            bail!("ffmpeg failed on segment {}: {}", i + 1, slot.describe());
-        }
+            .arg(&seg_path);
+        let done = subprocess::run(
+            &mut cmd,
+            &slot.source,
+            SEGMENT_BUDGET.deadline(Some(rendered)),
+        )
+        .with_context(|| format!("ffmpeg failed on segment {}: {}", i + 1, slot.describe()))?;
+        note_stderr("segment", &done.stderr);
         seg_paths.push((seg_path, fade));
     }
 
@@ -860,6 +872,7 @@ pub fn render(
         None => staged.clone(),
         Some(_) => workdir.path().join("silent.mp4"),
     };
+    let join_deadline = JOIN_BUDGET.deadline(Some(total));
     // Every ffmpeg run that can write `staged` sets the tag; on the silent
     // intermediate it is harmless.
     let tag: Vec<String> = publish
@@ -867,34 +880,43 @@ pub fn render(
         .map(|t| vec!["-metadata".into(), format!("comment={t}")])
         .unwrap_or_default();
     if seg_paths.iter().all(|(_, fade)| *fade == 0.0) {
-        concat_copy(ffmpeg, &seg_paths, workdir.path(), &tag, &silent)?;
+        concat_copy(
+            ffmpeg,
+            &seg_paths,
+            workdir.path(),
+            &tag,
+            &silent,
+            join_deadline,
+        )?;
     } else {
-        xfade_chain(ffmpeg, &seg_paths, slots, &tag, &silent)?;
+        xfade_chain(ffmpeg, &seg_paths, slots, &tag, &silent, join_deadline)?;
     }
 
     if let Some(track) = audio {
         let fade_start = (total - 1.0).max(0.0);
-        let status = Command::new(ffmpeg)
-            .args(["-y", "-v", "error"])
-            .arg("-i")
-            .arg(&silent)
-            .arg("-i")
-            .arg(track)
-            .args(["-map", "0:v", "-map", "1:a", "-c:v", "copy"])
-            .args(["-c:a", "aac", "-b:a", "192k"])
-            .args([
-                "-af",
-                &format!("afade=t=out:st={fade_start:.3}:d=1"),
-                "-t",
-                &format!("{total:.3}"),
-            ])
-            .args(&tag)
-            .arg(&staged)
-            .status()
-            .context("run ffmpeg audio mux")?;
-        if !status.success() {
-            bail!("ffmpeg audio mux failed");
-        }
+        let done = subprocess::run(
+            Command::new(ffmpeg)
+                .args(["-y", "-v", "error"])
+                .arg("-i")
+                .arg(&silent)
+                .arg("-i")
+                .arg(track)
+                .args(["-map", "0:v", "-map", "1:a", "-c:v", "copy"])
+                .args(["-c:a", "aac", "-b:a", "192k"])
+                .args([
+                    "-af",
+                    &format!("afade=t=out:st={fade_start:.3}:d=1"),
+                    "-t",
+                    &format!("{total:.3}"),
+                ])
+                .args(&tag)
+                .arg(&staged),
+            // A bad track is the usual reason this pass fails.
+            track,
+            MUX_BUDGET.deadline(Some(total)),
+        )
+        .context("ffmpeg audio mux failed")?;
+        note_stderr("audio mux", &done.stderr);
     }
     if let Some(check) = publish.check {
         check()?;
@@ -911,6 +933,7 @@ fn concat_copy(
     workdir: &Path,
     extra: &[String],
     output: &Path,
+    deadline: Duration,
 ) -> Result<()> {
     let mut list = String::new();
     for (p, _) in seg_paths {
@@ -922,18 +945,19 @@ fn concat_copy(
     }
     let list_path = workdir.join("concat.txt");
     std::fs::write(&list_path, list).context("write concat list")?;
-    let status = Command::new(ffmpeg)
-        .args(["-y", "-v", "error", "-f", "concat", "-safe", "0"])
-        .arg("-i")
-        .arg(&list_path)
-        .args(["-c", "copy"])
-        .args(extra)
-        .arg(output)
-        .status()
-        .context("run ffmpeg concat")?;
-    if !status.success() {
-        bail!("ffmpeg concat failed");
-    }
+    let done = subprocess::run(
+        Command::new(ffmpeg)
+            .args(["-y", "-v", "error", "-f", "concat", "-safe", "0"])
+            .arg("-i")
+            .arg(&list_path)
+            .args(["-c", "copy"])
+            .args(extra)
+            .arg(output),
+        output,
+        deadline,
+    )
+    .context("ffmpeg concat failed")?;
+    note_stderr("concat", &done.stderr);
     Ok(())
 }
 
@@ -950,6 +974,7 @@ fn xfade_chain(
     slots: &[Slot],
     extra: &[String],
     output: &Path,
+    deadline: Duration,
 ) -> Result<()> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-y", "-v", "error"]);
@@ -980,38 +1005,40 @@ fn xfade_chain(
         acc = out;
     }
     graph.pop(); // trailing ';'
-    let status = cmd
-        .args(["-filter_complex", &graph])
+    cmd.args(["-filter_complex", &graph])
         .args(["-map", &format!("[{acc}]")])
         .args(["-c:v", "libx264", "-preset", "veryfast"])
         .args(extra)
-        .arg(output)
-        .status()
-        .context("run ffmpeg transition chain")?;
-    if !status.success() {
-        bail!("ffmpeg transition chain failed");
-    }
+        .arg(output);
+    let done =
+        subprocess::run(&mut cmd, output, deadline).context("ffmpeg transition chain failed")?;
+    note_stderr("transition chain", &done.stderr);
     Ok(())
+}
+
+/// Print what a successful pass reported at `-v error` (its last stretch,
+/// once the pass ends), so problems ffmpeg recovered from stay visible.
+fn note_stderr(pass: &str, stderr: &[u8]) {
+    if !stderr.trim_ascii().is_empty() {
+        eprintln!("ffmpeg {pass}: {}", subprocess::stderr_tail(stderr));
+    }
 }
 
 /// How many seconds past its out-point `slot` can actually extend, capped
 /// at `want`. Photos loop forever; videos are probed (a project file may
 /// have been retimed by hand since planning). Under 0.15s a dissolve reads
 /// as a glitch, so it degrades to a cut (0.0).
-fn extendable_secs(ffmpeg: &Path, slot: &Slot, want: f64) -> f64 {
+fn extendable_secs(slot: &Slot, want: f64) -> f64 {
     let avail = match slot.kind {
         SlotKind::Photo | SlotKind::PhotoScenic => want,
-        SlotKind::Video => {
-            let _ = ffmpeg; // probing uses ffprobe, located independently
-            match eidetic_ingest::video::probe(&slot.source) {
-                Ok(Some(p)) => p
-                    .duration_secs
-                    .map(|d| (d - slot.start - slot.duration).max(0.0))
-                    .unwrap_or(0.0)
-                    .min(want),
-                _ => 0.0,
-            }
-        }
+        SlotKind::Video => match eidetic_ingest::video::probe(&slot.source) {
+            Ok(Some(p)) => p
+                .duration_secs
+                .map(|d| (d - slot.start - slot.duration).max(0.0))
+                .unwrap_or(0.0)
+                .min(want),
+            _ => 0.0,
+        },
     };
     if avail < 0.15 { 0.0 } else { avail }
 }
@@ -2400,22 +2427,23 @@ mod tests {
     fn synthetic_photo(dir: &Path) -> Option<PathBuf> {
         let ffmpeg = eidetic_ingest::video::ffmpeg()?;
         let path = dir.join("red.png");
-        let ok = Command::new(ffmpeg)
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=red:s=64x36",
-            ])
-            .args(["-frames:v", "1"])
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "ffmpeg could not make a synthetic photo");
+        subprocess::run(
+            Command::new(ffmpeg)
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=red:s=64x36",
+                ])
+                .args(["-frames:v", "1"])
+                .arg(&path),
+            &path,
+            Duration::from_secs(60),
+        )
+        .expect("ffmpeg makes a synthetic photo");
         Some(path)
     }
 
@@ -2473,18 +2501,19 @@ mod tests {
         // the output file exists. Writing straight to `output` with -y
         // truncated the previous reel here.
         let track = media.path().join("sixteen.wav");
-        let ok = Command::new(eidetic_ingest::video::ffmpeg().unwrap())
-            .args(["-y", "-v", "error", "-f", "lavfi"])
-            .args([
-                "-i",
-                "anullsrc=channel_layout=hexadecagonal:sample_rate=48000",
-            ])
-            .args(["-t", "1"])
-            .arg(&track)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "ffmpeg could not make a synthetic 16-channel track");
+        subprocess::run(
+            Command::new(eidetic_ingest::video::ffmpeg().unwrap())
+                .args(["-y", "-v", "error", "-f", "lavfi"])
+                .args([
+                    "-i",
+                    "anullsrc=channel_layout=hexadecagonal:sample_rate=48000",
+                ])
+                .args(["-t", "1"])
+                .arg(&track),
+            &track,
+            Duration::from_secs(60),
+        )
+        .expect("ffmpeg makes a synthetic 16-channel track");
         let slots = vec![photo_slot(photo.clone()), photo_slot(photo.clone())];
         let err = render(&slots, &output, 64, 36, Fit::Blur, Some(&track), &untagged).unwrap_err();
         assert!(err.to_string().contains("audio mux"), "{err:#}");
