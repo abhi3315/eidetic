@@ -750,14 +750,25 @@ impl Fit {
     }
 }
 
+/// What a render stamps into its output, and what must still hold before
+/// the output is replaced.
+#[derive(Default)]
+pub struct Publish<'a> {
+    /// Written as the mp4 `comment` tag.
+    pub tag: Option<&'a str>,
+    /// Run just before the finished render is renamed over `output`; an
+    /// error leaves `output` untouched and removes the staged file.
+    pub check: Option<&'a (dyn Fn() -> Result<()> + Send + Sync)>,
+}
+
 /// Render the cut list to `output` at `width`x`height`, 30fps, H.264. With
 /// `audio`, the track is laid under the cut, trimmed to the reel length
 /// with a one-second fade-out.
 ///
-/// `output` is only replaced once every ffmpeg step has succeeded: the
-/// final encode lands in a staging directory beside it and is renamed into
-/// place, so a failed render leaves any previous file at `output` intact
-/// and, on ordinary errors, no partial file behind.
+/// `output` is only replaced once every ffmpeg step and `publish.check`
+/// have succeeded: the final encode lands in a staging directory beside it
+/// and is renamed into place, so a failed render leaves any previous file
+/// at `output` intact and, on ordinary errors, no partial file behind.
 pub fn render(
     slots: &[Slot],
     output: &Path,
@@ -765,6 +776,7 @@ pub fn render(
     height: u32,
     fit: Fit,
     audio: Option<&Path>,
+    publish: &Publish<'_>,
 ) -> Result<()> {
     let Some(ffmpeg) = eidetic_ingest::video::ffmpeg() else {
         bail!("ffmpeg not found; install it (or set EIDETIC_FFMPEG_PATH) to render reels");
@@ -848,10 +860,16 @@ pub fn render(
         None => staged.clone(),
         Some(_) => workdir.path().join("silent.mp4"),
     };
+    // Every ffmpeg run that can write `staged` sets the tag; on the silent
+    // intermediate it is harmless.
+    let tag: Vec<String> = publish
+        .tag
+        .map(|t| vec!["-metadata".into(), format!("comment={t}")])
+        .unwrap_or_default();
     if seg_paths.iter().all(|(_, fade)| *fade == 0.0) {
-        concat_copy(ffmpeg, &seg_paths, workdir.path(), &silent)?;
+        concat_copy(ffmpeg, &seg_paths, workdir.path(), &tag, &silent)?;
     } else {
-        xfade_chain(ffmpeg, &seg_paths, slots, &silent)?;
+        xfade_chain(ffmpeg, &seg_paths, slots, &tag, &silent)?;
     }
 
     if let Some(track) = audio {
@@ -870,12 +888,16 @@ pub fn render(
                 "-t",
                 &format!("{total:.3}"),
             ])
+            .args(&tag)
             .arg(&staged)
             .status()
             .context("run ffmpeg audio mux")?;
         if !status.success() {
             bail!("ffmpeg audio mux failed");
         }
+    }
+    if let Some(check) = publish.check {
+        check()?;
     }
     std::fs::rename(&staged, output)
         .with_context(|| format!("failed to publish the render to {}", output.display()))?;
@@ -887,6 +909,7 @@ fn concat_copy(
     ffmpeg: &Path,
     seg_paths: &[(PathBuf, f64)],
     workdir: &Path,
+    extra: &[String],
     output: &Path,
 ) -> Result<()> {
     let mut list = String::new();
@@ -904,6 +927,7 @@ fn concat_copy(
         .arg("-i")
         .arg(&list_path)
         .args(["-c", "copy"])
+        .args(extra)
         .arg(output)
         .status()
         .context("run ffmpeg concat")?;
@@ -924,6 +948,7 @@ fn xfade_chain(
     ffmpeg: &Path,
     seg_paths: &[(PathBuf, f64)],
     slots: &[Slot],
+    extra: &[String],
     output: &Path,
 ) -> Result<()> {
     let mut cmd = Command::new(ffmpeg);
@@ -959,6 +984,7 @@ fn xfade_chain(
         .args(["-filter_complex", &graph])
         .args(["-map", &format!("[{acc}]")])
         .args(["-c:v", "libx264", "-preset", "veryfast"])
+        .args(extra)
         .arg(output)
         .status()
         .context("run ffmpeg transition chain")?;
@@ -2432,11 +2458,12 @@ mod tests {
 
         // Failure mid-pipeline (the second segment's source is gone): the
         // previous file survives byte for byte and nothing is left beside it.
+        let untagged = Publish::default();
         let slots = vec![
             photo_slot(photo.clone()),
             photo_slot(media.path().join("missing.png")),
         ];
-        let err = render(&slots, &output, 64, 36, Fit::Blur, None).unwrap_err();
+        let err = render(&slots, &output, 64, 36, Fit::Blur, None, &untagged).unwrap_err();
         assert!(err.to_string().contains("segment 2"), "{err:#}");
         assert_eq!(std::fs::read(&output).unwrap(), b"previous reel");
         assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
@@ -2459,17 +2486,86 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not make a synthetic 16-channel track");
         let slots = vec![photo_slot(photo.clone()), photo_slot(photo.clone())];
-        let err = render(&slots, &output, 64, 36, Fit::Blur, Some(&track)).unwrap_err();
+        let err = render(&slots, &output, 64, 36, Fit::Blur, Some(&track), &untagged).unwrap_err();
         assert!(err.to_string().contains("audio mux"), "{err:#}");
         assert_eq!(std::fs::read(&output).unwrap(), b"previous reel");
         assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
 
+        // A refusing publish check, after every ffmpeg step succeeded: the
+        // finished render is dropped with its staging dir.
+        let refuse = || -> Result<()> { bail!("not yours") };
+        let vetoed = Publish {
+            tag: None,
+            check: Some(&refuse),
+        };
+        let err = render(&slots, &output, 64, 36, Fit::Blur, None, &vetoed).unwrap_err();
+        assert!(err.to_string().contains("not yours"), "{err:#}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous reel");
+        assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
+
         // Success publishes a real video over it, again without litter.
-        render(&slots, &output, 64, 36, Fit::Blur, None).unwrap();
+        render(&slots, &output, 64, 36, Fit::Blur, None, &untagged).unwrap();
         let probe = eidetic_ingest::video::probe(&output)
             .unwrap()
             .expect("ffprobe ships with ffmpeg");
         assert!(probe.duration_secs.unwrap_or(0.0) > 0.5, "{probe:?}");
         assert_eq!(names(out_dir.path()), vec!["reel.mp4"]);
+    }
+
+    /// The comment tag ffprobe reads back from `video`.
+    fn comment(video: &Path) -> String {
+        let out = Command::new(eidetic_ingest::video::ffprobe().expect("ships with ffmpeg"))
+            .args(["-v", "error", "-show_entries", "format_tags=comment"])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(video)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn every_final_encode_carries_the_tag() {
+        let media = tempfile::tempdir().unwrap();
+        let Some(photo) = synthetic_photo(media.path()) else {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        };
+        let track = media.path().join("tone.wav");
+        let ok = Command::new(eidetic_ingest::video::ffmpeg().unwrap())
+            .args(["-y", "-v", "error", "-f", "lavfi"])
+            .args(["-i", "sine=frequency=440:duration=2"])
+            .arg(&track)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "ffmpeg could not make a synthetic track");
+        let tagged = Publish {
+            tag: Some("eidetic-project:test"),
+            check: None,
+        };
+        let cut = vec![photo_slot(photo.clone()), photo_slot(photo.clone())];
+        let mut fade = cut.clone();
+        fade[1].transition_in = Transition::Crossfade { secs: 0.2 };
+        let out = media.path().join("reel.mp4");
+        // Concat copy, the transition chain, and the audio mux over each.
+        for (slots, audio) in [
+            (&cut, None),
+            (&fade, None),
+            (&cut, Some(&track)),
+            (&fade, Some(&track)),
+        ] {
+            std::fs::remove_file(&out).ok();
+            render(
+                slots,
+                &out,
+                64,
+                36,
+                Fit::Blur,
+                audio.map(PathBuf::as_path),
+                &tagged,
+            )
+            .unwrap();
+            assert_eq!(comment(&out), "eidetic-project:test", "audio {audio:?}");
+        }
     }
 }
