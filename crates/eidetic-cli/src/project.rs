@@ -516,7 +516,9 @@ pub async fn plan_projects(spec: &ReelSpec, config: &Config) -> Result<Vec<ReelP
         .ok_or_else(|| anyhow::anyhow!("ffmpeg is required for audio-driven reels"))?;
         let audio_len = pcm.len() as f64 / eidetic_ingest::beats::SAMPLE_RATE;
         total = spec.duration.min(audio_len);
-        let pcm_for_beats = pcm.clone();
+        // Beat tracking and transcription read the same samples; share them.
+        let pcm = std::sync::Arc::new(pcm);
+        let pcm_for_beats = std::sync::Arc::clone(&pcm);
         let (track_for_beats, models_dir) = (track.clone(), config.paths.models_cache.clone());
         grid = tokio::task::spawn_blocking(move || {
             detect_beats(
