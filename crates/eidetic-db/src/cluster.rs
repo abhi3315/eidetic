@@ -79,6 +79,20 @@ impl Constraints {
     fn rejects(&self, face: FaceId, person: PersonId) -> bool {
         self.rejected.contains(&(face, person))
     }
+
+    /// Every face the user says is a different person from `face`. A linear
+    /// scan: links are made by hand and stay few.
+    fn forbidden_partners(&self, face: FaceId) -> impl Iterator<Item = FaceId> + '_ {
+        self.must_not_link.iter().filter_map(move |&(a, b)| {
+            if a == face {
+                Some(b)
+            } else if b == face {
+                Some(a)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// Canonical ordering so a pair is the same key either way round.
@@ -145,17 +159,27 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// Try to attach one face to an existing person.
 ///
 /// Returns the closest person within `attach_distance` that the user has not
-/// rejected for this face, or `None` to leave the face for the periodic pass.
-pub fn assign_to_existing<F: Face>(
+/// rejected for this face and that holds no face it must not be linked with,
+/// or `None` to leave the face for the periodic pass. `members` maps every
+/// attributed face to its person, exemplar or not: exemplars carry no face
+/// ids, so membership is the only way to see who belongs to whom. A person
+/// skipped for either reason does not stop the face joining the next-nearest
+/// allowed one.
+fn assign_to_existing<F: Face>(
     face: &F,
     people: &[PersonExemplars],
+    members: &HashMap<FaceId, PersonId>,
     constraints: &Constraints,
     params: &ClusterParams,
 ) -> Option<PersonId> {
+    let blocked: HashSet<PersonId> = constraints
+        .forbidden_partners(face.face_id())
+        .filter_map(|partner| members.get(&partner).copied())
+        .collect();
     let mut best: Option<(PersonId, f32)> = None;
 
     for person in people {
-        if constraints.rejects(face.face_id(), person.person) {
+        if constraints.rejects(face.face_id(), person.person) || blocked.contains(&person.person) {
             continue;
         }
         // Distance to a person is distance to their *nearest* exemplar, not to
@@ -176,6 +200,37 @@ pub fn assign_to_existing<F: Face>(
     }
 
     best.map(|(p, _)| p)
+}
+
+/// Try to attach each face of a batch to an existing person, in order.
+///
+/// Returns one entry per input face: the closest person within
+/// `attach_distance` that the user has not rejected for that face and that
+/// holds no face it must not be linked with, or `None` to leave the face for
+/// the periodic pass. `members` maps every attributed face to its person,
+/// exemplar or not. Each attachment counts as a member for
+/// the faces after it, so two faces the user split can never both join the
+/// same person in one run; exemplars stay fixed for the whole batch. The
+/// result therefore depends on input order, and `unassigned` must hold only
+/// faces with no person yet.
+pub fn assign_all_to_existing<F: Face>(
+    unassigned: &[F],
+    people: &[PersonExemplars],
+    members: impl IntoIterator<Item = (FaceId, PersonId)>,
+    constraints: &Constraints,
+    params: &ClusterParams,
+) -> Vec<Option<PersonId>> {
+    let mut members: HashMap<FaceId, PersonId> = members.into_iter().collect();
+    unassigned
+        .iter()
+        .map(|face| {
+            let pick = assign_to_existing(face, people, &members, constraints, params);
+            if let Some(person) = pick {
+                members.insert(face.face_id(), person);
+            }
+            pick
+        })
+        .collect()
 }
 
 /// A proposed new person.
@@ -468,7 +523,7 @@ impl Lcg {
     }
 }
 
-/// Fingerprint of everything a clustering run's outcome depends on.
+/// Fingerprint of a clustering run's inputs.
 ///
 /// Clustering is deterministic (fixed-seed shuffle, stable orderings), so
 /// identical inputs give identical output — and the periodic pass is the
@@ -476,6 +531,11 @@ impl Lcg {
 /// next run when it matches: repeated `eidetic faces` over an unchanged
 /// library costs nothing, while any new face, assignment, pin, constraint,
 /// parameter or model change re-runs everything.
+///
+/// Only the active model's faces are hashed. Attachment also consults members
+/// embedded by other models (for must-not-link), so a change confined to those
+/// rows does not trigger a run; at worst that leaves a face unattached, never
+/// in a person it was split from.
 ///
 /// Embeddings are deliberately not hashed: a face row's vector is written
 /// once at detection and never mutated, so the face id (plus `model_id` for
@@ -759,6 +819,7 @@ mod tests {
         let got = assign_to_existing(
             &f,
             &people,
+            &HashMap::new(),
             &Constraints::default(),
             &ClusterParams::default(),
         );
@@ -777,6 +838,7 @@ mod tests {
             assign_to_existing(
                 &f,
                 &people,
+                &HashMap::new(),
                 &Constraints::default(),
                 &ClusterParams::default()
             )
@@ -799,6 +861,7 @@ mod tests {
             assign_to_existing(
                 &f,
                 &people,
+                &HashMap::new(),
                 &Constraints::default(),
                 &ClusterParams::default()
             ),
@@ -807,7 +870,14 @@ mod tests {
 
         let constraints = Constraints::new(vec![(f.face_id(), alice)], vec![], vec![]);
         assert!(
-            assign_to_existing(&f, &people, &constraints, &ClusterParams::default()).is_none(),
+            assign_to_existing(
+                &f,
+                &people,
+                &HashMap::new(),
+                &constraints,
+                &ClusterParams::default()
+            )
+            .is_none(),
             "a rejected pairing must not be re-proposed"
         );
     }
@@ -834,10 +904,155 @@ mod tests {
             assign_to_existing(
                 &f,
                 &people,
+                &HashMap::new(),
                 &Constraints::default(),
                 &ClusterParams::default()
             ),
             Some(person)
+        );
+    }
+
+    /// P with one exemplar on `[1,0,0]`, plus Q with one exemplar on `q` when
+    /// given. A face near `[1,0.05,0]` sits ~0.001 from P and ~0.26 from
+    /// `q = [1,1,0]`: both within the default 0.5 attach distance, P nearer.
+    fn p_and_q(q: Option<[f32; 3]>) -> (PersonId, PersonId, Vec<PersonExemplars>) {
+        let p = PersonId::new();
+        let q_id = PersonId::new();
+        let mut people = vec![PersonExemplars {
+            person: p,
+            exemplars: vec![normalize(vec![1.0, 0.0, 0.0])],
+        }];
+        if let Some(q) = q {
+            people.push(PersonExemplars {
+                person: q_id,
+                exemplars: vec![normalize(q.to_vec())],
+            });
+        }
+        (p, q_id, people)
+    }
+
+    fn split(a: FaceId, b: FaceId) -> Constraints {
+        Constraints::new(vec![], vec![], vec![(a, b)])
+    }
+
+    #[test]
+    fn assign_to_existing_skips_a_person_holding_a_forbidden_member() {
+        // A belongs to P without being one of its exemplars (a video face, say).
+        let (p, _, people) = p_and_q(None);
+        let a = FaceId::new();
+        let members = HashMap::from([(a, p)]);
+        let b = face(vec![1.0, 0.05, 0.0]);
+        let params = ClusterParams::default();
+
+        assert_eq!(
+            assign_to_existing(&b, &people, &members, &Constraints::default(), &params),
+            Some(p),
+            "without the split, B joins P"
+        );
+        assert_eq!(
+            assign_to_existing(&b, &people, &members, &split(a, b.face_id()), &params),
+            None,
+            "B must not join the person holding A"
+        );
+    }
+
+    #[test]
+    fn assign_to_existing_blocked_face_falls_back_to_next_nearest() {
+        let a = FaceId::new();
+        let b = face(vec![1.0, 0.05, 0.0]);
+        let params = ClusterParams::default();
+
+        let (p, q, people) = p_and_q(Some([1.0, 1.0, 0.0]));
+        let members = HashMap::from([(a, p)]);
+        assert_eq!(
+            assign_to_existing(&b, &people, &members, &split(a, b.face_id()), &params),
+            Some(q)
+        );
+
+        // Q exists but is beyond attach_distance: nothing allowed is close.
+        let (p, _, people) = p_and_q(Some([0.0, 1.0, 0.0]));
+        let members = HashMap::from([(a, p)]);
+        assert_eq!(
+            assign_to_existing(&b, &people, &members, &split(a, b.face_id()), &params),
+            None
+        );
+    }
+
+    #[test]
+    fn assign_to_existing_unrelated_must_not_link_does_not_block() {
+        let (p, _, mut people) = p_and_q(Some([1.0, 1.0, 0.0]));
+        let r = PersonId::new();
+        people.push(PersonExemplars {
+            person: r,
+            exemplars: vec![normalize(vec![0.0, 0.0, 1.0])],
+        });
+        let b = face(vec![1.0, 0.05, 0.0]);
+        let params = ClusterParams::default();
+
+        // Partner has no person at all.
+        let loose = FaceId::new();
+        assert_eq!(
+            assign_to_existing(
+                &b,
+                &people,
+                &HashMap::new(),
+                &split(loose, b.face_id()),
+                &params
+            ),
+            Some(p)
+        );
+
+        // Partner belongs to a far-away person B was never going to join.
+        let r1 = FaceId::new();
+        let members = HashMap::from([(r1, r)]);
+        assert_eq!(
+            assign_to_existing(&b, &people, &members, &split(r1, b.face_id()), &params),
+            Some(p)
+        );
+    }
+
+    #[test]
+    fn assign_all_to_existing_counts_faces_attached_earlier_in_the_run() {
+        let c1 = face(vec![1.0, 0.05, 0.0]);
+        let c2 = face(vec![1.0, 0.03, 0.0]);
+        let constraints = split(c1.face_id(), c2.face_id());
+        let params = ClusterParams::default();
+
+        let (p, q, people) = p_and_q(Some([1.0, 1.0, 0.0]));
+        assert_eq!(
+            assign_all_to_existing(&[&c1, &c2], &people, [], &constraints, &params),
+            vec![Some(p), Some(q)]
+        );
+        assert_eq!(
+            assign_all_to_existing(&[&c2, &c1], &people, [], &constraints, &params),
+            vec![Some(p), Some(q)],
+            "whichever comes first takes the nearer person"
+        );
+
+        let (p, _, people) = p_and_q(None);
+        assert_eq!(
+            assign_all_to_existing(&[&c1, &c2], &people, [], &constraints, &params),
+            vec![Some(p), None]
+        );
+    }
+
+    #[test]
+    fn assign_all_to_existing_keeps_rejections_and_plain_nearest() {
+        let (p, q, people) = p_and_q(Some([1.0, 1.0, 0.0]));
+        let rejected = face(vec![1.0, 0.05, 0.0]);
+        let plain = face(vec![1.0, 0.04, 0.0]);
+        let existing = FaceId::new();
+        let constraints = Constraints::new(vec![(rejected.face_id(), p)], vec![], vec![]);
+
+        assert_eq!(
+            assign_all_to_existing(
+                &[&rejected, &plain],
+                &people,
+                [(existing, p)],
+                &constraints,
+                &ClusterParams::default()
+            ),
+            vec![Some(q), Some(p)]
         );
     }
 

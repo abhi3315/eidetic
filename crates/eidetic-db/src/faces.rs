@@ -344,6 +344,24 @@ impl FacesRepo {
             .collect()
     }
 
+    /// Every face attributed to a person, as `(face, person)`, pinned or not.
+    ///
+    /// Not filtered by recognition model or by having an embedding, unlike
+    /// [`Self::fetch_embeddings`]: a must-not-link is about who a face is, not
+    /// about its vector, so a member embedded by an older model still keeps a
+    /// forbidden face out of its person.
+    pub async fn fetch_face_persons(&self) -> crate::Result<Vec<(FaceId, PersonId)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, person_id FROM faces WHERE person_id IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(crate::Error::Query)?;
+        Ok(rows
+            .into_iter()
+            .map(|(f, p)| (FaceId::from(parse_uuid(&f)), PersonId::from(parse_uuid(&p))))
+            .collect())
+    }
+
     /// Fingerprint of the last completed clustering run, if any.
     pub async fn fetch_cluster_fingerprint(&self) -> crate::Result<Option<String>> {
         let row: Option<(String,)> =

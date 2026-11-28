@@ -2291,7 +2291,9 @@ struct ClusterSummary {
 ///
 /// Phase 1 first is deliberate: extending a known person is cheaper and more
 /// reliable than inventing one, and it stops a new candidate being created for
-/// someone who is already named.
+/// someone who is already named. Phase 1 honours must-not-link against every
+/// member of a person (exemplar or not, any model, photo or video) and against
+/// faces attached earlier in the same run.
 ///
 /// Faces the user has pinned are never touched — the repo enforces that in SQL,
 /// and they are also skipped here so they cannot be counted as work.
@@ -2375,11 +2377,21 @@ async fn cluster_faces(repo: &eidetic_db::FacesRepo) -> anyhow::Result<ClusterSu
         })
         .collect();
 
-    // Phase 1: offer unassigned faces to existing people.
+    // Phase 1: offer unassigned faces to existing people. Membership is read
+    // across every model and source, not just `all`, so a split face is kept
+    // out of any person holding its partner.
+    let members = repo
+        .fetch_face_persons()
+        .await
+        .context("failed to load face memberships")?;
+    let unassigned: Vec<&eidetic_db::FaceEmbedding> =
+        all.iter().filter(|f| f.person_id.is_none()).collect();
+    let picks =
+        cluster::assign_all_to_existing(&unassigned, &people, members, &constraints, &params);
     let mut attached = 0usize;
     let mut still_unassigned = Vec::new();
-    for face in all.iter().filter(|f| f.person_id.is_none()) {
-        match cluster::assign_to_existing(face, &people, &constraints, &params) {
+    for (face, pick) in unassigned.into_iter().zip(picks) {
+        match pick {
             Some(person) => {
                 repo.assign_face(face.id, person, false)
                     .await
