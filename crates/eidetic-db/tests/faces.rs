@@ -373,6 +373,68 @@ async fn unassigned_only_filter_excludes_assigned_faces() {
 }
 
 #[tokio::test]
+async fn fetch_face_persons_lists_every_attributed_face() {
+    let (_tmp, assets, faces) = setup().await;
+    let photo_asset = insert_asset(&assets, 9).await;
+    let video_asset = insert_asset(&assets, 10).await;
+    let old_model_asset = insert_asset(&assets, 11).await;
+
+    let photo = faces
+        .record_detection(
+            photo_asset,
+            &[
+                face(photo_asset, vec![1.0, 0.0]),
+                face(photo_asset, vec![0.0, 1.0]),
+                face(photo_asset, vec![0.6, 0.8]),
+            ],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
+        .await
+        .expect("record photo");
+    let (photo_face, pinned_face, loose_face) = (photo[0], photo[1], photo[2]);
+    let video_face = faces
+        .record_detection(
+            video_asset,
+            &[NewFace {
+                ts_secs: Some(1.5),
+                ..face(video_asset, vec![1.0, 0.0])
+            }],
+            "yunet-2023mar",
+            "auraface-v1",
+        )
+        .await
+        .expect("record video")[0];
+    let old_model_face = faces
+        .record_detection(
+            old_model_asset,
+            &[face(old_model_asset, vec![1.0, 0.0])],
+            "yunet-2023mar",
+            "sface-2021dec",
+        )
+        .await
+        .expect("record other model")[0];
+
+    let p = faces.create_person().await.expect("p");
+    let q = faces.create_person().await.expect("q");
+    for (f, person) in [(photo_face, p), (video_face, p), (old_model_face, q)] {
+        faces.assign_face(f, person, false).await.expect("assign");
+    }
+    faces.assign_face(pinned_face, q, true).await.expect("pin");
+
+    let mut got = faces.fetch_face_persons().await.expect("members");
+    got.sort_by_key(|(f, _)| f.as_uuid());
+    let mut want = vec![
+        (photo_face, p),
+        (video_face, p),
+        (old_model_face, q),
+        (pinned_face, q),
+    ];
+    want.sort_by_key(|(f, _)| f.as_uuid());
+    assert_eq!(got, want, "unassigned {loose_face} must not be listed");
+}
+
+#[tokio::test]
 async fn links_are_stored_symmetrically_and_split_by_kind() {
     let (_tmp, assets, faces) = setup().await;
     let asset = insert_asset(&assets, 9).await;
