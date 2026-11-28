@@ -194,7 +194,8 @@ fn cluster_only_keeps_split_faces_out_of_their_partners_person() {
         }
         faces.assign_face(pinned, p, true).await.expect("pin to p");
 
-        // Q: further from every candidate than P, but within attach distance.
+        // Q: further than P from the candidates near P, but within their
+        // attach distance.
         let q = faces.create_person().await.expect("q");
         let q1 = seed.face([1.0, 1.0, 0.0], false, EMBEDDER).await;
         faces.assign_face(q1, q, false).await.expect("assign to q");
@@ -211,6 +212,7 @@ fn cluster_only_keeps_split_faces_out_of_their_partners_person() {
         let c2 = seed.face(near_p(0.03), false, EMBEDDER).await;
         let d = seed.face(near_p(0.02), false, EMBEDDER).await;
         let j = seed.face(near_p(0.05), false, EMBEDDER).await;
+        // G: nearest R, beyond attach distance of both P and Q.
         let g = seed.face([0.0, 0.05, 1.0], false, EMBEDDER).await;
 
         faces.set_link(b, a_video, false).await.expect("split b");

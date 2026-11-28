@@ -165,7 +165,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// ids, so membership is the only way to see who belongs to whom. A person
 /// skipped for either reason does not stop the face joining the next-nearest
 /// allowed one.
-pub fn assign_to_existing<F: Face>(
+fn assign_to_existing<F: Face>(
     face: &F,
     people: &[PersonExemplars],
     members: &HashMap<FaceId, PersonId>,
@@ -202,9 +202,13 @@ pub fn assign_to_existing<F: Face>(
     best.map(|(p, _)| p)
 }
 
-/// Run [`assign_to_existing`] over a batch of unassigned faces, in order.
+/// Try to attach each face of a batch to an existing person, in order.
 ///
-/// Returns one entry per input face. Each attachment counts as a member for
+/// Returns one entry per input face: the closest person within
+/// `attach_distance` that the user has not rejected for that face and that
+/// holds no face it must not be linked with, or `None` to leave the face for
+/// the periodic pass. `members` maps every attributed face to its person,
+/// exemplar or not. Each attachment counts as a member for
 /// the faces after it, so two faces the user split can never both join the
 /// same person in one run; exemplars stay fixed for the whole batch. The
 /// result therefore depends on input order, and `unassigned` must hold only
